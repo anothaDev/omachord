@@ -1,0 +1,120 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Errno qw(EEXIST ENOENT);
+use Fcntl qw(O_DIRECTORY O_NOFOLLOW O_NONBLOCK O_RDONLY O_RDWR S_ISDIR S_ISREG);
+use IO::Handle;
+
+sub fail {
+  print STDERR "$_[0]\n";
+  exit 1;
+}
+
+sub path_parts {
+  my ($path) = @_;
+  fail("Path must be normalized and absolute: $path")
+    unless $path =~ m{^/} && $path ne "/" && $path !~ m{//|/\z};
+  my @parts = split m{/}, substr($path, 1);
+  fail("Path must be normalized and absolute: $path")
+    if grep { $_ eq "" || $_ eq "." || $_ eq ".." } @parts;
+  return @parts;
+}
+
+sub inspect_directory {
+  my ($handle, $path, $final) = @_;
+  my @stat = stat($handle);
+  fail("Could not inspect directory: $path") unless @stat && S_ISDIR($stat[2]);
+  my $owner = $stat[4];
+  my $mode = $stat[2] & 07777;
+  fail("Directory has a foreign-owned ancestor: $path")
+    unless $owner == 0 || $owner == $>;
+
+  if ($final) {
+    fail("Private directory is not user-owned: $path") unless $owner == $>;
+    chmod 0700, $handle or fail("Could not secure directory: $path");
+    @stat = stat($handle);
+    fail("Could not secure directory: $path")
+      unless @stat && S_ISDIR($stat[2]) && $stat[4] == $>
+        && ($stat[2] & 07777) == 0700;
+  } elsif (($mode & 0022) != 0 && ($mode & 01000) == 0) {
+    fail("Directory has an unsafe writable ancestor: $path");
+  }
+}
+
+sub walk_directory {
+  my ($path, $create) = @_;
+  my @parts = path_parts($path);
+  sysopen(my $directory, "/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
+    or fail("Could not open root directory: $!");
+
+  my $display = "";
+  for my $index (0 .. $#parts) {
+    my $component = $parts[$index];
+    $display .= "/$component";
+    my $relative = "/proc/self/fd/" . fileno($directory) . "/$component";
+    my $next;
+    if (!sysopen($next, $relative,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)) {
+      if ($create && $! == ENOENT) {
+        if (!mkdir($relative, 0700) && $! != EEXIST) {
+          fail("Could not create directory: $display: $!");
+        }
+        sysopen($next, $relative,
+          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
+          or fail("Could not open directory: $display: $!");
+      } else {
+        fail("Could not open directory without following links: $display: $!");
+      }
+    }
+    inspect_directory($next, $display, $index == $#parts);
+    $directory = $next;
+  }
+  return $directory;
+}
+
+sub open_private_file {
+  my ($path, $mode_text) = @_;
+  fail("Invalid private-file mode") unless $mode_text =~ /\A[0-7]{3,4}\z/;
+  my @parts = path_parts($path);
+  my $name = pop @parts;
+  fail("Invalid private-file path: $path") unless @parts;
+  my $parent = "/" . join("/", @parts);
+  my $directory = walk_directory($parent, 0);
+  my $relative = "/proc/self/fd/" . fileno($directory) . "/$name";
+
+  sysopen(my $file, $relative, O_RDWR | O_NOFOLLOW | O_NONBLOCK)
+    or fail("Could not open private file without following links: $path: $!");
+  my @stat = stat($file);
+  fail("Private file is not a regular user-owned file: $path")
+    unless @stat && S_ISREG($stat[2]) && $stat[4] == $> && $stat[3] == 1;
+
+  my $expected_mode = oct($mode_text);
+  chmod $expected_mode, $file or fail("Could not secure private file: $path");
+  @stat = stat($file);
+  fail("Could not secure private file: $path")
+    unless @stat && S_ISREG($stat[2]) && $stat[4] == $> && $stat[3] == 1
+      && ($stat[2] & 07777) == $expected_mode;
+  return $file;
+}
+
+my $command = shift // "";
+if ($command eq "prepare-dir") {
+  my $path = shift // fail("Missing directory path");
+  fail("Unexpected arguments") if @_;
+  walk_directory($path, 1);
+  exit 0;
+}
+
+if ($command eq "open-file") {
+  my $path = shift // fail("Missing private-file path");
+  my $mode = shift // fail("Missing private-file mode");
+  fail("Unexpected arguments") if @_;
+  my $file = open_private_file($path, $mode);
+  STDOUT->autoflush(1);
+  print "$$ ", fileno($file), "\n";
+  scalar <STDIN>;
+  exit 0;
+}
+
+fail("Unknown filesystem-helper command");

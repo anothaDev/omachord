@@ -1,0 +1,57 @@
+#!/bin/bash
+# Stand-in for bin/omachord used by test/qml-runtime/service.qml. It answers the
+# read-only queries the service makes and records every activation request.
+set -euo pipefail
+
+dir=${OMACHORD_QML_TEST_DIR:?}
+calls="$dir/runner-calls.log"
+active_marker="$dir/fake-active"
+
+case "${1:-} ${2:-}" in
+  "autostart ")
+    printf '%s\n' '{"ok":true,"connected":true}'
+    ;;
+  "status ")
+    printf '%s\n' '{"ok":true,"connected":true,"ownedConnection":true,"integrationComplete":true,"connectionEnabled":true,"configValid":true,"activeCount":0}'
+    ;;
+  "config snapshot")
+    printf '%s\n' '{"ok":true,"revision":"sha256:test","committed":true,"config":{"version":1,"routines":[{"id":"scratch-routine","name":"Scratch","enabled":true,"triggers":[],"conditions":[{"type":"omarchy-toggle","flag":"scratch"}],"actions":[{"type":"dnd","value":true,"restore":true}]},{"id":"plain","name":"Plain","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]}]}}'
+    ;;
+  "logs "*)
+    if [[ -f $dir/delay-logs ]]; then
+      sleep 1
+      rm -f "$dir/delay-logs"
+    fi
+    touch "$dir/logs-returned"
+    printf '%s\n' '[]'
+    ;;
+  "active ")
+    if [[ -f $active_marker ]]; then
+      printf '%s\n' '[{"routineId":"scratch-routine","activatedAt":"2026-08-30T12:00:00+02:00","trigger":"condition","keepUntil":"conditions","expiresAt":null,"onEndMode":"restore","setterCount":1}]'
+    else
+      printf '%s\n' '[]'
+    fi
+    ;;
+  "activate "*)
+    if [[ ! -f $dir/logs-returned ]]; then
+      printf '%s\n' 'EARLY activation before logs' >>"$calls"
+    fi
+    printf '%s\n' "$*" >>"$calls"
+    touch "$active_marker"
+    printf '{"ok":true,"routineId":"%s","trigger":"%s","state":"activated","durationMs":1,"expiresAt":null}\n' "$2" "${3:-}"
+    ;;
+  "deactivate "*)
+    printf '%s\n' "$*" >>"$calls"
+    if [[ -f $dir/hold-deactivate ]]; then
+      touch "$dir/deactivation-started"
+      while [[ -f $dir/hold-deactivate ]]; do sleep 0.01; done
+    fi
+    rm -f "$active_marker"
+    printf '{"ok":true,"routineId":"%s","trigger":"%s","state":"deactivated","restored":1,"skipped":0,"durationMs":1}\n' "$2" "${3:-}"
+    ;;
+  *)
+    printf '%s\n' "unexpected $*" >>"$calls"
+    printf '%s\n' '{"ok":false,"code":"usage","error":"unexpected call"}'
+    exit 1
+    ;;
+esac

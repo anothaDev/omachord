@@ -1,0 +1,3479 @@
+#!/bin/bash
+
+set -euo pipefail
+umask 077
+
+PLUGIN_ID="anothadev.omachord"
+SELF_PATH=$(realpath -e -- "${BASH_SOURCE[0]}")
+FS_HELPER="$(dirname -- "$SELF_PATH")/omachord-fs"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+OMARCHY_CONFIG_DIR="${OMACHORD_OMARCHY_CONFIG_DIR:-$HOME/.config/omarchy}"
+
+CONFIG_FILE="${OMACHORD_CONFIG_FILE:-$OMARCHY_CONFIG_DIR/omachord.json}"
+STATE_DIR="${OMACHORD_STATE_DIR:-$STATE_HOME/omarchy/omachord}"
+HYPR_DIR="${OMACHORD_HYPR_DIR:-$HOME/.config/hypr}"
+BINDINGS_FILE="$HYPR_DIR/bindings.lua"
+GENERATED_LUA="$HYPR_DIR/omachord.lua"
+HOOK_ROOT="${OMACHORD_HOOK_ROOT:-$OMARCHY_CONFIG_DIR/hooks}"
+DESKTOP_FILE="${OMACHORD_DESKTOP_FILE:-$DATA_HOME/applications/$PLUGIN_ID.desktop}"
+RUNNER_PATH="${OMACHORD_RUNNER_PATH:-$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID/bin/omachord}"
+LOCK_FILE="$STATE_DIR/config.lock"
+LOG_FILE="$STATE_DIR/runs.jsonl"
+OWNERSHIP_FILE="$STATE_DIR/connection.json"
+DISABLED_FILE="$STATE_DIR/connection.disabled.json"
+COMMIT_FILE="$STATE_DIR/config.commit.json"
+
+if [[ -n ${OMACHORD_RUN_LOCK_DIR:-} ]]; then
+  RUN_LOCK_DIR=$OMACHORD_RUN_LOCK_DIR
+elif [[ -n ${XDG_RUNTIME_DIR:-} ]]; then
+  RUN_LOCK_DIR="$XDG_RUNTIME_DIR/omachord"
+else
+  RUN_LOCK_DIR="$STATE_DIR/runtime"
+fi
+
+# This persisted ownership marker predates the display-name spelling and must
+# remain stable so existing connected installations can still be repaired.
+LOADER_LINE='require("default.hypr.require_optional").module("hypr.omachord") -- Oma Chord managed loader'
+HOOK_EVENTS=(battery-low font-set post-boot post-update pre-refresh-pacman theme-set)
+SETTER_TYPES=(nightlight dnd stay-awake theme brightness)
+ACTIVE_DIR="$STATE_DIR/active"
+MAX_CONFIG_BYTES=1048576
+MAX_CONTROL_BYTES=1048576
+LOCK_TIMEOUT=${OMACHORD_LOCK_TIMEOUT:-10}
+CONTROL_TIMEOUT=${OMACHORD_CONTROL_TIMEOUT:-5s}
+CONFIG_SNAPSHOT_FINGERPRINT=""
+CONFIG_COMMIT_REVISION=""
+CONFIG_LOAD_ERROR_CODE=invalid-config
+LAST_ERROR=""
+ROLLBACK_WARNING=""
+PRESERVED_CONFLICT=""
+ARCHIVED_FILE=""
+RETIRED_FILE=""
+ACTIVE_TIMEOUT_PID=""
+ACTIVE_COLLECTOR_PID=""
+ACTIVE_CAPTURE_DIR=""
+ACTIVE_ACTION_PGID=""
+ACTIVE_GUARD_PID=""
+ACTIVE_DONE_FILE=""
+
+default_config() {
+  printf '%s\n' '{"version":1,"routines":[]}'
+}
+
+json_error() {
+  local message=$1
+  local code=${2:-error}
+  jq -cn --arg error "$message" --arg code "$code" '{ok:false,code:$code,error:$error}'
+}
+
+json_ok() {
+  local message=${1:-}
+  jq -cn --arg message "$message" '{ok:true,message:$message}'
+}
+
+fail() {
+  local message=$1
+  local code=${2:-error}
+  json_error "$message" "$code"
+  exit 1
+}
+
+control_capture() {
+  local output status
+  output=$(mktemp) || return 1
+  if OMACHORD_ACTION_TIMEOUT="$CONTROL_TIMEOUT" \
+    OMACHORD_CAPTURE_MODE=head OMACHORD_CAPTURE_LIMIT="$MAX_CONTROL_BYTES" \
+    run_capture "$output" "$@"; then
+    cat -- "$output"
+    rm -f -- "$output"
+    return 0
+  else
+    status=$?
+  fi
+  [[ -z $LAST_ERROR ]] || printf '%s\n' "$LAST_ERROR" >&2
+  rm -f -- "$output"
+  return "$status"
+}
+
+trim() {
+  local value=$1
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+normalize_chord() {
+  local raw=$1
+  local expanded
+  local part key=""
+  local super=0 shift_key=0 ctrl=0 alt=0
+  local -a parts=()
+
+  expanded=${raw//+/ }
+  read -r -a parts <<<"$expanded"
+  for part in "${parts[@]}"; do
+    part=$(trim "$part")
+    part=${part^^}
+    [[ -n $part ]] || return 1
+    case $part in
+      SUPER|META|WIN) super=1 ;;
+      SHIFT) shift_key=1 ;;
+      CTRL|CONTROL) ctrl=1 ;;
+      ALT) alt=1 ;;
+      *)
+        [[ -z $key ]] || return 1
+        key=$part
+        ;;
+    esac
+  done
+
+  [[ -n $key ]] || return 1
+  case $key in
+    COMMA|PERIOD|MINUS|EQUAL|SLASH) key=${key,,} ;;
+  esac
+
+  local -a normalized=()
+  ((super)) && normalized+=(SUPER)
+  ((shift_key)) && normalized+=(SHIFT)
+  ((ctrl)) && normalized+=(CTRL)
+  ((alt)) && normalized+=(ALT)
+  normalized+=("$key")
+
+  local joined
+  printf -v joined ' + %s' "${normalized[@]}"
+  printf '%s\n' "${joined:3}"
+}
+
+write_config_snapshot() {
+  local destination=$1 size before after mode hash
+  CONFIG_SNAPSHOT_FINGERPRINT=""
+  if [[ ! -e $CONFIG_FILE && ! -L $CONFIG_FILE ]]; then
+    default_config >"$destination"
+    CONFIG_SNAPSHOT_FINGERPRINT=missing
+    return
+  fi
+  if [[ -L $CONFIG_FILE || ! -f $CONFIG_FILE || ! -O $CONFIG_FILE ]]; then
+    LAST_ERROR="Configuration must be a user-owned regular file: $CONFIG_FILE"
+    return 1
+  fi
+  before=$(stat -c '%d:%i:%s:%a:%y:%z' -- "$CONFIG_FILE" 2>/dev/null) || {
+    LAST_ERROR="Could not read configuration size: $CONFIG_FILE"
+    return 1
+  }
+  size=$(stat -c %s -- "$CONFIG_FILE" 2>/dev/null) || return 1
+  if ((size > MAX_CONFIG_BYTES)); then
+    LAST_ERROR="Configuration exceeds the 1 MiB limit"
+    return 1
+  fi
+  if ! dd if="$CONFIG_FILE" of="$destination" bs="$((MAX_CONFIG_BYTES + 1))" count=1 \
+    iflag=fullblock,nofollow,nonblock status=none 2>/dev/null; then
+    LAST_ERROR="Could not read configuration: $CONFIG_FILE"
+    return 1
+  fi
+  after=$(stat -c '%d:%i:%s:%a:%y:%z' -- "$CONFIG_FILE" 2>/dev/null) || {
+    LAST_ERROR="Configuration changed while it was being read: $CONFIG_FILE"
+    return 1
+  }
+  if [[ $after != "$before" || -L $CONFIG_FILE || ! -f $CONFIG_FILE || ! -O $CONFIG_FILE ]]; then
+    LAST_ERROR="Configuration changed while it was being read: $CONFIG_FILE"
+    return 1
+  fi
+  size=$(stat -c %s -- "$destination" 2>/dev/null || printf 0)
+  if ((size > MAX_CONFIG_BYTES)); then
+    LAST_ERROR="Configuration exceeds the 1 MiB limit"
+    return 1
+  fi
+  mode=$(stat -c %a -- "$CONFIG_FILE")
+  hash=$(sha256sum -- "$destination" | awk '{print $1}')
+  CONFIG_SNAPSHOT_FINGERPRINT="file:$mode:$hash"
+}
+
+read_config_stdin() {
+  local destination=$1 size
+  if ! dd of="$destination" bs="$((MAX_CONFIG_BYTES + 1))" count=1 \
+    iflag=fullblock status=none; then
+    LAST_ERROR="Could not read configuration from stdin"
+    return 1
+  fi
+  size=$(stat -c %s -- "$destination" 2>/dev/null || printf 0)
+  if ((size > MAX_CONFIG_BYTES)); then
+    LAST_ERROR="Configuration exceeds the 1 MiB limit"
+    return 1
+  fi
+}
+
+revision_for_fingerprint() {
+  local fingerprint=$1
+  if [[ $fingerprint == missing ]]; then
+    printf '%s\n' missing
+  elif [[ $fingerprint =~ ^file:[0-7]+:([0-9a-f]{64})$ ]]; then
+    printf 'sha256:%s\n' "${BASH_REMATCH[1]}"
+  else
+    return 1
+  fi
+}
+
+snapshot_revision() {
+  revision_for_fingerprint "$CONFIG_SNAPSHOT_FINGERPRINT"
+}
+
+commit_revision() {
+  [[ -e $COMMIT_FILE || -L $COMMIT_FILE ]] || return 1
+  secure_optional_private_file "$COMMIT_FILE" 600 "configuration commit" || return 1
+  jq -er '
+    select(type == "object" and (keys | sort) == ["revision", "version"])
+    | select(.version == 1)
+    | .revision
+    | select(. == "missing" or test("^sha256:[0-9a-f]{64}$"))
+  ' "$COMMIT_FILE" 2>/dev/null
+}
+
+configuration_is_committed() {
+  local revision=$1 allow_unmarked_missing=${2:-0} committed
+  if committed=$(commit_revision); then
+    if [[ $committed == "$revision" ]]; then return 0; fi
+    LAST_ERROR="Configuration does not match its committed revision"
+    return 1
+  fi
+  if ((allow_unmarked_missing)) && [[ $revision == missing \
+    && ! -e $COMMIT_FILE && ! -L $COMMIT_FILE ]]; then
+    return 0
+  fi
+  [[ -n $LAST_ERROR ]] || LAST_ERROR="Configuration has no valid committed revision"
+  return 1
+}
+
+load_committed_config() {
+  local destination=$1 revision
+  CONFIG_LOAD_ERROR_CODE=invalid-config
+  if ! require_secure_config_file; then
+    CONFIG_LOAD_ERROR_CODE=unsafe-config
+    return 1
+  fi
+  if ! write_config_snapshot "$destination" || ! validate_config_file "$destination"; then
+    return 1
+  fi
+  revision=$(snapshot_revision) || {
+    LAST_ERROR="Could not identify the configuration revision"
+    return 1
+  }
+  if ! configuration_is_committed "$revision" 1; then
+    CONFIG_LOAD_ERROR_CODE=uncommitted-config
+    return 1
+  fi
+}
+
+service_revision_matches() {
+  local expected=$1 temporary current
+  [[ $expected =~ ^sha256:[0-9a-f]{64}$ ]] || {
+    LAST_ERROR="A service transition requires a valid configuration revision"
+    return 1
+  }
+  temporary=$(mktemp) || {
+    LAST_ERROR="Could not verify the service configuration revision"
+    return 1
+  }
+  if ! load_committed_config "$temporary" || ! current=$(snapshot_revision); then
+    rm -f -- "$temporary"
+    [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not verify the service configuration revision"
+    return 1
+  fi
+  rm -f -- "$temporary"
+  if [[ $current != "$expected" ]]; then
+    LAST_ERROR="Configuration changed after the service evaluated the routine"
+    return 1
+  fi
+}
+
+write_config_commit() {
+  local config=$1 source revision
+  CONFIG_COMMIT_REVISION=""
+  revision="sha256:$(sha256sum -- "$config" | awk '{print $1}')"
+  source=$(mktemp) || {
+    LAST_ERROR="Could not prepare the configuration commit"
+    return 1
+  }
+  if ! jq -cn --arg revision "$revision" \
+    '{version:1,revision:$revision}' >"$source" \
+    || ! transaction_write_atomic "$source" "$COMMIT_FILE" 600; then
+    rm -f -- "$source"
+    LAST_ERROR=${LAST_ERROR:-"Could not commit the configuration revision"}
+    return 1
+  fi
+  rm -f -- "$source"
+  CONFIG_COMMIT_REVISION=$revision
+}
+
+config_file_secure() {
+  [[ ! -e $CONFIG_FILE && ! -L $CONFIG_FILE ]] && return 0
+  [[ -f $CONFIG_FILE && ! -L $CONFIG_FILE && -O $CONFIG_FILE ]] || return 1
+  [[ $(stat -c %a -- "$CONFIG_FILE" 2>/dev/null) == 600 ]]
+}
+
+require_secure_config_file() {
+  if ! config_file_secure; then
+    LAST_ERROR="Configuration must be a user-owned regular file with mode 0600: $CONFIG_FILE"
+    return 1
+  fi
+}
+
+validate_config_file() {
+  local file=$1
+  local schema_filter
+  local size
+  size=$(stat -c %s "$file" 2>/dev/null || printf 0)
+  if ((size > MAX_CONFIG_BYTES)); then
+    LAST_ERROR="Configuration exceeds the 1 MiB limit"
+    return 1
+  fi
+  read -r -d '' schema_filter <<'JQ' || true
+def allowed($keys): ((keys_unsorted - $keys) | length) == 0;
+def clean_strings: all(.. | strings; (contains("\u0000") or contains("\n") or contains("\r")) | not);
+def valid_hook: . == "battery-low" or . == "font-set" or . == "post-boot" or . == "post-update" or . == "pre-refresh-pacman" or . == "theme-set";
+def valid_trigger:
+  if .type == "shortcut" then
+    allowed(["type", "keys", "override"])
+      and (.keys | type == "string" and length > 0 and length <= 100)
+      and (.override | type == "boolean")
+  elif .type == "hook" then
+    allowed(["type", "event"])
+      and (.event | type == "string" and valid_hook)
+  else false end;
+def string_array: type == "array" and all(.[]; type == "string" and length <= 500);
+def absolute_path: type == "string" and startswith("/") and length <= 1000;
+def hhmm: type == "string" and test("^([01][0-9]|2[0-3]):[0-5][0-9]$");
+def weekday: . == "mon" or . == "tue" or . == "wed" or . == "thu" or . == "fri" or . == "sat" or . == "sun";
+def theme_slug: type == "string" and test("^[a-z0-9]+(?:-[a-z0-9]+)*$") and length <= 100;
+def is_setter: .type == "nightlight" or .type == "dnd" or .type == "stay-awake" or .type == "theme" or .type == "brightness";
+def valid_setter:
+  allowed(["type", "value", "restore"])
+    and (.restore | type == "boolean")
+    and if .type == "nightlight" or .type == "dnd" or .type == "stay-awake" then
+      (.value | type == "boolean")
+    elif .type == "theme" then
+      (.value | theme_slug)
+    elif .type == "brightness" then
+      (.value | type == "number" and floor == . and . >= 0 and . <= 100)
+    else false end;
+def valid_condition:
+  (.type | type == "string") and
+  if .type == "time" then
+    allowed(["type", "start", "end", "weekdays"])
+      and (.start | hhmm) and (.end | hhmm) and (.start != .end)
+      and (.weekdays | type == "array" and length <= 7
+           and all(.[]; type == "string" and weekday)
+           and length == (unique | length))
+  elif .type == "wifi" then
+    allowed(["type", "ssids"])
+      and (.ssids | type == "array" and length >= 1 and length <= 16
+           and all(.[]; type == "string" and length >= 1 and utf8bytelength <= 32)
+           and length == (unique | length))
+  elif .type == "power" then
+    allowed(["type", "source", "batteryBelow"])
+      and (.source | . == "ac" or . == "battery")
+      and (.batteryBelow | type == "number" and floor == . and . >= 0 and . <= 100)
+      and (.source == "battery" or .batteryBelow == 0)
+  elif .type == "omarchy-toggle" then
+    allowed(["type", "flag"])
+      and (.flag | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$") and (contains("..") | not))
+  else false end;
+def valid_keep_until:
+  . == "conditions"
+    or (type == "object" and allowed(["minutes"])
+        and (.minutes | type == "number" and floor == . and . >= 1 and . <= 1440));
+def valid_action:
+  (.type | type == "string") and
+  if .type == "microphone-toggle" then
+    allowed(["type", "sound", "mutedSound", "liveSound"])
+      and (.sound | type == "boolean")
+      and (.mutedSound | absolute_path)
+      and (.liveSound | absolute_path)
+  elif .type == "launch-app" then
+    allowed(["type", "desktopId"])
+      and (.desktopId | type == "string" and length > 0 and length <= 300 and (contains("/") | not))
+  elif .type == "omarchy-command" then
+    allowed(["type", "route", "args"])
+      and (.route | type == "string" and startswith("omarchy ") and length <= 300)
+      and (.args | string_array)
+  elif .type == "notification" then
+    allowed(["type", "title", "body", "urgency", "glyph"])
+      and (.title | type == "string" and length > 0 and length <= 200 and (startswith("-") | not))
+      and (.body | type == "string" and length <= 1000 and (startswith("-") | not))
+      and (.urgency | type == "string" and (. == "low" or . == "normal" or . == "critical"))
+      and (.glyph | type == "string" and length <= 20)
+  elif .type == "osd" then
+    allowed(["type", "icon", "message", "progress", "duration"])
+      and (.icon | type == "string" and length <= 100)
+      and (.message | type == "string" and length <= 300)
+      and (.progress | type == "number" and . >= -1 and . <= 100 and floor == .)
+      and (.duration | type == "number" and . >= 0 and . <= 60000 and floor == .)
+  elif .type == "sound" then
+    allowed(["type", "path"])
+      and (.path | absolute_path)
+  elif .type == "delay" then
+    allowed(["type", "milliseconds"])
+      and (.milliseconds | type == "number" and . >= 0 and . <= 300000 and floor == .)
+  elif .type == "exec" then
+    allowed(["type", "program", "args"])
+      and (.program | type == "string" and length > 0 and length <= 1000)
+      and (.args | string_array)
+  elif .type == "shell" then
+    allowed(["type", "command"])
+      and (.command | type == "string" and length > 0 and length <= 10000)
+  elif is_setter then
+    valid_setter
+  else false end;
+def valid_on_end:
+  type == "object"
+    and allowed(["mode", "actions"])
+    and (.mode | . == "restore" or . == "none" or . == "actions")
+    and (.actions | type == "array" and length <= 64
+         and all(.[]; valid_action and ((is_setter | not) or .restore == false)))
+    and (.mode == "actions" or (.actions | length == 0));
+def valid_routine:
+  allowed(["id", "name", "enabled", "triggers", "actions", "conditions", "onEnd", "keepUntil"])
+    and (.id | type == "string" and test("^[a-z0-9]+(?:-[a-z0-9]+)*$") and length <= 80)
+    and (.name | type == "string" and length > 0 and length <= 100)
+    and (.enabled | type == "boolean")
+    and (.triggers | type == "array" and all(.[]; valid_trigger))
+    and ([.triggers[] | select(.type == "shortcut")] | length <= 1)
+    and ([.triggers[] | select(.type == "hook") | .event] | length == (unique | length))
+    and (.actions | type == "array" and length <= 64 and all(.[]; valid_action))
+    and ((has("conditions") | not) or (.conditions | type == "array" and length <= 16 and all(.[]; valid_condition)))
+    and ((has("onEnd") | not) or (.onEnd | valid_on_end))
+    and ((has("keepUntil") | not) or (.keepUntil | valid_keep_until));
+type == "object"
+  and allowed(["version", "routines"])
+  and .version == 1
+  and (.routines | type == "array" and length <= 256 and all(.[]; valid_routine))
+  and ([.routines[].id] | length == (unique | length))
+  and clean_strings
+JQ
+
+  if ! jq -e "$schema_filter" "$file" >/dev/null 2>&1; then
+    LAST_ERROR="Configuration does not match schema version 1"
+    return 1
+  fi
+
+  local keys normalized
+  while IFS= read -r keys; do
+    if ! normalized=$(normalize_chord "$keys"); then
+      LAST_ERROR="Invalid shortcut: $keys"
+      return 1
+    fi
+    if [[ $keys != "$normalized" ]]; then
+      LAST_ERROR="Shortcut is not canonical: $keys (expected $normalized)"
+      return 1
+    fi
+  done < <(jq -r '.routines[].triggers[] | select(.type == "shortcut") | .keys' "$file")
+
+  local duplicates
+  duplicates=$(jq -r '[.routines[] | select(.enabled) | .triggers[] | select(.type == "shortcut") | .keys] | group_by(.)[] | select(length > 1) | .[0]' "$file" | head -n 1)
+  if [[ -n $duplicates ]]; then
+    LAST_ERROR="Two enabled routines use $duplicates"
+    return 1
+  fi
+}
+
+ensure_private_directory_tree() {
+  local target=$1 label=${2:-directory} error
+  if [[ ! -x $FS_HELPER ]]; then
+    LAST_ERROR="The Omachord filesystem helper is unavailable"
+    return 1
+  fi
+  if ! error=$("$FS_HELPER" prepare-dir "$target" 2>&1); then
+    LAST_ERROR=${error:-"Could not prepare the $label: $target"}
+    return 1
+  fi
+}
+
+secure_optional_private_directory() {
+  local path=$1 label=${2:-state directory}
+  [[ -e $path || -L $path ]] || return 0
+  if [[ -L $path || ! -d $path || ! -O $path ]]; then
+    LAST_ERROR="The $label must be a user-owned directory: $path"
+    return 1
+  fi
+  if ! chmod -h 700 -- "$path" \
+    || [[ -L $path || ! -d $path || ! -O $path ]] \
+    || [[ $(stat -c %a -- "$path" 2>/dev/null) != 700 ]]; then
+    LAST_ERROR="Could not secure the $label: $path"
+    return 1
+  fi
+}
+
+secure_optional_private_file() {
+  local path=$1 mode=${2:-600} label=${3:-state file}
+  [[ -e $path || -L $path ]] || return 0
+  if [[ -L $path || ! -f $path || ! -O $path ]]; then
+    LAST_ERROR="The $label must be a user-owned regular file: $path"
+    return 1
+  fi
+  if ! chmod -h "$mode" -- "$path" \
+    || [[ -L $path || ! -f $path || ! -O $path ]] \
+    || [[ $(stat -c %a -- "$path" 2>/dev/null) != "$mode" ]]; then
+    LAST_ERROR="Could not secure the $label: $path"
+    return 1
+  fi
+}
+
+prepare_state_dir() {
+  local path
+  ensure_private_directory_tree "$STATE_DIR" "state directory" || return 1
+  for path in "$LOCK_FILE" "$STATE_DIR/log.lock" "$LOG_FILE" "$OWNERSHIP_FILE" "$DISABLED_FILE" "$COMMIT_FILE"; do
+    secure_optional_private_file "$path" 600 "state file" || return 1
+  done
+  for path in "$STATE_DIR/backups" "$STATE_DIR/conflicts" "$STATE_DIR/retired" "$ACTIVE_DIR"; do
+    secure_optional_private_directory "$path" "state directory" || return 1
+  done
+  if [[ $RUN_LOCK_DIR == "$STATE_DIR/runtime" ]]; then
+    secure_optional_private_directory "$RUN_LOCK_DIR" "runtime lock directory" || return 1
+  fi
+}
+
+prepare_private_subdirectory() {
+  ensure_private_directory_tree "$1" "private state directory"
+}
+
+ensure_private_file() {
+  local path=$1 mode=${2:-600} label=${3:-state file} directory temporary
+  directory=$(dirname -- "$path")
+  if [[ -L $directory || ! -d $directory || ! -O $directory \
+    || $(stat -c %a -- "$directory" 2>/dev/null) != 700 ]]; then
+    LAST_ERROR="The parent of the $label is not a private directory: $directory"
+    return 1
+  fi
+  if [[ ! -e $path && ! -L $path ]]; then
+    temporary=$(mktemp "$directory/.omachord-state.XXXXXXXX") || {
+      LAST_ERROR="Could not create the $label: $path"
+      return 1
+    }
+    if ! chmod "$mode" -- "$temporary"; then
+      rm -f -- "$temporary"
+      LAST_ERROR="Could not secure the $label: $path"
+      return 1
+    fi
+    if ! mv --update=none-fail --no-copy -T -- "$temporary" "$path" >/dev/null 2>&1; then
+      rm -f -- "$temporary"
+    fi
+  fi
+  secure_optional_private_file "$path" "$mode" "$label"
+}
+
+private_fd_matches_file() {
+  local fd=$1 path=$2 expected observed
+  if [[ -L $path || ! -f $path || ! -O $path ]]; then
+    LAST_ERROR="A private file changed while it was being opened: $path"
+    return 1
+  fi
+  expected=$(stat -c '%d:%i:%u:%a' -- "$path" 2>/dev/null) || return 1
+  observed=$(stat -Lc '%d:%i:%u:%a' -- "/proc/self/fd/$fd" 2>/dev/null) || return 1
+  if [[ $observed != "$expected" ]]; then
+    LAST_ERROR="A private file changed while it was being opened: $path"
+    return 1
+  fi
+}
+
+safe_open_private_fd() {
+  local destination_fd=$1 path=$2 mode=${3:-600} label=${4:-state file}
+  local error_file opener_job opener_out opener_in opener_pid opener_fd open_ok=true
+  if [[ ! -x $FS_HELPER ]]; then
+    LAST_ERROR="The Omachord filesystem helper is unavailable"
+    return 1
+  fi
+  error_file=$(mktemp) || {
+    LAST_ERROR="Could not prepare to open the $label"
+    return 1
+  }
+  coproc OMACHORD_OPENER { "$FS_HELPER" open-file "$path" "$mode" 2>"$error_file"; }
+  opener_job=$OMACHORD_OPENER_PID
+  opener_out=${OMACHORD_OPENER[0]}
+  opener_in=${OMACHORD_OPENER[1]}
+  if ! IFS=' ' read -r opener_pid opener_fd <&"$opener_out" \
+    || [[ ! $opener_pid =~ ^[0-9]+$ || ! $opener_fd =~ ^[0-9]+$ ]]; then
+    open_ok=false
+  else
+    case $destination_fd in
+      6) exec 6<>"/proc/$opener_pid/fd/$opener_fd" || open_ok=false ;;
+      7) exec 7<>"/proc/$opener_pid/fd/$opener_fd" || open_ok=false ;;
+      8) exec 8<>"/proc/$opener_pid/fd/$opener_fd" || open_ok=false ;;
+      9) exec 9<>"/proc/$opener_pid/fd/$opener_fd" || open_ok=false ;;
+      *) open_ok=false ;;
+    esac
+  fi
+  printf '\n' >&"$opener_in" 2>/dev/null || true
+  exec {opener_in}>&- 2>/dev/null || true
+  exec {opener_out}<&- 2>/dev/null || true
+  wait "$opener_job" 2>/dev/null || open_ok=false
+  if [[ $open_ok != true ]] || ! private_fd_matches_file "$destination_fd" "$path"; then
+    case $destination_fd in
+      6) exec 6>&- ;;
+      7) exec 7>&- ;;
+      8) exec 8>&- ;;
+      9) exec 9>&- ;;
+    esac
+    if [[ -z $LAST_ERROR ]]; then
+      LAST_ERROR=$(<"$error_file")
+      [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not safely open the $label"
+    fi
+    rm -f -- "$error_file"
+    return 1
+  fi
+  rm -f -- "$error_file"
+}
+
+acquire_config_lock() {
+  local mode=${1:-exclusive}
+  ensure_private_file "$LOCK_FILE" 600 "configuration lock" || return 1
+  safe_open_private_fd 9 "$LOCK_FILE" 600 "configuration lock" || return 1
+  if [[ $mode == shared ]]; then
+    flock -s -w "$LOCK_TIMEOUT" 9 || { exec 9>&-; LAST_ERROR="Timed out locking configuration state"; return 1; }
+  else
+    flock -x -w "$LOCK_TIMEOUT" 9 || { exec 9>&-; LAST_ERROR="Timed out locking configuration state"; return 1; }
+  fi
+  if ! private_fd_matches_file 9 "$LOCK_FILE"; then exec 9>&-; return 1; fi
+}
+
+acquire_log_lock() {
+  local mode=${1:-exclusive}
+  ensure_private_file "$STATE_DIR/log.lock" 600 "run-history lock" || return 1
+  safe_open_private_fd 8 "$STATE_DIR/log.lock" 600 "run-history lock" || return 1
+  if [[ $mode == shared ]]; then
+    flock -s -w "$LOCK_TIMEOUT" 8 || { exec 8>&-; LAST_ERROR="Timed out locking run history"; return 1; }
+  else
+    flock -x -w "$LOCK_TIMEOUT" 8 || { exec 8>&-; LAST_ERROR="Timed out locking run history"; return 1; }
+  fi
+  if ! private_fd_matches_file 8 "$STATE_DIR/log.lock"; then
+    exec 8>&-
+    return 1
+  fi
+}
+
+write_atomic() {
+  local source=$1 destination=$2 mode=${3:-600}
+  local directory temporary
+  directory=$(dirname -- "$destination")
+  mkdir -p "$directory" || return 1
+  temporary=$(mktemp "$directory/.omachord.XXXXXX") || return 1
+  if ! cp -- "$source" "$temporary" || ! chmod "$mode" "$temporary" || ! mv -fT -- "$temporary" "$destination"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+}
+
+file_identity() {
+  stat -c '%d:%i' -- "$1" 2>/dev/null
+}
+
+archive_inode() {
+  local source=$1 destination=$2 kind=$3 stable_fingerprint=${4:-}
+  local directory target base adjacent current
+  ARCHIVED_FILE=""
+  [[ -f $source && ! -L $source ]] || {
+    ARCHIVED_FILE=$source
+    return 1
+  }
+  base=$(basename -- "$destination" | tr -c 'A-Za-z0-9._-' '_')
+  target=""
+  directory="$STATE_DIR/$kind"
+  if prepare_private_subdirectory "$directory"; then
+    target=$(mktemp "$directory/$base.XXXXXXXX") || target=""
+    if [[ -n $target ]]; then
+      rm -f -- "$target"
+      if ! ln -- "$source" "$target" 2>/dev/null; then
+        rm -f -- "$target"
+        target=""
+      fi
+    fi
+  fi
+
+  if [[ -z $target ]]; then
+    adjacent=$(dirname -- "$source")/.omachord-$kind
+    if prepare_private_subdirectory "$adjacent"; then
+      target=$(mktemp "$adjacent/$base.XXXXXXXX") || target=""
+      if [[ -n $target ]]; then
+        rm -f -- "$target"
+        if ! ln -- "$source" "$target" 2>/dev/null; then
+          rm -f -- "$target"
+          target=""
+        fi
+      fi
+    fi
+  fi
+
+  if [[ -z $target ]]; then
+    # Leaving the private transaction path in place is safer than unlinking an
+    # inode that another process may still be writing.
+    ARCHIVED_FILE=$source
+    return 0
+  fi
+
+  rm -f -- "$source"
+  ARCHIVED_FILE=$target
+  if [[ $kind == retired && -n $stable_fingerprint ]]; then
+    current=$(fingerprint_for_destination "$target" "$destination")
+    if [[ $current == "$stable_fingerprint" ]] \
+      && command -v fuser >/dev/null 2>&1 \
+      && ! fuser -sI "$target" 2>/dev/null \
+      && [[ $(fingerprint_for_destination "$target" "$destination") == "$stable_fingerprint" ]]; then
+      rm -f -- "$target"
+      ARCHIVED_FILE=""
+    fi
+  fi
+}
+
+preserve_concurrent_file() {
+  local source=$1 destination=$2
+  archive_inode "$source" "$destination" conflicts || true
+  PRESERVED_CONFLICT=$ARCHIVED_FILE
+}
+
+retire_file() {
+  local source=$1 destination=$2 stable_fingerprint=${3:-}
+  if ! archive_inode "$source" "$destination" retired "$stable_fingerprint"; then
+    RETIRED_FILE=""
+    return 1
+  fi
+  RETIRED_FILE=$ARCHIVED_FILE
+  return 0
+}
+
+exchange_back_or_preserve() {
+  local swapped=$1 destination=$2 stable_fingerprint=${3:-}
+  if mv --exchange --no-copy -T -- "$swapped" "$destination"; then
+    retire_file "$swapped" "$destination" "$stable_fingerprint" || true
+    return 0
+  fi
+  preserve_concurrent_file "$swapped" "$destination"
+  return 1
+}
+
+atomic_replace_if_fingerprint() {
+  local source=$1 destination=$2 expected_current=$3 mode=${4:-600}
+  local directory temporary expected_new observed
+  PRESERVED_CONFLICT=""
+  RETIRED_FILE=""
+  directory=$(dirname -- "$destination")
+  mkdir -p "$directory" || return 1
+  temporary=$(mktemp "$directory/.omachord.XXXXXXXX") || return 1
+  if ! cp -- "$source" "$temporary" || ! chmod "$mode" "$temporary"; then
+    rm -f -- "$temporary"
+    return 1
+  fi
+  expected_new=$(fingerprint_for_destination "$temporary" "$destination")
+
+  if [[ $expected_current == missing ]]; then
+    transaction_critical_begin
+    if ! mv --update=none-fail --no-copy -T -- "$temporary" "$destination" >/dev/null 2>&1; then
+      transaction_critical_end
+      rm -f -- "$temporary"
+      LAST_ERROR="A file appeared during the transaction: $destination"
+      return 1
+    fi
+    transaction_critical_end
+  elif [[ $expected_current == file:* ]]; then
+    transaction_critical_begin
+    if ! mv --exchange --no-copy -T -- "$temporary" "$destination" >/dev/null 2>&1; then
+      transaction_critical_end
+      rm -f -- "$temporary"
+      LAST_ERROR="Could not atomically exchange $destination"
+      return 1
+    fi
+    observed=$(fingerprint_for_destination "$temporary" "$destination")
+    if [[ $observed != "$expected_current" ]]; then
+      exchange_back_or_preserve "$temporary" "$destination" "$expected_new" || true
+      transaction_critical_end
+      LAST_ERROR="A file changed during the transaction: $destination"
+      [[ -z $PRESERVED_CONFLICT ]] || LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
+      return 1
+    fi
+    if ! retire_file "$temporary" "$destination" "$expected_current"; then
+      transaction_critical_end
+      LAST_ERROR="Could not preserve the replaced file at $temporary"
+      return 1
+    fi
+    transaction_critical_end
+  else
+    rm -f -- "$temporary"
+    LAST_ERROR="Refusing to replace a non-regular file: $destination"
+    return 1
+  fi
+
+  if [[ $(fingerprint_for_destination "$destination" "$destination") != "$expected_new" ]]; then
+    LAST_ERROR="A file changed while completing the transaction: $destination"
+    return 1
+  fi
+}
+
+atomic_remove_if_fingerprint() {
+  local destination=$1 expected_current=$2 snapshot_slot=${3:-}
+  local directory placeholder quarantine observed placeholder_identity placeholder_fingerprint moved_identity
+  PRESERVED_CONFLICT=""
+  RETIRED_FILE=""
+
+  if [[ $expected_current == missing ]]; then
+    if [[ $(fingerprint_for_destination "$destination" "$destination") != missing ]]; then
+      LAST_ERROR="A file appeared during the transaction: $destination"
+      return 1
+    fi
+    return 0
+  fi
+  if [[ $expected_current != file:* ]]; then
+    LAST_ERROR="Refusing to remove a non-regular file: $destination"
+    return 1
+  fi
+
+  directory=$(dirname -- "$destination")
+  placeholder=$(mktemp "$directory/.omachord-remove.XXXXXXXX") || return 1
+  chmod 600 "$placeholder" || { rm -f -- "$placeholder"; return 1; }
+  placeholder_identity=$(file_identity "$placeholder")
+  placeholder_fingerprint=$(fingerprint_for_destination "$placeholder" "$destination")
+  [[ -z $snapshot_slot ]] || SNAPSHOT_EXPECTED[$snapshot_slot]=$placeholder_fingerprint
+
+  transaction_critical_begin
+  if ! mv --exchange --no-copy -T -- "$placeholder" "$destination" >/dev/null 2>&1; then
+    transaction_critical_end
+    rm -f -- "$placeholder"
+    LAST_ERROR="Could not atomically exchange $destination for removal"
+    return 1
+  fi
+  observed=$(fingerprint_for_destination "$placeholder" "$destination")
+  if [[ $observed != "$expected_current" ]]; then
+    exchange_back_or_preserve "$placeholder" "$destination" "$placeholder_fingerprint" || true
+    transaction_critical_end
+    LAST_ERROR="A file changed during the transaction: $destination"
+    [[ -z $PRESERVED_CONFLICT ]] || LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
+    return 1
+  fi
+
+  if ! retire_file "$placeholder" "$destination" "$expected_current"; then
+    transaction_critical_end
+    LAST_ERROR="Could not preserve $destination before removal"
+    return 1
+  fi
+  quarantine=$(mktemp "$directory/.omachord-unlink.XXXXXXXX") || {
+    transaction_critical_end
+    LAST_ERROR="Could not prepare an atomic removal for $destination"
+    return 1
+  }
+  rm -f -- "$quarantine"
+  if ! mv --update=none-fail --no-copy -T -- "$destination" "$quarantine" >/dev/null 2>&1; then
+    transaction_critical_end
+    LAST_ERROR="A file changed while removing $destination"
+    return 1
+  fi
+  moved_identity=$(file_identity "$quarantine")
+  if [[ $moved_identity != "$placeholder_identity" \
+    || $(fingerprint_for_destination "$quarantine" "$destination") != "$placeholder_fingerprint" ]]; then
+    if ! mv --update=none-fail --no-copy -T -- "$quarantine" "$destination" >/dev/null 2>&1; then
+      preserve_concurrent_file "$quarantine" "$destination"
+    fi
+    transaction_critical_end
+    LAST_ERROR="A file changed while removing $destination"
+    [[ -z $PRESERVED_CONFLICT ]] || LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
+    return 1
+  fi
+
+  [[ -z $snapshot_slot ]] || SNAPSHOT_EXPECTED[$snapshot_slot]=missing
+  if ! retire_file "$quarantine" "$destination" "$placeholder_fingerprint"; then
+    transaction_critical_end
+    LAST_ERROR="Could not preserve the removed transaction inode at $quarantine"
+    return 1
+  fi
+  transaction_critical_end
+  if [[ $(fingerprint_for_destination "$destination" "$destination") != missing ]]; then
+    LAST_ERROR="A file appeared while completing removal: $destination"
+    return 1
+  fi
+}
+
+lua_quote() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
+generate_lua() {
+  local file=$1
+  local routine id name keys override
+  printf '%s\n' '-- Generated by Omachord. Do not edit.'
+  printf 'local runner = %s\n' "$(lua_quote "$RUNNER_PATH")"
+  printf '%s\n' 'if o.cmd_present(runner) then'
+
+  while IFS= read -r routine; do
+    id=$(jq -r '.id' <<<"$routine")
+    name=$(jq -r '.name' <<<"$routine")
+    keys=$(jq -r '.triggers[] | select(.type == "shortcut") | .keys' <<<"$routine")
+    override=$(jq -r '.triggers[] | select(.type == "shortcut") | .override' <<<"$routine")
+    [[ -n $keys ]] || continue
+    if [[ $override == "true" ]]; then
+      printf '  hl.unbind(%s)\n' "$(lua_quote "$keys")"
+    fi
+    printf '  o.bind(%s, %s, o.shell_quote(runner) .. " run " .. o.shell_quote(%s) .. " shortcut")\n' \
+      "$(lua_quote "$keys")" "$(lua_quote "Omachord: $name")" "$(lua_quote "$id")"
+  done < <(jq -c '.routines[] | select(.enabled) | select(any(.triggers[]; .type == "shortcut"))' "$file")
+
+  printf '%s\n' 'end'
+}
+
+hook_wrapper_path() {
+  printf '%s/%s.d/%s' "$HOOK_ROOT" "$1" "$PLUGIN_ID"
+}
+
+generate_hook_wrapper() {
+  local event=$1
+  printf '%s\n' '#!/bin/bash'
+  printf 'runner=%q\n' "$RUNNER_PATH"
+  printf '%s\n' '[[ -x $runner ]] || exit 0'
+  printf 'exec "$runner" trigger hook %q "$@"\n' "$event"
+}
+
+write_hook_wrapper() {
+  local event=$1 destination source
+  destination=$(hook_wrapper_path "$event")
+  source=$(mktemp) || return 1
+  if ! generate_hook_wrapper "$event" >"$source"; then
+    rm -f -- "$source"
+    return 1
+  fi
+  if ! transaction_write_atomic "$source" "$destination" 755; then
+    rm -f -- "$source"
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+sync_generated_lua() {
+  local file=$1 lua_source
+  lua_source=$(mktemp) || return 1
+  if ! generate_lua "$file" >"$lua_source" || ! transaction_write_atomic "$lua_source" "$GENERATED_LUA" 600; then
+    rm -f -- "$lua_source"
+    return 1
+  fi
+  rm -f -- "$lua_source"
+}
+
+install_hook_wrappers() {
+  local event
+  for event in "${HOOK_EVENTS[@]}"; do
+    write_hook_wrapper "$event" || return 1
+  done
+}
+
+connected() {
+  [[ -f $BINDINGS_FILE && ! -L $BINDINGS_FILE ]] \
+    && grep -Fqx -- "$LOADER_LINE" "$BINDINGS_FILE"
+}
+
+owned_connection() {
+  [[ -f $OWNERSHIP_FILE && ! -L $OWNERSHIP_FILE ]] \
+    && jq -e --arg id "$PLUGIN_ID" '.version == 1 and .pluginId == $id and .loaderCreated == true' "$OWNERSHIP_FILE" >/dev/null 2>&1
+}
+
+connection_disabled() {
+  [[ -e $DISABLED_FILE || -L $DISABLED_FILE ]] || return 1
+  secure_optional_private_file "$DISABLED_FILE" 600 "connection preference" || return 2
+  jq -e --arg id "$PLUGIN_ID" '
+    type == "object"
+    and (keys | sort) == ["disabled", "pluginId", "version"]
+    and .version == 1
+    and .pluginId == $id
+    and .disabled == true
+  ' "$DISABLED_FILE" >/dev/null 2>&1 || {
+    LAST_ERROR="The Omachord connection preference is invalid: $DISABLED_FILE"
+    return 2
+  }
+}
+
+write_connection_disabled() {
+  local source
+  source=$(mktemp) || {
+    LAST_ERROR="Could not prepare the connection preference"
+    return 1
+  }
+  if ! jq -cn --arg id "$PLUGIN_ID" \
+    '{version:1,pluginId:$id,disabled:true}' >"$source" \
+    || ! transaction_write_atomic "$source" "$DISABLED_FILE" 600; then
+    rm -f -- "$source"
+    LAST_ERROR=${LAST_ERROR:-"Could not save the connection preference"}
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+remove_connection_disabled() {
+  secure_optional_private_file "$DISABLED_FILE" 600 "connection preference" || return 1
+  rm -f -- "$DISABLED_FILE" || {
+    LAST_ERROR="Could not enable automatic connection"
+    return 1
+  }
+}
+
+write_ownership() {
+  local source
+  source=$(mktemp) || return 1
+  if ! jq -cn --arg id "$PLUGIN_ID" --arg connectedAt "$(date --iso-8601=seconds)" \
+    '{version:1,pluginId:$id,loaderCreated:true,connectedAt:$connectedAt}' >"$source" \
+    || ! transaction_write_atomic "$source" "$OWNERSHIP_FILE" 600; then
+    rm -f -- "$source"
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+generated_lua_matches() {
+  local expected=$1 current=$2
+  cmp -s -- "$expected" "$current" \
+    || sed -e '1s/^-- Generated by Omachord/-- Generated by Oma Chord/' \
+      -e 's/"Omachord: /"Oma: /' "$expected" | cmp -s - "$current"
+}
+
+desktop_entry_matches() {
+  local expected=$1 current=$2
+  cmp -s -- "$expected" "$current" \
+    || sed 's/^Name=Omachord$/Name=Oma Chord/' "$expected" | cmp -s - "$current"
+}
+
+integration_branding_current() {
+  local config expected
+  config=$(mktemp) || return 1
+  expected=$(mktemp) || {
+    rm -f -- "$config"
+    return 1
+  }
+  if ! write_config_snapshot "$config" \
+    || ! validate_config_file "$config" \
+    || ! generate_lua "$config" >"$expected" \
+    || ! cmp -s -- "$expected" "$GENERATED_LUA" \
+    || ! generate_desktop_entry >"$expected" \
+    || ! cmp -s -- "$expected" "$DESKTOP_FILE"; then
+    rm -f -- "$config" "$expected"
+    return 1
+  fi
+  rm -f -- "$config" "$expected"
+}
+
+integration_complete() {
+  local event config expected revision
+  connected && owned_connection || return 1
+  config_file_secure || return 1
+  [[ -f $GENERATED_LUA && ! -L $GENERATED_LUA ]] || return 1
+  [[ -f $DESKTOP_FILE && ! -L $DESKTOP_FILE ]] || return 1
+  [[ $(stat -c %a "$GENERATED_LUA") == 600 ]] || return 1
+  [[ $(stat -c %a "$DESKTOP_FILE") == 644 ]] || return 1
+  [[ $(stat -c %a "$OWNERSHIP_FILE") == 600 ]] || return 1
+
+  config=$(mktemp) || return 1
+  expected=$(mktemp) || {
+    rm -f -- "$config"
+    return 1
+  }
+  if ! write_config_snapshot "$config" \
+    || ! validate_config_file "$config" \
+    || ! revision=$(snapshot_revision) \
+    || ! configuration_is_committed "$revision" 0 \
+    || ! generate_lua "$config" >"$expected" \
+    || ! generated_lua_matches "$expected" "$GENERATED_LUA" \
+    || ! generate_desktop_entry >"$expected" \
+    || ! desktop_entry_matches "$expected" "$DESKTOP_FILE"; then
+    rm -f -- "$config" "$expected"
+    return 1
+  fi
+
+  for event in "${HOOK_EVENTS[@]}"; do
+    local path
+    path=$(hook_wrapper_path "$event")
+    if [[ ! -f $path || -L $path || ! -x $path || $(stat -c %a "$path") != 755 ]] \
+      || ! generate_hook_wrapper "$event" >"$expected" \
+      || ! cmp -s -- "$expected" "$path"; then
+      rm -f -- "$config" "$expected"
+      return 1
+    fi
+  done
+  rm -f -- "$config" "$expected"
+}
+
+prepare_run_lock_dir() {
+  ensure_private_directory_tree "$RUN_LOCK_DIR" "runtime lock directory"
+}
+
+backup_bindings() {
+  local backup
+  [[ -e $BINDINGS_FILE || -L $BINDINGS_FILE ]] || return 0
+  if [[ -L $BINDINGS_FILE || ! -f $BINDINGS_FILE || ! -O $BINDINGS_FILE ]]; then
+    LAST_ERROR="Bindings must be a user-owned regular file: $BINDINGS_FILE"
+    return 1
+  fi
+  prepare_private_subdirectory "$STATE_DIR/backups" || {
+    LAST_ERROR="Could not create the bindings backup directory"
+    return 1
+  }
+  backup=$(mktemp "$STATE_DIR/backups/bindings.lua.XXXXXXXX") || {
+    LAST_ERROR="Could not create a bindings backup"
+    return 1
+  }
+  if ! cp -pT -- "$BINDINGS_FILE" "$backup"; then
+    rm -f -- "$backup"
+    LAST_ERROR="Could not back up $BINDINGS_FILE"
+    return 1
+  fi
+}
+
+connection_collision() {
+  local event path
+  for path in "$GENERATED_LUA" "$DESKTOP_FILE"; do
+    if [[ -e $path ]]; then
+      LAST_ERROR="Refusing to replace an unowned file: $path"
+      return 0
+    fi
+  done
+  for event in "${HOOK_EVENTS[@]}"; do
+    path=$(hook_wrapper_path "$event")
+    if [[ -e $path ]]; then
+      LAST_ERROR="Refusing to replace an unowned file: $path"
+      return 0
+    fi
+  done
+  return 1
+}
+
+hypr_errors() {
+  if [[ ${OMACHORD_SKIP_HYPR_RELOAD:-0} == 1 ]]; then
+    return 0
+  fi
+  command -v hyprctl >/dev/null 2>&1 || {
+    printf '%s' 'hyprctl is unavailable'
+    return 1
+  }
+  control_capture hyprctl configerrors 2>&1
+}
+
+require_clean_hyprland() {
+  local errors
+  if ! errors=$(hypr_errors); then
+    LAST_ERROR=${errors:-"Unable to query Hyprland configuration errors"}
+    return 1
+  fi
+  if [[ -n $errors ]]; then
+    LAST_ERROR="Hyprland already reports configuration errors: $errors"
+    return 1
+  fi
+}
+
+reload_hyprland() {
+  local errors
+  if [[ ${OMACHORD_SKIP_HYPR_RELOAD:-0} == 1 ]]; then
+    return 0
+  fi
+  if ! control_capture hyprctl reload >/dev/null 2>&1; then
+    LAST_ERROR="Hyprland reload failed"
+    return 1
+  fi
+  if ! errors=$(hypr_errors); then
+    LAST_ERROR=${errors:-"Unable to validate Hyprland after reload"}
+    return 1
+  fi
+  if [[ -n $errors ]]; then
+    LAST_ERROR="Hyprland rejected the generated bindings: $errors"
+    return 1
+  fi
+}
+
+declare -a SNAPSHOT_PATHS=()
+declare -a SNAPSHOT_KEYS=()
+declare -a SNAPSHOT_BASELINES=()
+declare -a SNAPSHOT_EXPECTED=()
+SNAPSHOT_DIR=""
+TRANSACTION_ARMED=0
+TRANSACTION_RELOAD_ON_ABORT=0
+TRANSACTION_CRITICAL=0
+TRANSACTION_PENDING_SIGNAL=0
+
+snapshot_begin() {
+  SNAPSHOT_DIR=$(mktemp -d) || {
+    LAST_ERROR="Could not create a transaction snapshot"
+    return 1
+  }
+  SNAPSHOT_PATHS=()
+  SNAPSHOT_KEYS=()
+  SNAPSHOT_BASELINES=()
+  SNAPSHOT_EXPECTED=()
+  ROLLBACK_WARNING=""
+}
+
+snapshot_file() {
+  local path=$1 key=$2 baseline
+  if [[ $path == "$CONFIG_FILE" ]]; then
+    if [[ ! -e $path && ! -L $path ]]; then
+      baseline=missing
+    elif ! write_config_snapshot "$SNAPSHOT_DIR/$key"; then
+      LAST_ERROR=${LAST_ERROR:-"Could not snapshot $path"}
+      return 1
+    else
+      baseline=$CONFIG_SNAPSHOT_FINGERPRINT
+      if [[ $(fingerprint_for_destination "$SNAPSHOT_DIR/$key" "$CONFIG_FILE") != "$baseline" ]] \
+        || ! touch "$SNAPSHOT_DIR/$key.exists"; then
+        LAST_ERROR="Could not snapshot $path"
+        return 1
+      fi
+    fi
+    SNAPSHOT_PATHS+=("$path")
+    SNAPSHOT_KEYS+=("$key")
+    SNAPSHOT_BASELINES+=("$baseline")
+    SNAPSHOT_EXPECTED+=("")
+    return
+  fi
+
+  baseline=$(fingerprint_path "$path")
+  SNAPSHOT_PATHS+=("$path")
+  SNAPSHOT_KEYS+=("$key")
+  SNAPSHOT_BASELINES+=("$baseline")
+  SNAPSHOT_EXPECTED+=("")
+  if [[ $baseline == file:* ]]; then
+    if [[ -L $path || ! -f $path ]] \
+      || ! cp -p -- "$path" "$SNAPSHOT_DIR/$key" \
+      || [[ $(fingerprint_path "$path") != "$baseline" ]] \
+      || [[ $(fingerprint_for_destination "$SNAPSHOT_DIR/$key" "$path") != "$baseline" ]] \
+      || ! touch "$SNAPSHOT_DIR/$key.exists"; then
+      LAST_ERROR="Could not snapshot $path"
+      return 1
+    fi
+  fi
+}
+
+snapshot_owned_files() {
+  local include_config=${1:-0} include_bindings=${2:-0} event
+  if ((include_config)); then snapshot_file "$CONFIG_FILE" config || return 1; fi
+  if ((include_bindings)); then snapshot_file "$BINDINGS_FILE" bindings || return 1; fi
+  snapshot_file "$GENERATED_LUA" generated || return 1
+  snapshot_file "$DESKTOP_FILE" desktop || return 1
+  snapshot_file "$OWNERSHIP_FILE" ownership || return 1
+  snapshot_file "$DISABLED_FILE" disabled || return 1
+  for event in "${HOOK_EVENTS[@]}"; do
+    snapshot_file "$(hook_wrapper_path "$event")" "hook-$event" || return 1
+  done
+}
+
+snapshot_missing_artifacts() {
+  local event path key index
+  local -a paths=("$GENERATED_LUA" "$DESKTOP_FILE" "$OWNERSHIP_FILE")
+  local -a keys=(generated desktop ownership)
+  for event in "${HOOK_EVENTS[@]}"; do
+    paths+=("$(hook_wrapper_path "$event")")
+    keys+=("hook-$event")
+  done
+  for ((index = 0; index < ${#paths[@]}; index++)); do
+    path=${paths[$index]}
+    key=${keys[$index]}
+    snapshot_file "$path" "$key" || return 1
+    if [[ ${SNAPSHOT_BASELINES[-1]} != missing ]]; then
+      LAST_ERROR="Refusing to replace an unowned file created during Connect: $path"
+      return 1
+    fi
+  done
+}
+
+file_fingerprint() {
+  local path=$1
+  if [[ -L $path ]]; then
+    printf 'symlink:%s\n' "$(readlink -- "$path")"
+  elif [[ -f $path ]]; then
+    printf 'file:%s:%s\n' "$(stat -c %a "$path")" "$(sha256sum -- "$path" | awk '{print $1}')"
+  elif [[ -e $path ]]; then
+    printf 'other:%s\n' "$(stat -c %F "$path")"
+  else
+    printf '%s\n' missing
+  fi
+}
+
+config_file_fingerprint() {
+  local path=$1 before after size copied mode temporary hash
+  if [[ -L $path ]]; then
+    printf 'symlink:%s\n' "$(readlink -- "$path")"
+    return
+  fi
+  if [[ ! -e $path ]]; then
+    printf '%s\n' missing
+    return
+  fi
+  if [[ ! -f $path ]]; then
+    printf 'other:%s\n' "$(stat -c %F -- "$path" 2>/dev/null || printf unknown)"
+    return
+  fi
+
+  before=$(stat -c '%d:%i:%s:%a:%y:%z' -- "$path" 2>/dev/null) || {
+    printf '%s\n' unstable
+    return
+  }
+  size=$(stat -c %s -- "$path" 2>/dev/null) || {
+    printf '%s\n' unstable
+    return
+  }
+  if ((size > MAX_CONFIG_BYTES)); then
+    printf 'oversized:%s\n' "$size"
+    return
+  fi
+  temporary=$(mktemp) || {
+    printf '%s\n' unstable
+    return
+  }
+  if ! dd if="$path" of="$temporary" bs="$((MAX_CONFIG_BYTES + 1))" count=1 \
+    iflag=fullblock,nofollow,nonblock status=none 2>/dev/null; then
+    rm -f -- "$temporary"
+    printf '%s\n' unstable
+    return
+  fi
+  after=$(stat -c '%d:%i:%s:%a:%y:%z' -- "$path" 2>/dev/null) || after=unstable
+  copied=$(stat -c %s -- "$temporary" 2>/dev/null || printf 0)
+  if [[ $after != "$before" ]] || ((copied != size || copied > MAX_CONFIG_BYTES)); then
+    rm -f -- "$temporary"
+    printf '%s\n' unstable
+    return
+  fi
+  mode=$(stat -c %a -- "$path" 2>/dev/null) || mode=""
+  hash=$(sha256sum -- "$temporary" | awk '{print $1}')
+  rm -f -- "$temporary"
+  if [[ -z $mode ]]; then printf '%s\n' unstable; else printf 'file:%s:%s\n' "$mode" "$hash"; fi
+}
+
+fingerprint_for_destination() {
+  local path=$1 destination=$2
+  if [[ $destination == "$CONFIG_FILE" ]]; then
+    config_file_fingerprint "$path"
+  else
+    file_fingerprint "$path"
+  fi
+}
+
+fingerprint_path() {
+  local path=$1
+  if [[ $path == "$CONFIG_FILE" ]]; then
+    config_file_fingerprint "$path"
+  else
+    file_fingerprint "$path"
+  fi
+}
+
+snapshot_index() {
+  local path=$1 index
+  for ((index = 0; index < ${#SNAPSHOT_PATHS[@]}; index++)); do
+    if [[ ${SNAPSHOT_PATHS[$index]} == "$path" ]]; then
+      printf '%s\n' "$index"
+      return 0
+    fi
+  done
+  return 1
+}
+
+snapshot_assert_unchanged() {
+  local path=$1 index current baseline
+  index=$(snapshot_index "$path") || {
+    LAST_ERROR="Transaction path was not snapshotted: $path"
+    return 1
+  }
+  current=$(fingerprint_path "$path")
+  baseline=${SNAPSHOT_BASELINES[$index]}
+  if [[ $current != "$baseline" ]]; then
+    LAST_ERROR="A file changed during the transaction: $path"
+    return 1
+  fi
+  if [[ $baseline != missing && $baseline != file:* ]]; then
+    LAST_ERROR="Refusing to replace a non-regular file: $path"
+    return 1
+  fi
+}
+
+transaction_write_atomic() {
+  local source=$1 destination=$2 mode=${3:-600}
+  local index expected baseline
+  if [[ -n $SNAPSHOT_DIR ]]; then
+    index=$(snapshot_index "$destination") || return 1
+    baseline=${SNAPSHOT_BASELINES[$index]}
+    expected="file:$mode:$(sha256sum -- "$source" | awk '{print $1}')"
+    SNAPSHOT_EXPECTED[$index]=$expected
+    if ! atomic_replace_if_fingerprint "$source" "$destination" "$baseline" "$mode"; then
+      return 1
+    fi
+    return 0
+  fi
+  if ! write_atomic "$source" "$destination" "$mode"; then
+    LAST_ERROR="Could not write $destination"
+    return 1
+  fi
+}
+
+transaction_remove() {
+  local path=$1
+  local index baseline
+  if [[ -n $SNAPSHOT_DIR ]]; then
+    index=$(snapshot_index "$path") || return 1
+    baseline=${SNAPSHOT_BASELINES[$index]}
+    if ! atomic_remove_if_fingerprint "$path" "$baseline" "$index"; then
+      return 1
+    fi
+    return 0
+  fi
+  if ! rm -f -- "$path"; then
+    LAST_ERROR="Could not remove $path"
+    return 1
+  fi
+}
+
+snapshot_restore() {
+  local index path key mode expected baseline current failed=0
+  for ((index = 0; index < ${#SNAPSHOT_PATHS[@]}; index++)); do
+    path=${SNAPSHOT_PATHS[$index]}
+    key=${SNAPSHOT_KEYS[$index]}
+    expected=${SNAPSHOT_EXPECTED[$index]}
+    [[ -n $expected ]] || continue
+    baseline=${SNAPSHOT_BASELINES[$index]}
+    current=$(fingerprint_path "$path")
+    [[ $current != "$baseline" ]] || continue
+    if [[ -f $SNAPSHOT_DIR/$key.exists ]]; then
+      mode=$(stat -c %a "$SNAPSHOT_DIR/$key")
+      if ! atomic_replace_if_fingerprint "$SNAPSHOT_DIR/$key" "$path" "$expected" "$mode"; then
+        ROLLBACK_WARNING="Rollback could not restore $path"
+        [[ -z $PRESERVED_CONFLICT ]] || ROLLBACK_WARNING="$ROLLBACK_WARNING; a concurrent version was preserved at $PRESERVED_CONFLICT"
+        failed=1
+      fi
+    else
+      if ! atomic_remove_if_fingerprint "$path" "$expected"; then
+        ROLLBACK_WARNING="Rollback could not remove $path"
+        [[ -z $PRESERVED_CONFLICT ]] || ROLLBACK_WARNING="$ROLLBACK_WARNING; a concurrent version was preserved at $PRESERVED_CONFLICT"
+        failed=1
+      fi
+    fi
+  done
+  ((failed == 0))
+}
+
+snapshot_end() {
+  [[ -n $SNAPSHOT_DIR ]] && rm -rf -- "$SNAPSHOT_DIR"
+  SNAPSHOT_DIR=""
+}
+
+transaction_abort() {
+  local status=${1:-$?}
+  trap - EXIT HUP INT TERM
+  TRANSACTION_CRITICAL=0
+  TRANSACTION_PENDING_SIGNAL=0
+  if ((TRANSACTION_ARMED)); then
+    set +e
+    snapshot_restore >/dev/null 2>&1
+    if ((TRANSACTION_RELOAD_ON_ABORT)); then
+      reload_hyprland >/dev/null 2>&1
+    fi
+    snapshot_end
+  fi
+  ((status != 0)) || status=1
+  exit "$status"
+}
+
+transaction_arm() {
+  TRANSACTION_ARMED=1
+  TRANSACTION_RELOAD_ON_ABORT=${1:-0}
+  TRANSACTION_CRITICAL=0
+  TRANSACTION_PENDING_SIGNAL=0
+  trap 'transaction_abort $?' EXIT
+  trap 'transaction_signal 129' HUP
+  trap 'transaction_signal 130' INT
+  trap 'transaction_signal 143' TERM
+}
+
+transaction_signal() {
+  local status=$1
+  if ((TRANSACTION_CRITICAL)); then
+    TRANSACTION_PENDING_SIGNAL=$status
+    return 0
+  fi
+  transaction_abort "$status"
+}
+
+transaction_critical_begin() {
+  TRANSACTION_CRITICAL=1
+}
+
+transaction_critical_end() {
+  TRANSACTION_CRITICAL=0
+  local pending=$TRANSACTION_PENDING_SIGNAL
+  TRANSACTION_PENDING_SIGNAL=0
+  ((pending == 0)) || transaction_abort "$pending"
+}
+
+transaction_disarm() {
+  TRANSACTION_ARMED=0
+  TRANSACTION_RELOAD_ON_ABORT=0
+  TRANSACTION_CRITICAL=0
+  TRANSACTION_PENDING_SIGNAL=0
+  trap - EXIT HUP INT TERM
+}
+
+rollback_transaction() {
+  local cause=$1 reload_after_restore=${2:-0}
+  local restore_failed=0 reload_failed=0 recovery_error=""
+
+  if ! snapshot_restore; then
+    restore_failed=1
+  fi
+  if ((reload_after_restore)); then
+    if ! reload_hyprland; then
+      reload_failed=1
+      recovery_error=$LAST_ERROR
+    fi
+  fi
+
+  if ((restore_failed || reload_failed)); then
+    LAST_ERROR="$cause"
+    [[ -z $ROLLBACK_WARNING ]] || LAST_ERROR="$LAST_ERROR. $ROLLBACK_WARNING"
+    [[ -z $recovery_error ]] || LAST_ERROR="$LAST_ERROR. Recovery reload failed: $recovery_error"
+    return 1
+  fi
+  LAST_ERROR=$cause
+}
+
+bindings_json() {
+  local raw line keys description normalized temporary config_snapshot unparsed=0 editable expected='[]'
+  temporary=$(mktemp)
+  if ! raw=$(control_capture omarchy menu keybindings --print 2>/dev/null); then
+    rm -f -- "$temporary"
+    return 1
+  fi
+
+  if connected && owned_connection; then
+    config_snapshot=$(mktemp)
+    if ! write_config_snapshot "$config_snapshot"; then
+      rm -f -- "$temporary" "$config_snapshot"
+      return 1
+    fi
+    expected=$(jq -c '[.routines[] | select(.enabled) as $routine | $routine.triggers[] | select(.type == "shortcut") | {keys:.keys,description:("Omachord: " + $routine.name)}]' "$config_snapshot" 2>/dev/null) || expected='[]'
+    rm -f -- "$config_snapshot"
+  fi
+
+  while IFS= read -r line; do
+    if [[ $line == *"→"* ]]; then
+      keys=$(trim "${line%%→*}")
+      description=$(trim "${line#*→}")
+    elif [[ $line == *" -> "* ]]; then
+      keys=$(trim "${line%% -> *}")
+      description=$(trim "${line#* -> }")
+    else
+      [[ -z $(trim "$line") ]] || unparsed=1
+      continue
+    fi
+    if normalized=$(normalize_chord "$keys" 2>/dev/null); then
+      editable=true
+    else
+      normalized=$keys
+      editable=false
+    fi
+    jq -cn \
+      --arg keys "$normalized" \
+      --arg description "$description" \
+      --argjson editable "$editable" \
+      '{keys:$keys,description:$description,editable:$editable}' >>"$temporary"
+  done <<<"$raw"
+
+  if ((unparsed)); then
+    rm -f -- "$temporary"
+    LAST_ERROR="Omarchy returned an unrecognized keybinding row"
+    return 1
+  fi
+
+  jq -s --argjson expected "$expected" '
+    map(. as $binding
+      | ([$expected[] | select(
+          .keys == $binding.keys
+          and (.description == $binding.description
+            or ("Oma: " + (.description | ltrimstr("Omachord: "))) == $binding.description)
+        )][0] // null) as $managed
+      | . + {
+          description: ($managed.description // .description),
+          managed: ($managed != null)
+        })
+    | sort_by(.description, .keys)
+  ' "$temporary"
+  rm -f -- "$temporary"
+}
+
+check_shortcut_conflicts() {
+  local file=$1 catalogue routine keys override existing
+  if ! catalogue=$(bindings_json); then
+    LAST_ERROR="Could not read effective Omarchy keybindings"
+    return 1
+  fi
+
+  while IFS= read -r routine; do
+    keys=$(jq -r '.triggers[] | select(.type == "shortcut") | .keys' <<<"$routine")
+    override=$(jq -r '.triggers[] | select(.type == "shortcut") | .override' <<<"$routine")
+    existing=$(jq -r --arg keys "$keys" '[.[] | select(.keys == $keys and (.managed | not))][0].description // ""' <<<"$catalogue")
+    if [[ -n $existing && $override != "true" ]]; then
+      LAST_ERROR="$keys is already assigned to $existing"
+      return 1
+    fi
+  done < <(jq -c '.routines[] | select(.enabled) | select(any(.triggers[]; .type == "shortcut"))' "$file")
+}
+
+shadow_warnings_json() {
+  local file=$1 catalogue routine keys name found temporary
+  temporary=$(mktemp)
+  if ! catalogue=$(bindings_json); then
+    printf '%s\n' '[]'
+    rm -f -- "$temporary"
+    return
+  fi
+  while IFS= read -r routine; do
+    keys=$(jq -r '.triggers[] | select(.type == "shortcut") | .keys' <<<"$routine")
+    name=$(jq -r '.name' <<<"$routine")
+    found=$(jq -r --arg keys "$keys" --arg description "Omachord: $name" 'any(.[]; .keys == $keys and .description == $description)' <<<"$catalogue")
+    if [[ $found != "true" ]]; then
+      jq -cn --arg warning "$keys did not resolve to Omachord: $name after reload" '$warning' >>"$temporary"
+    fi
+  done < <(jq -c '.routines[] | select(.enabled) | select(any(.triggers[]; .type == "shortcut"))' "$file")
+  jq -s '.' "$temporary"
+  rm -f -- "$temporary"
+}
+
+generate_desktop_entry() {
+  cat <<EOF
+[Desktop Entry]
+Type=Application
+Name=Omachord
+Comment=Compose keyboard shortcuts and Omarchy automations
+Exec=omarchy-shell shell summon $PLUGIN_ID {}
+Icon=preferences-desktop-keyboard-shortcuts
+Terminal=false
+Categories=Settings;
+Keywords=shortcuts;keyboard;automation;omarchy;
+StartupNotify=false
+EOF
+}
+
+install_desktop_entry() {
+  local source
+  source=$(mktemp) || return 1
+  if ! generate_desktop_entry >"$source"; then
+    rm -f -- "$source"
+    return 1
+  fi
+  if ! transaction_write_atomic "$source" "$DESKTOP_FILE" 644; then
+    rm -f -- "$source"
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+append_loader() {
+  local allow_existing=${1:-true} source mode
+  mkdir -p "$HYPR_DIR" || {
+    LAST_ERROR="Could not create $HYPR_DIR"
+    return 1
+  }
+  if [[ -L $BINDINGS_FILE || (-e $BINDINGS_FILE && ! -f $BINDINGS_FILE) ]]; then
+    LAST_ERROR="Refusing to replace a non-regular file: $BINDINGS_FILE"
+    return 1
+  fi
+  if [[ -n $SNAPSHOT_DIR ]]; then
+    snapshot_assert_unchanged "$BINDINGS_FILE" || return 1
+  fi
+  if [[ -f $BINDINGS_FILE ]] && grep -Fqx -- "$LOADER_LINE" "$BINDINGS_FILE"; then
+    if [[ $allow_existing == true ]]; then
+      return 0
+    fi
+    LAST_ERROR="Refusing to claim a loader line created during Connect"
+    return 1
+  fi
+  source=$(mktemp) || return 1
+  if [[ -f $BINDINGS_FILE ]]; then
+    mode=$(stat -c %a "$BINDINGS_FILE")
+    if ! cat "$BINDINGS_FILE" >"$source"; then
+      rm -f -- "$source"
+      LAST_ERROR="Could not read $BINDINGS_FILE"
+      return 1
+    fi
+  else
+    mode=644
+  fi
+  if [[ -s $source && $(tail -c 1 "$source" | wc -l) -eq 0 ]]; then
+    printf '\n' >>"$source"
+  fi
+  printf '\n%s\n' "$LOADER_LINE" >>"$source"
+  if ! transaction_write_atomic "$source" "$BINDINGS_FILE" "$mode"; then
+    rm -f -- "$source"
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+remove_loader() {
+  local source mode
+  [[ -f $BINDINGS_FILE ]] || return 0
+  mode=$(stat -c %a "$BINDINGS_FILE")
+  source=$(mktemp) || return 1
+  grep -Fvx -- "$LOADER_LINE" "$BINDINGS_FILE" >"$source" || true
+  if ! transaction_write_atomic "$source" "$BINDINGS_FILE" "$mode"; then
+    rm -f -- "$source"
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+command_config_show() {
+  local temporary
+  temporary=$(mktemp)
+  if ! write_config_snapshot "$temporary" || ! validate_config_file "$temporary"; then
+    rm -f -- "$temporary"
+    fail "$LAST_ERROR" invalid-config
+  fi
+  jq -S '.' "$temporary"
+  rm -f -- "$temporary"
+}
+
+command_config_snapshot() {
+  local temporary revision committed=false
+  acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  temporary=$(mktemp)
+  if ! require_secure_config_file \
+    || ! write_config_snapshot "$temporary" \
+    || ! validate_config_file "$temporary"; then
+    rm -f -- "$temporary"
+    fail "$LAST_ERROR" invalid-config
+  fi
+  revision=$(snapshot_revision) || {
+    rm -f -- "$temporary"
+    fail "Could not identify the configuration revision" invalid-config
+  }
+  if configuration_is_committed "$revision" 1; then committed=true; fi
+  jq -cn --arg revision "$revision" --argjson committed "$committed" \
+    --slurpfile config "$temporary" \
+    '{ok:true,revision:$revision,committed:$committed,config:$config[0]}'
+  rm -f -- "$temporary"
+}
+
+command_config_validate() {
+  local temporary
+  temporary=$(mktemp)
+  if ! read_config_stdin "$temporary" || ! validate_config_file "$temporary"; then
+    rm -f -- "$temporary"
+    fail "$LAST_ERROR" invalid-config
+  fi
+  rm -f -- "$temporary"
+  json_ok "Configuration is valid"
+}
+
+command_config_apply() {
+  local expected_revision=${1:-} candidate current_snapshot current_baseline current_revision
+  local config_index warnings="[]" mutation_error code active=false
+  [[ $# -eq 1 && $expected_revision =~ ^(missing|sha256:[0-9a-f]{64})$ ]] \
+    || fail "Usage: omachord config apply <expected-revision>" usage
+  candidate=$(mktemp)
+  if ! read_config_stdin "$candidate" || ! validate_config_file "$candidate"; then
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" invalid-config
+  fi
+
+  acquire_config_lock || fail "$LAST_ERROR" unsafe-state
+
+  current_snapshot=$(mktemp)
+  if ! require_secure_config_file || ! write_config_snapshot "$current_snapshot"; then
+    rm -f -- "$candidate" "$current_snapshot"
+    fail "$LAST_ERROR" unsafe-config
+  fi
+  current_baseline=$CONFIG_SNAPSHOT_FINGERPRINT
+  current_revision=$(snapshot_revision) || {
+    rm -f -- "$candidate" "$current_snapshot"
+    fail "Could not identify the configuration revision" invalid-config
+  }
+  rm -f -- "$current_snapshot"
+  if [[ $current_revision != "$expected_revision" ]]; then
+    rm -f -- "$candidate"
+    fail "Configuration changed since it was loaded" stale-config
+  fi
+
+  if command -v omarchy >/dev/null 2>&1 && ! check_shortcut_conflicts "$candidate"; then
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" shortcut-conflict
+  fi
+
+  if connected; then
+    active=true
+    if ! owned_connection; then
+      rm -f -- "$candidate"
+      fail "The Hyprland loader exists but is not owned by this installation" ownership-conflict
+    fi
+    if ! require_clean_hyprland && integration_complete; then
+      rm -f -- "$candidate"
+      fail "$LAST_ERROR" hyprland-errors
+    fi
+  fi
+
+  export OMACHORD_BULK_CLEANUP=1
+  if ! deactivate_orphans config "$candidate"; then
+    unset OMACHORD_BULK_CLEANUP
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" action-failed
+  fi
+  unset OMACHORD_BULK_CLEANUP
+
+  if ! snapshot_begin \
+    || ! snapshot_file "$CONFIG_FILE" config \
+    || ! snapshot_file "$COMMIT_FILE" commit; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" snapshot-failed
+  fi
+  config_index=$(snapshot_index "$CONFIG_FILE")
+  if [[ ${SNAPSHOT_BASELINES[$config_index]} != "$current_baseline" ]]; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "Configuration changed before the transaction started" concurrent-edit
+  fi
+  if [[ $active == true ]] && ! snapshot_file "$GENERATED_LUA" generated; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" snapshot-failed
+  fi
+  transaction_arm "$([[ $active == true ]] && printf 1 || printf 0)"
+
+  mutation_error=""
+  if ! transaction_write_atomic "$candidate" "$CONFIG_FILE" 600; then
+    mutation_error=${LAST_ERROR:-"Could not write the Omachord configuration"}
+  elif [[ $active == true ]] && ! sync_generated_lua "$candidate"; then
+    mutation_error=${LAST_ERROR:-"Could not update the generated shortcuts"}
+  fi
+  if [[ -n $mutation_error ]]; then
+    if rollback_transaction "$mutation_error" 0; then code=write-rolled-back; else code=rollback-failed; fi
+    transaction_disarm
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" "$code"
+  fi
+
+  if [[ $active == true ]]; then
+    if ! reload_hyprland; then
+      mutation_error=$LAST_ERROR
+      if rollback_transaction "$mutation_error" 1; then code=reload-rolled-back; else code=rollback-failed; fi
+      transaction_disarm
+      snapshot_end
+      rm -f -- "$candidate"
+      fail "$LAST_ERROR" "$code"
+    fi
+    warnings=$(shadow_warnings_json "$candidate")
+  fi
+
+  if ! write_config_commit "$candidate"; then
+    mutation_error=${LAST_ERROR:-"Could not commit the routine configuration"}
+    if rollback_transaction "$mutation_error" "$([[ $active == true ]] && printf 1 || printf 0)"; then
+      code=commit-rolled-back
+    else
+      code=rollback-failed
+    fi
+    transaction_disarm
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" "$code"
+  fi
+
+  transaction_disarm
+  snapshot_end
+  rm -f -- "$candidate"
+  jq -cn --argjson connected "$(connected && printf true || printf false)" \
+    --argjson warnings "$warnings" --arg revision "$CONFIG_COMMIT_REVISION" \
+    --argjson deactivated "$DEACTIVATED_IDS" \
+    '{ok:true,connected:$connected,warnings:$warnings,revision:$revision,deactivated:$deactivated}'
+}
+
+command_connect() {
+  local expected_revision=${1:-} candidate candidate_baseline candidate_revision config_index
+  local warnings mutation_error code repairing=false already_connected=false
+  [[ $# -le 1 && (-z $expected_revision || $expected_revision =~ ^(missing|sha256:[0-9a-f]{64})$) ]] \
+    || fail "Usage: omachord connect [expected-revision]" usage
+  acquire_config_lock || fail "$LAST_ERROR" unsafe-state
+  require_secure_config_file || fail "$LAST_ERROR" unsafe-config
+
+  if connected; then
+    if ! owned_connection; then
+      fail "The Omachord loader already exists but this installation does not own it" ownership-conflict
+    fi
+    if integration_complete; then
+      if integration_branding_current; then already_connected=true; else repairing=true; fi
+    else
+      repairing=true
+    fi
+  elif owned_connection; then
+    repairing=true
+  fi
+  if ! owned_connection && connection_collision; then
+    fail "$LAST_ERROR" ownership-conflict
+  fi
+  if [[ $already_connected != true && $repairing != true ]]; then
+    require_clean_hyprland || fail "$LAST_ERROR" hyprland-errors
+  fi
+
+  candidate=$(mktemp)
+  if ! write_config_snapshot "$candidate" || ! validate_config_file "$candidate"; then
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" invalid-config
+  fi
+  candidate_baseline=$CONFIG_SNAPSHOT_FINGERPRINT
+  candidate_revision=$(revision_for_fingerprint "$candidate_baseline") || {
+    rm -f -- "$candidate"
+    fail "Could not identify the configuration revision" invalid-config
+  }
+  if [[ -n $expected_revision && $candidate_revision != "$expected_revision" ]]; then
+    rm -f -- "$candidate"
+    fail "Configuration changed since it was loaded" stale-config
+  fi
+  if [[ $already_connected == true ]]; then
+    rm -f -- "$candidate"
+    remove_connection_disabled || fail "$LAST_ERROR" unsafe-state
+    jq -cn '{ok:true,connected:true,alreadyConnected:true,warnings:[]}'
+    return
+  fi
+
+  if command -v omarchy >/dev/null 2>&1 && ! check_shortcut_conflicts "$candidate"; then
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" shortcut-conflict
+  fi
+
+  if ! snapshot_begin \
+    || ! snapshot_file "$BINDINGS_FILE" bindings \
+    || ! snapshot_file "$CONFIG_FILE" config \
+    || ! snapshot_file "$COMMIT_FILE" commit \
+    || ! snapshot_file "$DISABLED_FILE" disabled; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" snapshot-failed
+  fi
+  config_index=$(snapshot_index "$CONFIG_FILE")
+  if [[ ${SNAPSHOT_BASELINES[$config_index]} != "$candidate_baseline" ]]; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "Configuration changed before the transaction started" concurrent-edit
+  fi
+  if [[ $repairing != true && -f $BINDINGS_FILE ]] \
+    && grep -Fqx -- "$LOADER_LINE" "$BINDINGS_FILE"; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "Refusing to claim a loader line created during Connect" ownership-conflict
+  fi
+  if [[ $repairing == true ]]; then
+    if ! snapshot_file "$GENERATED_LUA" generated \
+      || ! snapshot_file "$DESKTOP_FILE" desktop \
+      || ! snapshot_file "$OWNERSHIP_FILE" ownership; then
+      snapshot_end
+      rm -f -- "$candidate"
+      fail "$LAST_ERROR" snapshot-failed
+    fi
+    for event in "${HOOK_EVENTS[@]}"; do
+      if ! snapshot_file "$(hook_wrapper_path "$event")" "hook-$event"; then
+        snapshot_end
+        rm -f -- "$candidate"
+        fail "$LAST_ERROR" snapshot-failed
+      fi
+    done
+  elif ! snapshot_missing_artifacts; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" ownership-conflict
+  fi
+  if ! backup_bindings; then
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" backup-failed
+  fi
+  transaction_arm 1
+
+  if ! transaction_write_atomic "$candidate" "$CONFIG_FILE" 600 \
+    || ! transaction_remove "$DISABLED_FILE" \
+    || ! write_ownership \
+    || ! append_loader "$repairing" \
+    || ! sync_generated_lua "$candidate" \
+    || ! install_hook_wrappers \
+    || ! install_desktop_entry; then
+    mutation_error=${LAST_ERROR:-"Could not install Omachord integration"}
+    if rollback_transaction "$mutation_error" 0; then code=connect-rolled-back; else code=rollback-failed; fi
+    transaction_disarm
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" "$code"
+  fi
+  if ! reload_hyprland; then
+    mutation_error=$LAST_ERROR
+    if rollback_transaction "$mutation_error" 1; then code=connect-rolled-back; else code=rollback-failed; fi
+    transaction_disarm
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" "$code"
+  fi
+
+  if ! write_config_commit "$candidate"; then
+    mutation_error=${LAST_ERROR:-"Could not commit the routine configuration"}
+    if rollback_transaction "$mutation_error" 1; then code=connect-rolled-back; else code=rollback-failed; fi
+    transaction_disarm
+    snapshot_end
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" "$code"
+  fi
+
+  warnings=$(shadow_warnings_json "$candidate")
+  transaction_disarm
+  snapshot_end
+  rm -f -- "$candidate"
+  jq -cn --argjson warnings "$warnings" --argjson repaired "$repairing" \
+    --arg revision "$CONFIG_COMMIT_REVISION" \
+    '{ok:true,connected:true,repaired:$repaired,warnings:$warnings,revision:$revision}'
+}
+
+command_disconnect() {
+  local event mutation_error code
+  acquire_config_lock || fail "$LAST_ERROR" unsafe-state
+
+  if ! connected && ! owned_connection; then
+    export OMACHORD_BULK_CLEANUP=1
+    if ! deactivate_all disconnect; then
+      unset OMACHORD_BULK_CLEANUP
+      fail "$LAST_ERROR" action-failed
+    fi
+    unset OMACHORD_BULK_CLEANUP
+    write_connection_disabled || fail "$LAST_ERROR" unsafe-state
+    jq -cn --argjson deactivated "$DEACTIVATED_IDS" \
+      '{ok:true,connected:false,alreadyDisconnected:true,deactivated:$deactivated}'
+    return
+  fi
+  if ! owned_connection; then
+    fail "The Hyprland loader is not owned by this installation; it was left untouched" ownership-conflict
+  fi
+  export OMACHORD_BULK_CLEANUP=1
+  if ! deactivate_all disconnect; then
+    unset OMACHORD_BULK_CLEANUP
+    fail "$LAST_ERROR" action-failed
+  fi
+  unset OMACHORD_BULK_CLEANUP
+  if ! snapshot_begin || ! snapshot_owned_files 0 1; then
+    snapshot_end
+    fail "$LAST_ERROR" snapshot-failed
+  fi
+  if ! backup_bindings; then
+    snapshot_end
+    fail "$LAST_ERROR" backup-failed
+  fi
+  transaction_arm 1
+
+  if ! remove_loader \
+    || ! transaction_remove "$GENERATED_LUA" \
+    || ! transaction_remove "$DESKTOP_FILE"; then
+    mutation_error=${LAST_ERROR:-"Could not remove Omachord integration"}
+  else
+    mutation_error=""
+    for event in "${HOOK_EVENTS[@]}"; do
+      if ! transaction_remove "$(hook_wrapper_path "$event")"; then
+        mutation_error=${LAST_ERROR:-"Could not remove an Omachord hook"}
+        break
+      fi
+    done
+    if [[ -z $mutation_error ]] && ! transaction_remove "$OWNERSHIP_FILE"; then
+      mutation_error=${LAST_ERROR:-"Could not remove Omachord ownership state"}
+    fi
+    if [[ -z $mutation_error ]] && ! write_connection_disabled; then
+      mutation_error=${LAST_ERROR:-"Could not save the connection preference"}
+    fi
+  fi
+
+  if [[ -n $mutation_error ]]; then
+    if rollback_transaction "$mutation_error" 0; then code=disconnect-rolled-back; else code=rollback-failed; fi
+    transaction_disarm
+    snapshot_end
+    fail "$LAST_ERROR" "$code"
+  fi
+  if ! reload_hyprland; then
+    mutation_error=$LAST_ERROR
+    if rollback_transaction "$mutation_error" 1; then code=disconnect-rolled-back; else code=rollback-failed; fi
+    transaction_disarm
+    snapshot_end
+    fail "$LAST_ERROR" "$code"
+  fi
+  transaction_disarm
+  snapshot_end
+  jq -cn --argjson deactivated "$DEACTIVATED_IDS" '{ok:true,connected:false,deactivated:$deactivated}'
+}
+
+command_autostart() {
+  local disabled_state=0
+  [[ $# -eq 0 ]] || fail "Usage: omachord autostart" usage
+  connection_disabled || disabled_state=$?
+  if ((disabled_state == 2)); then
+    fail "$LAST_ERROR" unsafe-state
+  fi
+  if ((disabled_state == 0)); then
+    jq -cn '{ok:true,connected:false,disabled:true,skipped:true}'
+    return
+  fi
+  command_connect
+}
+
+command_status() {
+  local errors="" clean=false hyprland_available=false config_valid=true config_error=""
+  local temporary disabled_state=0 connection_enabled=true
+  acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  temporary=$(mktemp)
+  if ! write_config_snapshot "$temporary"; then
+    config_valid=false
+    config_error=$LAST_ERROR
+  elif ! require_secure_config_file; then
+    config_valid=false
+    config_error=$LAST_ERROR
+  elif ! validate_config_file "$temporary"; then
+    config_valid=false
+    config_error=$LAST_ERROR
+  fi
+  rm -f -- "$temporary"
+  connection_disabled || disabled_state=$?
+  if ((disabled_state == 2)); then
+    config_valid=false
+    config_error=$LAST_ERROR
+  elif ((disabled_state == 0)); then
+    connection_enabled=false
+  fi
+
+  if command -v hyprctl >/dev/null 2>&1; then
+    if errors=$(control_capture hyprctl configerrors 2>&1); then
+      hyprland_available=true
+      [[ -n $errors ]] || clean=true
+    else
+      errors=${errors:-"Unable to query Hyprland configuration errors"}
+    fi
+  fi
+  jq -cn \
+    --argjson connected "$(connected && printf true || printf false)" \
+    --argjson ownedConnection "$(owned_connection && printf true || printf false)" \
+    --argjson integrationComplete "$(integration_complete && printf true || printf false)" \
+    --argjson connectionEnabled "$connection_enabled" \
+    --argjson configExists "$([[ -f $CONFIG_FILE ]] && printf true || printf false)" \
+    --argjson configValid "$config_valid" \
+    --arg configError "$config_error" \
+    --arg configPath "$CONFIG_FILE" \
+    --arg runnerPath "$RUNNER_PATH" \
+    --argjson hyprlandAvailable "$hyprland_available" \
+    --argjson hyprlandClean "$clean" \
+    --arg hyprlandErrors "$errors" \
+    --argjson activeCount "$(active_routine_ids | /usr/bin/grep -c . || true)" \
+    '{ok:true,connected:$connected,ownedConnection:$ownedConnection,integrationComplete:$integrationComplete,connectionEnabled:$connectionEnabled,configExists:$configExists,configValid:$configValid,configError:$configError,configPath:$configPath,runnerPath:$runnerPath,hyprlandAvailable:$hyprlandAvailable,hyprlandClean:$hyprlandClean,hyprlandErrors:$hyprlandErrors,activeCount:$activeCount}'
+}
+
+command_commands() {
+  local metadata
+  metadata=$(control_capture omarchy commands --json) \
+    || fail "Could not read Omarchy command metadata" commands-unavailable
+  jq '[
+    .commands[]
+    | select(.requires_sudo == false and .hidden == false) as $command
+    | ($command.routes // [$command.route])[]
+    | {route:.,summary:$command.summary,args:$command.args}
+  ] | unique_by(.route) | sort_by(.route)' <<<"$metadata"
+}
+
+rotate_log() {
+  local size temporary
+  secure_optional_private_file "$LOG_FILE" 600 "run history" || return 1
+  [[ -e $LOG_FILE ]] || return 0
+  size=$(stat -c %s "$LOG_FILE" 2>/dev/null || printf 0)
+  ((size <= 262144)) && return 0
+  temporary=$(mktemp)
+  tail -n 200 "$LOG_FILE" >"$temporary"
+  if ! write_atomic "$temporary" "$LOG_FILE" 600 \
+    || ! secure_optional_private_file "$LOG_FILE" 600 "run history"; then
+    rm -f -- "$temporary"
+    LAST_ERROR=${LAST_ERROR:-"Could not rotate run history"}
+    return 1
+  fi
+  rm -f -- "$temporary"
+}
+
+log_run() {
+  local routine_id=$1 trigger=$2 status=$3 duration=$4 error=${5:-}
+  local entry
+  entry=$(jq -cn \
+    --arg timestamp "$(date --iso-8601=seconds)" \
+    --arg routineId "$routine_id" \
+    --arg trigger "$trigger" \
+    --arg status "$status" \
+    --argjson durationMs "$duration" \
+    --arg error "$error" \
+    '{timestamp:$timestamp,routineId:$routineId,trigger:$trigger,status:$status,durationMs:$durationMs,error:$error}')
+  acquire_log_lock exclusive || return 1
+  if ! ensure_private_file "$LOG_FILE" 600 "run history" || ! rotate_log; then
+    exec 8>&-
+    return 1
+  fi
+  if ! safe_open_private_fd 6 "$LOG_FILE" 600 "run history"; then
+    exec 6>&- 8>&-
+    LAST_ERROR=${LAST_ERROR:-"Could not open run history"}
+    return 1
+  fi
+  if ! private_fd_matches_file 6 "$LOG_FILE" \
+    || ! printf '%s\n' "$entry" >>"/proc/self/fd/6"; then
+    exec 6>&- 8>&-
+    LAST_ERROR="Could not append run history"
+    return 1
+  fi
+  exec 6>&-
+  exec 8>&-
+}
+
+cleanup_active_action() {
+  set +e
+  if [[ -n $ACTIVE_ACTION_PGID ]]; then
+    kill -TERM -- "-$ACTIVE_ACTION_PGID" 2>/dev/null || true
+    sleep 0.05 6>&- 7>&- 8>&- 9>&-
+    kill -KILL -- "-$ACTIVE_ACTION_PGID" 2>/dev/null || true
+  fi
+  [[ -z $ACTIVE_TIMEOUT_PID ]] || wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null
+  if [[ -n $ACTIVE_COLLECTOR_PID ]]; then
+    kill "$ACTIVE_COLLECTOR_PID" 2>/dev/null
+    wait "$ACTIVE_COLLECTOR_PID" 2>/dev/null
+  fi
+  [[ -z $ACTIVE_DONE_FILE ]] || : >"$ACTIVE_DONE_FILE"
+  [[ -z $ACTIVE_GUARD_PID ]] || wait "$ACTIVE_GUARD_PID" 2>/dev/null
+  [[ -z $ACTIVE_CAPTURE_DIR ]] || rm -rf -- "$ACTIVE_CAPTURE_DIR"
+  ACTIVE_TIMEOUT_PID=""
+  ACTIVE_COLLECTOR_PID=""
+  ACTIVE_CAPTURE_DIR=""
+  ACTIVE_ACTION_PGID=""
+  ACTIVE_GUARD_PID=""
+  ACTIVE_DONE_FILE=""
+  set -e
+}
+
+process_start_time() {
+  local stat rest
+  stat=$(<"/proc/$1/stat") || return 1
+  rest=${stat##*) }
+  local -a fields=()
+  read -r -a fields <<<"$rest"
+  ((${#fields[@]} >= 20)) || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+process_is_live() {
+  local pid=$1 expected_start=$2 stat rest
+  stat=$(<"/proc/$pid/stat") || return 1
+  rest=${stat##*) }
+  local -a fields=()
+  read -r -a fields <<<"$rest"
+  ((${#fields[@]} >= 20)) \
+    && [[ ${fields[0]} != Z && ${fields[19]} == "$expected_start" ]]
+}
+
+action_guard() {
+  local parent_pid=$1 parent_start=$2 action_pgid=$3 done_file=$4
+  while [[ ! -e $done_file ]]; do
+    if ! process_is_live "$parent_pid" "$parent_start"; then
+      kill -TERM -- "-$action_pgid" 2>/dev/null || true
+      sleep 0.05
+      kill -KILL -- "-$action_pgid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.02
+  done
+}
+
+abort_active_routine() {
+  local status=$1
+  trap - HUP INT TERM
+  cleanup_active_action
+  exit "$status"
+}
+
+run_capture() {
+  local output_file=$1
+  shift
+  local status capture_dir fifo collector timeout_pid guard_pid parent_pid parent_start done_file index output_size
+  local capture_mode=${OMACHORD_CAPTURE_MODE:-tail} capture_limit=${OMACHORD_CAPTURE_LIMIT:-4096}
+  LAST_ERROR=""
+  capture_dir=$(mktemp -d) || {
+    LAST_ERROR="Could not create an action output buffer"
+    return 1
+  }
+  ACTIVE_CAPTURE_DIR=$capture_dir
+  fifo="$capture_dir/output"
+  done_file="$capture_dir/done"
+  if ! mkfifo "$fifo"; then
+    rm -rf -- "$capture_dir"
+    ACTIVE_CAPTURE_DIR=""
+    LAST_ERROR="Could not create an action output buffer"
+    return 1
+  fi
+  if [[ $capture_mode == head ]]; then
+    head -c "$((capture_limit + 1))" <"$fifo" >"$output_file" 6>&- 7>&- 8>&- 9>&- &
+  else
+    tail -c "$capture_limit" <"$fifo" >"$output_file" 6>&- 7>&- 8>&- 9>&- &
+  fi
+  collector=$!
+  ACTIVE_COLLECTOR_PID=$collector
+  set +e
+  # The timeout supervisor retains lock descriptors if this runner is killed;
+  # the action itself receives them closed and cannot leak them to descendants.
+  timeout --kill-after=1s -- "${OMACHORD_ACTION_TIMEOUT:-30s}" \
+    bash -c 'exec 6>&- 7>&- 8>&- 9>&-; exec "$@"' bash "$@" \
+    8>&- 9>&- >"$fifo" 2>&1 &
+  timeout_pid=$!
+  ACTIVE_TIMEOUT_PID=$timeout_pid
+  ACTIVE_ACTION_PGID=$timeout_pid
+  parent_pid=$BASHPID
+  parent_start=$(process_start_time "$parent_pid") || {
+    LAST_ERROR="Could not start the action cleanup guard"
+    cleanup_active_action
+    return 1
+  }
+  setsid "$SELF_PATH" __action-guard "$parent_pid" "$parent_start" \
+    "$timeout_pid" "$done_file" 8>&- 9>&- </dev/null >/dev/null 2>&1 &
+  guard_pid=$!
+  ACTIVE_GUARD_PID=$guard_pid
+  ACTIVE_DONE_FILE=$done_file
+  wait "$timeout_pid"
+  status=$?
+  output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
+
+  # A detached child that closed stdout is intentional and does not block the
+  # routine. Only stop descendants that still hold the capture pipe open.
+  for ((index = 0; index < 10; index++)); do
+    kill -0 "$collector" 2>/dev/null || break
+    sleep 0.01 6>&- 7>&- 8>&- 9>&-
+  done
+  if kill -0 "$collector" 2>/dev/null \
+    || { [[ $capture_mode == head ]] && ((output_size > capture_limit)); }; then
+    kill -TERM -- "-$timeout_pid" 2>/dev/null || true
+    sleep 0.05 6>&- 7>&- 8>&- 9>&-
+    kill -KILL -- "-$timeout_pid" 2>/dev/null || true
+  fi
+  for ((index = 0; index < 20; index++)); do
+    kill -0 "$collector" 2>/dev/null || break
+    sleep 0.01 6>&- 7>&- 8>&- 9>&-
+  done
+  if kill -0 "$collector" 2>/dev/null; then
+    kill "$collector" 2>/dev/null || true
+  fi
+  wait "$collector" 2>/dev/null || true
+  output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
+  if [[ $capture_mode == head ]] && ((output_size > capture_limit)); then
+    kill -TERM -- "-$timeout_pid" 2>/dev/null || true
+    sleep 0.05 6>&- 7>&- 8>&- 9>&-
+    kill -KILL -- "-$timeout_pid" 2>/dev/null || true
+    status=125
+    LAST_ERROR="Command output exceeds the $capture_limit byte limit"
+  fi
+  : >"$done_file"
+  wait "$guard_pid" 2>/dev/null || true
+  set -e
+  rm -rf -- "$capture_dir"
+  ACTIVE_TIMEOUT_PID=""
+  ACTIVE_COLLECTOR_PID=""
+  ACTIVE_CAPTURE_DIR=""
+  ACTIVE_ACTION_PGID=""
+  ACTIVE_GUARD_PID=""
+  ACTIVE_DONE_FILE=""
+  if ((status == 0)); then
+    return 0
+  fi
+  if ((status == 124 || status == 137)); then
+    LAST_ERROR="Action timed out after ${OMACHORD_ACTION_TIMEOUT:-30s}"
+  elif [[ -z $LAST_ERROR ]]; then
+    LAST_ERROR=$(tail -c 2000 "$output_file" | tr '\n' ' ')
+    [[ -n $LAST_ERROR ]] || LAST_ERROR="Command failed: $1"
+  fi
+  return 1
+}
+
+execute_microphone_action() {
+  local action=$1 output=$2 muted sound_path
+  if ! ensure_private_file "$RUN_LOCK_DIR/resource-microphone.lock" 600 "microphone resource lock"; then
+    return 1
+  fi
+  safe_open_private_fd 6 "$RUN_LOCK_DIR/resource-microphone.lock" 600 \
+    "microphone resource lock" || return 1
+  if ! private_fd_matches_file 6 "$RUN_LOCK_DIR/resource-microphone.lock" \
+    || ! flock -x -w "$LOCK_TIMEOUT" 6 \
+    || ! private_fd_matches_file 6 "$RUN_LOCK_DIR/resource-microphone.lock"; then
+    exec 6>&-
+    LAST_ERROR="Could not lock the microphone resource"
+    return 1
+  fi
+
+  if ! run_capture "$output" omarchy audio input mute; then
+    exec 6>&-
+    return 1
+  fi
+
+  if [[ $(jq -r '.sound' <<<"$action") == "true" ]]; then
+    if ! run_capture "$output" wpctl get-volume @DEFAULT_AUDIO_SOURCE@; then
+      [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not read microphone state"
+      exec 6>&-
+      return 1
+    fi
+    muted=$(cat -- "$output")
+    if [[ $muted == *MUTED* ]]; then
+      sound_path=$(jq -r '.mutedSound' <<<"$action")
+    else
+      sound_path=$(jq -r '.liveSound' <<<"$action")
+    fi
+    if [[ ! -f $sound_path ]]; then
+      LAST_ERROR="Sound file not found: $sound_path"
+      exec 6>&-
+      return 1
+    fi
+    if ! run_capture "$output" paplay "$sound_path"; then
+      exec 6>&-
+      return 1
+    fi
+  fi
+
+  exec 6>&-
+}
+
+execute_action() {
+  local action=$1 type output sound_path desktop_id route metadata binary binary_path omarchy_executable milliseconds seconds delay_timeout program command setter_value
+  local -a args=()
+  type=$(jq -r '.type' <<<"$action")
+  output=$(mktemp)
+
+  case $type in
+    nightlight|dnd|stay-awake|theme|brightness)
+      setter_value=$(setter_value_from_action "$action")
+      if ! write_setter "$type" "$setter_value"; then rm -f -- "$output"; return 1; fi
+      ;;
+    microphone-toggle)
+      if ! execute_microphone_action "$action" "$output"; then rm -f -- "$output"; return 1; fi
+      ;;
+    launch-app)
+      desktop_id=$(jq -r '.desktopId' <<<"$action")
+      desktop_id=${desktop_id%.desktop}.desktop
+      if ! run_capture "$output" uwsm-app -- gtk-launch -- "$desktop_id"; then rm -f -- "$output"; return 1; fi
+      ;;
+    omarchy-command)
+      route=$(jq -r '.route' <<<"$action")
+      if ! metadata=$(control_capture omarchy commands --json); then
+        LAST_ERROR="Could not read Omarchy command metadata"
+        rm -f -- "$output"
+        return 1
+      fi
+      binary=$(jq -r --arg route "$route" '.commands[] | select(.requires_sudo == false and .hidden == false) | select((.routes // [.route]) | index($route)) | .binary' <<<"$metadata" | head -n 1)
+      if [[ -z $binary || $binary == */* ]]; then
+        LAST_ERROR="Omarchy command is unavailable for automation: $route"
+        rm -f -- "$output"
+        return 1
+      fi
+      omarchy_executable=$(command -v omarchy)
+      binary_path=$(dirname -- "$omarchy_executable")/$binary
+      if [[ ! -x $binary_path ]]; then
+        LAST_ERROR="Omarchy command executable is missing: $binary_path"
+        rm -f -- "$output"
+        return 1
+      fi
+      mapfile -t args < <(jq -r '.args[]' <<<"$action")
+      if ! run_capture "$output" "$binary_path" "${args[@]}"; then rm -f -- "$output"; return 1; fi
+      ;;
+    notification)
+      args=(notification send -u "$(jq -r '.urgency' <<<"$action")")
+      local glyph
+      glyph=$(jq -r '.glyph' <<<"$action")
+      [[ -z $glyph ]] || args+=(-g "$glyph")
+      args+=("$(jq -r '.title' <<<"$action")" "$(jq -r '.body' <<<"$action")")
+      if ! run_capture "$output" omarchy "${args[@]}"; then rm -f -- "$output"; return 1; fi
+      ;;
+    osd)
+      args=(osd)
+      local icon message progress duration
+      icon=$(jq -r '.icon' <<<"$action")
+      message=$(jq -r '.message' <<<"$action")
+      progress=$(jq -r '.progress' <<<"$action")
+      duration=$(jq -r '.duration' <<<"$action")
+      [[ -z $icon ]] || args+=(-i "$icon")
+      [[ -z $message ]] || args+=(-m "$message")
+      ((progress < 0)) || args+=(-p "$progress")
+      ((duration == 0)) || args+=(-d "$duration")
+      if ! run_capture "$output" omarchy "${args[@]}"; then rm -f -- "$output"; return 1; fi
+      ;;
+    sound)
+      sound_path=$(jq -r '.path' <<<"$action")
+      [[ -f $sound_path ]] || { LAST_ERROR="Sound file not found: $sound_path"; rm -f -- "$output"; return 1; }
+      if ! run_capture "$output" paplay "$sound_path"; then rm -f -- "$output"; return 1; fi
+      ;;
+    delay)
+      milliseconds=$(jq -r '.milliseconds' <<<"$action")
+      seconds=$(jq -nr --argjson ms "$milliseconds" '$ms / 1000')
+      delay_timeout=$(jq -nr --argjson ms "$milliseconds" '($ms / 1000 + 1 | tostring) + "s"')
+      if ! OMACHORD_ACTION_TIMEOUT="$delay_timeout" run_capture "$output" sleep "$seconds"; then
+        rm -f -- "$output"
+        return 1
+      fi
+      ;;
+    exec)
+      program=$(jq -r '.program' <<<"$action")
+      mapfile -t args < <(jq -r '.args[]' <<<"$action")
+      if ! run_capture "$output" "$program" "${args[@]}"; then rm -f -- "$output"; return 1; fi
+      ;;
+    shell)
+      command=$(jq -r '.command' <<<"$action")
+      if ! run_capture "$output" bash -lc "$command"; then rm -f -- "$output"; return 1; fi
+      ;;
+    *)
+      LAST_ERROR="Unknown action type: $type"
+      rm -f -- "$output"
+      return 1
+      ;;
+  esac
+
+  rm -f -- "$output"
+}
+
+is_setter_type() {
+  local candidate
+  for candidate in "${SETTER_TYPES[@]}"; do
+    [[ $candidate == "$1" ]] && return 0
+  done
+  return 1
+}
+
+setter_value_from_action() {
+  jq -r 'if (.value | type) == "number" then (.value | floor | tostring) else (.value | tostring) end' <<<"$1"
+}
+
+# Mirrors the normalization in omarchy-theme-set so a current theme name
+# compares equal to the slug a routine stores.
+theme_slug_from_name() {
+  local value
+  value=$(trim "$1")
+  sed -E 's/<[^>]+>//g' <<<"$value" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'
+}
+
+# Reads one setter's current value into SETTER_VALUE as a normalized string
+# (true|false, a theme slug, or an integer percentage). Fails closed on any
+# unexpected output so activation never records a value it cannot restore.
+SETTER_VALUE=""
+read_setter() {
+  local type=$1 raw value
+  SETTER_VALUE=""
+  case $type in
+    nightlight)
+      raw=$(control_capture omarchy-shell nightlight status 2>/dev/null) \
+        || { LAST_ERROR="Could not read the night light state"; return 1; }
+      value=$(jq -er 'select(type == "object") | .enabled | select(type == "boolean") | tostring' <<<"$raw" 2>/dev/null) \
+        || { LAST_ERROR="Unexpected night light state: ${raw:0:100}"; return 1; }
+      ;;
+    dnd)
+      raw=$(control_capture omarchy-shell notifications isDnd 2>/dev/null) \
+        || { LAST_ERROR="Could not read the do-not-disturb state"; return 1; }
+      case $(trim "$raw") in
+        on) value=true ;;
+        off) value=false ;;
+        *) LAST_ERROR="Unexpected do-not-disturb state: ${raw:0:100}"; return 1 ;;
+      esac
+      ;;
+    stay-awake)
+      raw=$(control_capture omarchy-shell idle status 2>/dev/null) \
+        || { LAST_ERROR="Could not read the stay-awake state"; return 1; }
+      value=$(jq -er 'select(type == "object") | .stayAwake | select(type == "boolean") | tostring' <<<"$raw" 2>/dev/null) \
+        || { LAST_ERROR="Unexpected stay-awake state: ${raw:0:100}"; return 1; }
+      ;;
+    theme)
+      raw=$(control_capture omarchy-theme-current 2>/dev/null) \
+        || { LAST_ERROR="Could not read the current theme"; return 1; }
+      value=$(theme_slug_from_name "$raw")
+      if [[ ! $value =~ ^[a-z0-9]+(-[a-z0-9]+)*$ || $value == unknown || ${#value} -gt 100 ]]; then
+        LAST_ERROR="Unexpected current theme: ${raw:0:100}"
+        return 1
+      fi
+      ;;
+    brightness)
+      raw=$(control_capture omarchy-brightness-display --no-osd 2>/dev/null) \
+        || { LAST_ERROR="Could not read the display brightness"; return 1; }
+      value=$(trim "$raw")
+      if [[ ! $value =~ ^[0-9]{1,3}$ ]] || ((10#$value > 100)); then
+        LAST_ERROR="Unexpected display brightness: ${raw:0:100}"
+        return 1
+      fi
+      value=$((10#$value))
+      ;;
+    *)
+      LAST_ERROR="Unknown setter type: $type"
+      return 1
+      ;;
+  esac
+  SETTER_VALUE=$value
+}
+
+write_setter() {
+  local type=$1 value=$2 output
+  local -a command=()
+  case $type in
+    nightlight)
+      command=(omarchy-shell nightlight "$([[ $value == true ]] && printf enable || printf disable)")
+      ;;
+    dnd)
+      command=(omarchy-shell notifications setDnd "$([[ $value == true ]] && printf on || printf off)")
+      ;;
+    stay-awake)
+      # The idle service is inverted: enabling idle allows the screensaver and
+      # lock again, so staying awake means disabling idle.
+      command=(omarchy-shell idle "$([[ $value == true ]] && printf disable || printf enable)")
+      ;;
+    theme)
+      command=(omarchy-theme-set "$value")
+      ;;
+    brightness)
+      command=(omarchy-brightness-display --no-osd "${value}%")
+      ;;
+    *)
+      LAST_ERROR="Unknown setter type: $type"
+      return 1
+      ;;
+  esac
+  output=$(mktemp)
+  if ! run_capture "$output" "${command[@]}"; then
+    rm -f -- "$output"
+    return 1
+  fi
+  rm -f -- "$output"
+}
+
+snapshot_path() {
+  printf '%s/%s.json\n' "$ACTIVE_DIR" "$1"
+}
+
+active_routine_ids() {
+  local path name
+  [[ -d $ACTIVE_DIR ]] || return 0
+  for path in "$ACTIVE_DIR"/*.json; do
+    [[ -e $path || -L $path ]] || continue
+    name=$(basename -- "$path")
+    name=${name%.json}
+    [[ $name =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || continue
+    printf '%s\n' "$name"
+  done
+}
+
+# Loads an activation snapshot into SNAPSHOT_JSON.
+# Returns 0 when loaded, 1 when the routine is not active, 2 when a snapshot
+# exists but is not trustworthy (LAST_ERROR is set).
+SNAPSHOT_JSON=""
+read_snapshot() {
+  local routine_id=$1 path filter size
+  SNAPSHOT_JSON=""
+  path=$(snapshot_path "$routine_id")
+  [[ -e $path || -L $path ]] || return 1
+  secure_optional_private_file "$path" 600 "activation snapshot" || return 2
+  size=$(stat -c %s -- "$path" 2>/dev/null || printf 0)
+  if ((size > MAX_CONTROL_BYTES)); then
+    LAST_ERROR="Activation snapshot exceeds the size limit: $path"
+    return 2
+  fi
+  read -r -d '' filter <<'JQ' || true
+type == "object"
+  and .version == 1
+  and .routineId == $id
+  and (.activatedAt | type == "string")
+  and (.trigger | type == "string")
+  and ((.keepUntil == "conditions" and .expiresAt == null)
+       or ((.keepUntil | type) == "object"
+           and (.keepUntil | keys) == ["minutes"]
+           and (.keepUntil.minutes | type == "number" and floor == . and . >= 1 and . <= 1440)
+           and (.expiresAt | type == "string")))
+  and (.onEndMode | . == "restore" or . == "none" or . == "actions")
+  and ((.endActionIndex // 0) | type == "number" and floor == . and . >= 0 and . <= 64)
+  and ((.claims // []) | type == "array" and all(.[];
+        . == "nightlight" or . == "dnd" or . == "stay-awake" or . == "theme" or . == "brightness")
+       and length <= 5 and length == (unique | length))
+  and (.setters | type == "array" and all(.[];
+        type == "object"
+        and (.index | type == "number")
+        and (.type | . == "nightlight" or . == "dnd" or . == "stay-awake" or . == "theme" or . == "brightness")
+        and (.restore | type == "boolean")
+        and has("before") and has("applied")
+        and if .type == "nightlight" or .type == "dnd" or .type == "stay-awake" then
+          (.before | type == "boolean") and (.applied | type == "boolean")
+        elif .type == "theme" then
+          (.before | type == "string" and test("^[a-z0-9]+(?:-[a-z0-9]+)*$") and length <= 100)
+            and (.applied | type == "string" and test("^[a-z0-9]+(?:-[a-z0-9]+)*$") and length <= 100)
+        else
+          (.before | type == "number" and floor == . and . >= 0 and . <= 100)
+            and (.applied | type == "number" and floor == . and . >= 0 and . <= 100)
+        end))
+  and (.claims == null or ([.setters[].type] - .claims | length) == 0)
+JQ
+  if ! SNAPSHOT_JSON=$(jq -ec --arg id "$routine_id" "select($filter)" "$path" 2>/dev/null); then
+    SNAPSHOT_JSON=""
+    LAST_ERROR="Activation snapshot is invalid: $path"
+    return 2
+  fi
+  if jq -e '(.keepUntil | type) == "object"' <<<"$SNAPSHOT_JSON" >/dev/null \
+    && ! date -d "$(jq -r '.expiresAt' <<<"$SNAPSHOT_JSON")" +%s >/dev/null 2>&1; then
+    SNAPSHOT_JSON=""
+    LAST_ERROR="Activation snapshot has an invalid expiry: $path"
+    return 2
+  fi
+}
+
+write_snapshot() {
+  local routine_id=$1 content=$2 temporary
+  temporary=$(mktemp) || {
+    LAST_ERROR="Could not stage the activation snapshot"
+    return 1
+  }
+  printf '%s\n' "$content" >"$temporary"
+  if ! write_atomic "$temporary" "$(snapshot_path "$routine_id")" 600; then
+    rm -f -- "$temporary"
+    LAST_ERROR="Could not write the activation snapshot"
+    return 1
+  fi
+  rm -f -- "$temporary"
+}
+
+remove_snapshot() {
+  local path
+  path=$(snapshot_path "$1")
+  if ! rm -f -- "$path"; then
+    LAST_ERROR="Could not remove the completed activation snapshot: $path"
+    return 1
+  fi
+}
+
+ACTIVATION_ERROR_CODE="unsafe-state"
+claim_activation_snapshot() {
+  local routine_id=$1 claims=$2 snapshot=$3 other state=0 conflict
+  ACTIVATION_ERROR_CODE="unsafe-state"
+  prepare_run_lock_dir || return 1
+  ensure_private_file "$RUN_LOCK_DIR/resource-setters.lock" 600 "setter claim lock" || return 1
+  safe_open_private_fd 6 "$RUN_LOCK_DIR/resource-setters.lock" 600 "setter claim lock" || return 1
+  if ! flock -x -w "$LOCK_TIMEOUT" 6; then
+    exec 6>&-
+    LAST_ERROR="Timed out locking setter claims"
+    return 1
+  fi
+  if ! private_fd_matches_file 6 "$RUN_LOCK_DIR/resource-setters.lock"; then
+    exec 6>&-
+    return 1
+  fi
+  while IFS= read -r other; do
+    [[ -n $other && $other != "$routine_id" ]] || continue
+    state=0
+    read_snapshot "$other" || state=$?
+    if ((state == 2)); then
+      exec 6>&-
+      return 1
+    fi
+    ((state == 0)) || continue
+    conflict=$(jq -nr --argjson wanted "$claims" --argjson active "$SNAPSHOT_JSON" '
+      ($active.claims // [$active.setters[].type]) as $owned
+      | [$wanted[] | select(. as $type | any($owned[]; . == $type))][0] // empty')
+    if [[ -n $conflict ]]; then
+      exec 6>&-
+      LAST_ERROR="Restoring setter '$conflict' is already owned by active routine: $other"
+      ACTIVATION_ERROR_CODE="setter-conflict"
+      return 1
+    fi
+  done < <(active_routine_ids)
+  if ! write_snapshot "$routine_id" "$snapshot"; then
+    exec 6>&-
+    return 1
+  fi
+  exec 6>&-
+}
+
+# A routine is stateful when activating it leaves something to undo.
+routine_is_stateful() {
+  jq -e '
+    def is_setter: .type == "nightlight" or .type == "dnd" or .type == "stay-awake" or .type == "theme" or .type == "brightness";
+    any(.actions[]; is_setter and .restore == true)
+      or (((.onEnd // {}).mode // "restore") == "actions" and (((.onEnd // {}).actions // []) | length > 0))
+      or ((.keepUntil // "conditions") | type == "object")' <<<"$1" >/dev/null
+}
+
+RESOLVED_ROUTINE=""
+resolve_routine() {
+  local routine_id=$1 allow_disabled=${2:-0} config_file enabled
+  RESOLVED_ROUTINE=""
+  config_file=$(mktemp)
+  if ! load_committed_config "$config_file"; then
+    rm -f -- "$config_file"
+    json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
+    return 1
+  fi
+  RESOLVED_ROUTINE=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
+  rm -f -- "$config_file"
+  if [[ -z $RESOLVED_ROUTINE ]]; then
+    json_error "Routine not found: $routine_id" not-found
+    return 1
+  fi
+  enabled=$(jq -r '.enabled' <<<"$RESOLVED_ROUTINE")
+  if [[ $enabled != "true" && $allow_disabled != 1 ]]; then
+    json_error "Routine is disabled: $routine_id" disabled
+    return 1
+  fi
+}
+
+LOCK_ERROR_CODE=""
+lock_routine() {
+  local routine_id=$1
+  LOCK_ERROR_CODE=lock-error
+  prepare_run_lock_dir || return 1
+  ensure_private_file "$RUN_LOCK_DIR/routine-$routine_id.lock" 600 "routine lock" || return 1
+  safe_open_private_fd 7 "$RUN_LOCK_DIR/routine-$routine_id.lock" 600 \
+    "routine lock" || return 1
+  if ! private_fd_matches_file 7 "$RUN_LOCK_DIR/routine-$routine_id.lock"; then
+    exec 7>&-
+    return 1
+  fi
+  if ! flock -n 7; then
+    exec 7>&-
+    LAST_ERROR="Routine is already running: $routine_id"
+    LOCK_ERROR_CODE=busy
+    return 1
+  fi
+  if ! private_fd_matches_file 7 "$RUN_LOCK_DIR/routine-$routine_id.lock"; then
+    exec 7>&-
+    return 1
+  fi
+}
+
+arm_routine_traps() {
+  trap 'abort_active_routine 129' HUP
+  trap 'abort_active_routine 130' INT
+  trap 'abort_active_routine 143' TERM
+}
+
+unlock_routine() {
+  trap - HUP INT TERM
+  exec 7>&-
+}
+
+export_trigger_context() {
+  local trigger=$1 phase=$2
+  if [[ $trigger == hook:* ]]; then
+    export OMACHORD_TRIGGER=hook
+  else
+    export OMACHORD_TRIGGER="$trigger"
+  fi
+  export OMACHORD_PHASE="$phase"
+}
+
+# Reverts the setters recorded in a snapshot, newest first, but only where
+# the live value still equals what the routine applied. A value the user
+# changed in the meantime is theirs and stays untouched.
+RESTORED_COUNT=0
+SKIPPED_COUNT=0
+RESTORE_ERROR=""
+restore_from_snapshot() {
+  local snapshot=$1 entry type before applied
+  RESTORED_COUNT=0
+  SKIPPED_COUNT=0
+  RESTORE_ERROR=""
+  while IFS= read -r entry; do
+    type=$(jq -r '.type' <<<"$entry")
+    before=$(jq -r 'if (.before | type) == "number" then (.before | floor | tostring) else (.before | tostring) end' <<<"$entry")
+    applied=$(jq -r 'if (.applied | type) == "number" then (.applied | floor | tostring) else (.applied | tostring) end' <<<"$entry")
+    if ! read_setter "$type"; then
+      [[ -n $RESTORE_ERROR ]] || RESTORE_ERROR=$LAST_ERROR
+      continue
+    fi
+    if [[ $SETTER_VALUE != "$applied" ]]; then
+      SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+      continue
+    fi
+    if ! write_setter "$type" "$before"; then
+      [[ -n $RESTORE_ERROR ]] || RESTORE_ERROR=$LAST_ERROR
+      continue
+    fi
+    RESTORED_COUNT=$((RESTORED_COUNT + 1))
+  done < <(jq -c '.setters | map(select(.restore == true)) | reverse | .[]' <<<"$snapshot")
+}
+
+run_resolved_routine() {
+  local routine=$1 routine_id=$2 trigger=$3
+  local action start end duration status="success" error=""
+  if ! lock_routine "$routine_id"; then
+    json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
+    return 1
+  fi
+  arm_routine_traps
+  start=$(date +%s%3N)
+  export_trigger_context "$trigger" run
+  while IFS= read -r action; do
+    if ! execute_action "$action"; then
+      status="failed"
+      error=$LAST_ERROR
+      break
+    fi
+  done < <(jq -c '.actions[]' <<<"$routine")
+  end=$(date +%s%3N)
+  duration=$((end - start))
+  if ! log_run "$routine_id" "$trigger" "$status" "$duration" "$error"; then
+    unlock_routine
+    json_error "$LAST_ERROR" unsafe-state
+    return 1
+  fi
+  unlock_routine
+
+  if [[ $status == "failed" ]]; then
+    json_error "$error" action-failed
+    return 1
+  fi
+  jq -cn --arg routineId "$routine_id" --arg trigger "$trigger" --argjson durationMs "$duration" '{ok:true,routineId:$routineId,trigger:$trigger,durationMs:$durationMs}'
+}
+
+run_routine() {
+  local routine_id=$1 trigger=$2 allow_disabled=${3:-0}
+  resolve_routine "$routine_id" "$allow_disabled" || return 1
+  run_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
+}
+
+# Applies a stateful routine and records what it changed so it can be undone.
+# Each restoring setter is added to the snapshot before its side effect, so an
+# interrupted activation always leaves a restorable record.
+activate_resolved_routine() {
+  local routine=$1 routine_id=$2 trigger=$3 already_locked=${4:-0}
+  local snapshot_state=0 snapshot claims keep_until on_end_mode minutes expires_at="" now
+  local entry index action type value restore start end duration status="activated" error=""
+  if ((!already_locked)) && ! lock_routine "$routine_id"; then
+    json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
+    return 1
+  fi
+  read_snapshot "$routine_id" || snapshot_state=$?
+  if ((snapshot_state == 2)); then
+    unlock_routine
+    json_error "$LAST_ERROR" unsafe-state
+    return 1
+  fi
+  if ((snapshot_state == 0)); then
+    unlock_routine
+    jq -cn --arg routineId "$routine_id" --arg trigger "$trigger" \
+      '{ok:true,routineId:$routineId,trigger:$trigger,state:"active",alreadyActive:true}'
+    return 0
+  fi
+  arm_routine_traps
+  start=$(date +%s%3N)
+  export_trigger_context "$trigger" activate
+
+  keep_until=$(jq -c '.keepUntil // "conditions"' <<<"$routine")
+  on_end_mode=$(jq -r '(.onEnd // {}).mode // "restore"' <<<"$routine")
+  minutes=$(jq -r 'if (.keepUntil | type) == "object" then .keepUntil.minutes else empty end' <<<"$routine")
+  now=$(date +%s)
+  if [[ -n $minutes ]]; then
+    expires_at=$(date --iso-8601=seconds -d "@$((now + minutes * 60))")
+  fi
+  claims=$(jq -c '[.actions[] | select(.restore == true) | .type
+    | select(. == "nightlight" or . == "dnd" or . == "stay-awake" or . == "theme" or . == "brightness")] | unique' <<<"$routine")
+  snapshot=$(jq -cn \
+    --arg routineId "$routine_id" \
+    --arg activatedAt "$(date --iso-8601=seconds -d "@$now")" \
+    --arg trigger "$trigger" \
+    --argjson keepUntil "$keep_until" \
+    --arg expiresAt "$expires_at" \
+    --arg onEndMode "$on_end_mode" \
+    --argjson claims "$claims" \
+    '{version:1,routineId:$routineId,activatedAt:$activatedAt,trigger:$trigger,keepUntil:$keepUntil,expiresAt:(if $expiresAt == "" then null else $expiresAt end),onEndMode:$onEndMode,endActionIndex:0,claims:$claims,setters:[]}')
+  if ! prepare_private_subdirectory "$ACTIVE_DIR" \
+    || ! claim_activation_snapshot "$routine_id" "$claims" "$snapshot"; then
+    unlock_routine
+    json_error "$LAST_ERROR" "$ACTIVATION_ERROR_CODE"
+    return 1
+  fi
+
+  while IFS= read -r entry; do
+    index=$(jq -r '.key' <<<"$entry")
+    action=$(jq -c '.value' <<<"$entry")
+    type=$(jq -r '.type' <<<"$action")
+    if is_setter_type "$type"; then
+      value=$(setter_value_from_action "$action")
+      restore=$(jq -r '.restore' <<<"$action")
+      if [[ $restore == true ]]; then
+        if ! read_setter "$type"; then
+          status="failed"
+          error=$LAST_ERROR
+          break
+        fi
+        snapshot=$(jq -c --argjson index "$index" --arg type "$type" --arg before "$SETTER_VALUE" --arg applied "$value" '
+          def typed($t; $v): if $t == "theme" then $v elif $t == "brightness" then ($v | tonumber) else ($v == "true") end;
+          .setters += [{index:$index,type:$type,before:typed($type; $before),applied:typed($type; $applied),restore:true}]' <<<"$snapshot")
+        if ! write_snapshot "$routine_id" "$snapshot"; then
+          status="failed"
+          error=$LAST_ERROR
+          break
+        fi
+        if ! write_setter "$type" "$value"; then
+          status="failed"
+          error=$LAST_ERROR
+          break
+        fi
+      elif ! write_setter "$type" "$value"; then
+        status="failed"
+        error=$LAST_ERROR
+        break
+      fi
+    elif ! execute_action "$action"; then
+      status="failed"
+      error=$LAST_ERROR
+      break
+    fi
+  done < <(jq -c '.actions | to_entries[]' <<<"$routine")
+
+  if [[ $status == "failed" ]]; then
+    restore_from_snapshot "$snapshot"
+    if [[ -z $RESTORE_ERROR ]]; then
+      if remove_snapshot "$routine_id"; then
+        error="activate: $error"
+      else
+        error="activate: $error; rollback incomplete ($LAST_ERROR), recovery record kept"
+      fi
+    else
+      # The rollback itself failed, so the record of what was changed stays
+      # behind and the routine remains active until a later deactivation.
+      error="activate: $error; rollback incomplete ($RESTORE_ERROR), recovery record kept"
+    fi
+  fi
+  end=$(date +%s%3N)
+  duration=$((end - start))
+  if ! log_run "$routine_id" "$trigger" "$status" "$duration" "$error"; then
+    unlock_routine
+    json_error "$LAST_ERROR" unsafe-state
+    return 1
+  fi
+  unlock_routine
+
+  if [[ $status == "failed" ]]; then
+    json_error "$error" action-failed
+    return 1
+  fi
+  jq -cn --arg routineId "$routine_id" --arg trigger "$trigger" --argjson durationMs "$duration" \
+    --arg expiresAt "$expires_at" \
+    '{ok:true,routineId:$routineId,trigger:$trigger,state:"activated",durationMs:$durationMs,expiresAt:(if $expiresAt == "" then null else $expiresAt end)}'
+}
+
+activate_routine() {
+  local routine_id=$1 trigger=$2 allow_disabled=${3:-0}
+  resolve_routine "$routine_id" "$allow_disabled" || return 1
+  if routine_is_stateful "$RESOLVED_ROUTINE"; then
+    activate_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
+  else
+    run_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
+  fi
+}
+
+# Ends an active routine from its snapshot alone, so a routine that was
+# deleted or disabled after activation can still be restored.
+deactivate_routine() {
+  local routine_id=$1 reason=$2 already_locked=${3:-0}
+  local snapshot_state=0 snapshot on_end_mode end_action_index routine="" config_file entry action index action_count
+  local start end duration status="deactivated" error=""
+  if ((!already_locked)) && ! lock_routine "$routine_id"; then
+    json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
+    return 1
+  fi
+  read_snapshot "$routine_id" || snapshot_state=$?
+  if ((snapshot_state == 2)); then
+    unlock_routine
+    json_error "$LAST_ERROR" unsafe-state
+    return 1
+  fi
+  if ((snapshot_state == 1)); then
+    unlock_routine
+    jq -cn --arg routineId "$routine_id" --arg trigger "$reason" \
+      '{ok:true,routineId:$routineId,trigger:$trigger,state:"inactive",alreadyInactive:true}'
+    return 0
+  fi
+  snapshot=$SNAPSHOT_JSON
+  if [[ $reason == condition || $reason == service ]]; then
+    if ! jq -e '(.trigger == "condition" or .trigger == "service") and .keepUntil == "conditions"' \
+      <<<"$snapshot" >/dev/null; then
+      unlock_routine
+      json_error "The active routine is no longer owned by the condition service" stale-transition
+      return 1
+    fi
+  elif [[ $reason == timer ]]; then
+    local expires_epoch
+    if ! jq -e '(.keepUntil | type) == "object"' <<<"$snapshot" >/dev/null; then
+      unlock_routine
+      json_error "The active routine is no longer owned by a timer" stale-transition
+      return 1
+    fi
+    expires_epoch=$(date -d "$(jq -r '.expiresAt // empty' <<<"$snapshot")" +%s 2>/dev/null || true)
+    if [[ -z $expires_epoch ]] || ((expires_epoch > $(date +%s))); then
+      unlock_routine
+      json_error "The active routine timer has not expired" stale-transition
+      return 1
+    fi
+  fi
+  arm_routine_traps
+  start=$(date +%s%3N)
+  export_trigger_context "$reason" deactivate
+  on_end_mode=$(jq -r '.onEndMode' <<<"$snapshot")
+  end_action_index=$(jq -r '.endActionIndex // 0' <<<"$snapshot")
+
+  if [[ $on_end_mode == actions ]]; then
+    config_file=$(mktemp)
+    if load_committed_config "$config_file"; then
+      routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
+      if [[ -z $routine ]]; then
+        status="failed"
+        error="end action: the committed routine is unavailable"
+      else
+        action_count=$(jq -r '((.onEnd // {}).actions // []) | length' <<<"$routine")
+        if ((end_action_index > action_count)); then
+          status="failed"
+          error="end action: recovery progress exceeds the committed action list"
+        fi
+      fi
+    else
+      status="failed"
+      error="end action: $LAST_ERROR"
+    fi
+    rm -f -- "$config_file"
+  fi
+
+  RESTORED_COUNT=0
+  SKIPPED_COUNT=0
+  RESTORE_ERROR=""
+  if [[ $on_end_mode != none ]]; then
+    restore_from_snapshot "$snapshot"
+    if [[ -n $RESTORE_ERROR ]]; then
+      status="failed"
+      error="restore: $RESTORE_ERROR"
+    fi
+  fi
+  if [[ $on_end_mode == actions && -n $routine && $status == deactivated ]]; then
+    while IFS= read -r entry; do
+      index=$(jq -r '.key' <<<"$entry")
+      action=$(jq -c '.value' <<<"$entry")
+      # End actions are at-most-once: checkpoint consumption before execution
+      # so a failed checkpoint or later retry cannot repeat an external effect.
+      end_action_index=$((index + 1))
+      snapshot=$(jq -c --argjson index "$end_action_index" '.endActionIndex = $index' <<<"$snapshot")
+      if ! write_snapshot "$routine_id" "$snapshot"; then
+        status="failed"
+        error="end action: $LAST_ERROR"
+        break
+      fi
+      if ! execute_action "$action"; then
+        status="failed"
+        error="end action: $LAST_ERROR"
+        break
+      fi
+    done < <(jq -c --argjson start "$end_action_index" \
+      '((.onEnd // {}).actions // []) | to_entries[] | select(.key >= $start)' <<<"$routine")
+  fi
+  # A snapshot is only discarded once everything it recorded has been dealt
+  # with; otherwise it stays so a later deactivation can finish the restore.
+  if [[ $status == "deactivated" ]]; then
+    if ! remove_snapshot "$routine_id"; then
+      status="failed"
+      error="$LAST_ERROR (recovery record kept)"
+    fi
+  else
+    error="$error (recovery record kept)"
+  fi
+  end=$(date +%s%3N)
+  duration=$((end - start))
+  if ! log_run "$routine_id" "$reason" "$status" "$duration" "$error"; then
+    unlock_routine
+    json_error "$LAST_ERROR" unsafe-state
+    return 1
+  fi
+  unlock_routine
+
+  if [[ $status == "failed" ]]; then
+    json_error "$error" action-failed
+    return 1
+  fi
+  jq -cn --arg routineId "$routine_id" --arg trigger "$reason" --argjson durationMs "$duration" \
+    --argjson restored "$RESTORED_COUNT" --argjson skipped "$SKIPPED_COUNT" \
+    '{ok:true,routineId:$routineId,trigger:$trigger,state:"deactivated",restored:$restored,skipped:$skipped,durationMs:$durationMs}'
+}
+
+# One shortcut both enters and leaves a stateful routine.
+toggle_resolved_routine() {
+  local routine=$1 routine_id=$2 trigger=$3 snapshot_state=0
+  if ! lock_routine "$routine_id"; then
+    json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
+    return 1
+  fi
+  read_snapshot "$routine_id" || snapshot_state=$?
+  if ((snapshot_state == 2)); then
+    unlock_routine
+    json_error "$LAST_ERROR" unsafe-state
+    return 1
+  fi
+  if ((snapshot_state == 0)); then
+    deactivate_routine "$routine_id" "$trigger" 1
+  else
+    activate_resolved_routine "$routine" "$routine_id" "$trigger" 1
+  fi
+}
+
+# Ends active routines that the given configuration no longer supports.
+DEACTIVATED_IDS="[]"
+deactivate_orphans() {
+  local reason=$1 config_file=$2 routine_id routine result error
+  DEACTIVATED_IDS="[]"
+  while IFS= read -r routine_id; do
+    [[ -n $routine_id ]] || continue
+    routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
+    if [[ -z $routine ]] || [[ $(jq -r '.enabled' <<<"$routine") != true ]] \
+      || ! routine_is_stateful "$routine"; then
+      result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
+      if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
+        error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
+        rm -f -- "$result"
+        [[ -z $error ]] || LAST_ERROR=$error
+        [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
+        return 1
+      fi
+      rm -f -- "$result"
+      DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+    fi
+  done < <(active_routine_ids)
+}
+
+deactivate_all() {
+  local reason=$1 routine_id result error
+  DEACTIVATED_IDS="[]"
+  while IFS= read -r routine_id; do
+    [[ -n $routine_id ]] || continue
+    result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
+    if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
+      error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
+      rm -f -- "$result"
+      [[ -z $error ]] || LAST_ERROR=$error
+      [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
+      return 1
+    fi
+    rm -f -- "$result"
+    DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+  done < <(active_routine_ids)
+}
+
+command_run() {
+  local routine_id=${1:-} trigger=${2:-manual} allow_disabled=0
+  [[ -n $routine_id ]] || fail "Usage: omachord run <routine-id> [manual|shortcut|test]" usage
+  case $trigger in
+    manual|shortcut) ;;
+    test) allow_disabled=1 ;;
+    *) fail "Unknown run source: $trigger" usage ;;
+  esac
+  acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  resolve_routine "$routine_id" "$allow_disabled" || return 1
+  if routine_is_stateful "$RESOLVED_ROUTINE"; then
+    toggle_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
+  else
+    run_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
+  fi
+}
+
+command_activate() {
+  local routine_id=${1:-} trigger=${2:-manual} expected_revision=${3:-} allow_disabled=0
+  (($# <= 3)) || fail "Usage: omachord activate <routine-id> [source [expected-revision]]" usage
+  [[ -n $routine_id ]] || fail "Usage: omachord activate <routine-id> [manual|shortcut|test|condition|service]" usage
+  case $trigger in
+    manual|shortcut|condition|service) ;;
+    test) allow_disabled=1 ;;
+    *) fail "Unknown activation source: $trigger" usage ;;
+  esac
+  acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  if [[ $trigger == condition || $trigger == service ]]; then
+    service_revision_matches "$expected_revision" || fail "$LAST_ERROR" stale-config
+    integration_complete || fail "Omachord is no longer connected" not-connected
+  elif [[ -n $expected_revision ]]; then
+    fail "Only service activations accept an expected revision" usage
+  fi
+  activate_routine "$routine_id" "$trigger" "$allow_disabled"
+}
+
+command_deactivate() {
+  local routine_id=${1:-} reason=${2:-manual} expected_revision=${3:-}
+  (($# <= 3)) || fail "Usage: omachord deactivate <routine-id> [source [expected-revision]]" usage
+  [[ -n $routine_id ]] || fail "Usage: omachord deactivate <routine-id> [manual|shortcut|test|condition|service|timer]" usage
+  [[ $routine_id =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "Invalid routine id: $routine_id" usage
+  case $reason in
+    manual|shortcut|test|condition|service|timer) ;;
+    *) fail "Unknown deactivation source: $reason" usage ;;
+  esac
+  acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  if [[ $reason == condition || $reason == service || $reason == timer ]]; then
+    service_revision_matches "$expected_revision" || fail "$LAST_ERROR" stale-config
+  elif [[ -n $expected_revision ]]; then
+    fail "Only service deactivations accept an expected revision" usage
+  fi
+  deactivate_routine "$routine_id" "$reason"
+}
+
+command_active() {
+  local routine_id rows="[]" snapshot_state
+  if [[ -e $ACTIVE_DIR || -L $ACTIVE_DIR ]]; then
+    secure_optional_private_directory "$ACTIVE_DIR" "activation directory" || fail "$LAST_ERROR" unsafe-state
+  fi
+  while IFS= read -r routine_id; do
+    [[ -n $routine_id ]] || continue
+    snapshot_state=0
+    read_snapshot "$routine_id" || snapshot_state=$?
+    ((snapshot_state == 0)) || fail "${LAST_ERROR:-Activation snapshot is invalid}" unsafe-state
+    rows=$(jq -c --argjson row "$SNAPSHOT_JSON" \
+      '. + [$row | {routineId,activatedAt,trigger,keepUntil,expiresAt,onEndMode,setterCount:(.setters | length)}]' <<<"$rows")
+  done < <(active_routine_ids)
+  printf '%s\n' "$rows"
+}
+
+command_trigger_hook() {
+  local event=${1:-}
+  shift || true
+  local valid=0 candidate index=1 failures=0 matched=0 config_snapshot
+  for candidate in "${HOOK_EVENTS[@]}"; do [[ $candidate == "$event" ]] && valid=1; done
+  ((valid)) || fail "Unsupported hook event: $event" usage
+  if [[ ${OMACHORD_BULK_CLEANUP:-} == 1 ]]; then
+    jq -cn --arg event "$event" '{ok:true,event:$event,matched:0,suppressed:true}'
+    return
+  fi
+  acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+
+  export OMACHORD_TRIGGER=hook
+  export OMACHORD_HOOK="$event"
+  for candidate in "$@"; do
+    printf -v "OMACHORD_ARG_$index" '%s' "$candidate"
+    export "OMACHORD_ARG_$index"
+    ((index += 1))
+  done
+
+  config_snapshot=$(mktemp)
+  if ! load_committed_config "$config_snapshot"; then
+    rm -f -- "$config_snapshot"
+    json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
+    return 1
+  fi
+
+  local -a routine_ids=()
+  mapfile -t routine_ids < <(jq -r --arg event "$event" '.routines[] | select(.enabled) | select(any(.triggers[]; .type == "hook" and .event == $event)) | .id' "$config_snapshot")
+  local CONFIG_FILE=$config_snapshot
+  # An event only ever starts a stateful routine; it ends through its
+  # conditions, its keep-until timer, or an explicit deactivation.
+  for candidate in "${routine_ids[@]}"; do
+    ((matched += 1))
+    if ! activate_routine "$candidate" "hook:$event" 0 >/dev/null; then
+      ((failures += 1))
+    fi
+  done
+  rm -f -- "$config_snapshot"
+  if ((failures > 0)); then
+    json_error "$failures of $matched hook routines failed" hook-failed
+    return 1
+  fi
+  jq -cn --arg event "$event" --argjson matched "$matched" '{ok:true,event:$event,matched:$matched}'
+}
+
+command_logs() {
+  local raw_limit=${1:-50} limit
+  [[ $raw_limit =~ ^[0-9]+$ ]] || fail "Log limit must be a number" usage
+  limit=$((10#$raw_limit))
+  ((limit <= 500)) || limit=500
+  acquire_log_lock shared || fail "$LAST_ERROR" unsafe-state
+  if [[ ! -e $LOG_FILE && ! -L $LOG_FILE ]]; then
+    printf '%s\n' '[]'
+    exec 8>&-
+    return
+  fi
+  if ! secure_optional_private_file "$LOG_FILE" 600 "run history" \
+    || ! safe_open_private_fd 6 "$LOG_FILE" 600 "run history"; then
+    exec 6>&- 8>&-
+    fail "$LAST_ERROR" unsafe-state
+  fi
+  tail -n "$limit" <&6 | jq -s 'reverse'
+  exec 6>&-
+  exec 8>&-
+}
+
+usage() {
+  cat <<'EOF'
+Usage: omachord <command>
+
+Commands:
+  status
+  config show
+  config snapshot       Read config with its compare-and-swap revision
+  config validate       Read candidate JSON from stdin
+  config apply <revision>
+  connect [revision]
+  autostart             Connect on first use unless explicitly disabled
+  disconnect
+  bindings
+  commands
+  run <routine-id> [manual|shortcut|test]
+                        Stateful routines toggle between active and inactive
+  activate <routine-id> [manual|shortcut|test]
+  activate <routine-id> <condition|service> <expected-revision>
+  deactivate <routine-id> [manual|shortcut|test]
+  deactivate <routine-id> <condition|service|timer> <expected-revision>
+  active                Snapshots of currently active stateful routines
+  trigger hook <event> [args...]
+  logs [limit]
+EOF
+}
+
+clear_trigger_context() {
+  local name
+  unset OMACHORD_TRIGGER OMACHORD_HOOK OMACHORD_PHASE
+  for name in "${!OMACHORD_ARG_@}"; do
+    [[ -n $name ]] && unset "$name"
+  done
+}
+
+require_prepared_state() {
+  prepare_state_dir || fail "$LAST_ERROR" unsafe-state
+}
+
+main() {
+  local command=${1:-}
+  shift || true
+  if [[ $command == __action-guard ]]; then
+    [[ $# -eq 4 ]] || exit 2
+    action_guard "$@"
+    return
+  fi
+  clear_trigger_context
+  case $command in
+    status) require_prepared_state; command_status "$@" ;;
+    config)
+      local subcommand=${1:-}
+      shift || true
+      case $subcommand in
+        show) command_config_show "$@" ;;
+        snapshot) require_prepared_state; command_config_snapshot "$@" ;;
+        validate) command_config_validate "$@" ;;
+        apply) require_prepared_state; command_config_apply "$@" ;;
+        *) fail "Usage: omachord config <show|snapshot|validate|apply>" usage ;;
+      esac
+      ;;
+    connect) require_prepared_state; command_connect "$@" ;;
+    autostart) require_prepared_state; command_autostart "$@" ;;
+    disconnect) require_prepared_state; command_disconnect "$@" ;;
+    bindings)
+      require_prepared_state
+      acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+      bindings_json || fail "Could not read Omarchy keybindings" bindings-unavailable
+      ;;
+    commands) command_commands "$@" ;;
+    run) require_prepared_state; command_run "$@" ;;
+    activate) require_prepared_state; command_activate "$@" ;;
+    deactivate) require_prepared_state; command_deactivate "$@" ;;
+    active) require_prepared_state; command_active "$@" ;;
+    trigger)
+      local trigger_type=${1:-}
+      shift || true
+      [[ $trigger_type == "hook" ]] || fail "Usage: omachord trigger hook <event> [args...]" usage
+      require_prepared_state
+      command_trigger_hook "$@"
+      ;;
+    logs) require_prepared_state; command_logs "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) fail "Unknown command: $command" usage ;;
+  esac
+}
+
+main "$@"

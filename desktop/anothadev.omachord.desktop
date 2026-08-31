@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Omachord
+Comment=Compose keyboard shortcuts and Omarchy automations
+Exec=omarchy-shell shell summon anothadev.omachord {}
+Icon=preferences-desktop-keyboard-shortcuts
+Terminal=false
+Categories=Settings;
+Keywords=shortcuts;keyboard;automation;omarchy;
+StartupNotify=false

@@ -1,0 +1,29 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+
+"$ROOT/test/version-test.sh"
+"$ROOT/test/runner-test.sh"
+"$ROOT/test/qml-runtime-test.sh"
+"$ROOT/test/qml-service-test.sh"
+node "$ROOT/test/model-test.mjs"
+node "$ROOT/test/conditions-test.mjs"
+node "$ROOT/test/qml-plain-text-test.mjs"
+node "$ROOT/test/qml-policy-test.mjs"
+bash -n "$ROOT/bin/omachord"
+perl -c "$ROOT/bin/omachord-fs"
+desktop-file-validate "$ROOT/desktop/anothadev.omachord.desktop"
+omarchy plugin validate "$ROOT"
+QT_QPA_PLATFORM=offscreen qmltestrunner -input "$ROOT/test/qml" -o -,txt
+qmllint -I /usr/share/omarchy/shell \
+  "$ROOT/Panel.qml" \
+  "$ROOT/PlainTextButton.qml" \
+  "$ROOT/ChoicePicker.qml" \
+  "$ROOT/RoutineEditor.qml" \
+  "$ROOT/ActionCard.qml" \
+  "$ROOT/Service.qml" \
+  "$ROOT/ShortcutRecorder.qml"
+
+printf 'All tests passed.\n'

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install portable validators
+        run: sudo apt-get update && sudo apt-get install --yes desktop-file-utils jq
+
+      - name: Validate portable source
+        run: |
+          bash -n bin/omachord test/*.sh
+          perl -c bin/omachord-fs
+          jq -e '.schemaVersion == 1 and .id == "anothadev.omachord" and .version == "0.2.0"' manifest.json >/dev/null
+          desktop-file-validate desktop/anothadev.omachord.desktop
+          node test/model-test.mjs
+          node test/conditions-test.mjs
+          node test/qml-plain-text-test.mjs
+          node test/qml-policy-test.mjs
+
+      - name: Record integration-test boundary
+        run: |
+          printf '%s\n' 'Omarchy, Hyprland, Quickshell, and runtime QML checks run in the documented local release gate.'
