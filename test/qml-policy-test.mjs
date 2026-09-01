@@ -25,10 +25,16 @@ assert.match(panel, /latest revision could not be loaded\. Use Refresh before sa
   "stale-save recovery must report revision refresh failure")
 assert.match(panel, /config = parsed\.config\s*\n\s*configRevision = parsed\.revision/,
   "stale-save recovery must refresh the base config and revision together")
-assert.match(panel, /: \(root\.status\.integrationComplete \? "Disable" : "Enable"\)/,
-  "the default-on integration must expose Enable and Disable rather than setup-oriented Connect")
+assert.match(panel, /showConfirmation\(\s*"disconnect"/,
+  "turning Omachord off must go through a confirmation")
+assert.match(panel, /function requestIntegrationToggle\(\)[\s\S]*?mutateConnection\("connect"\)/,
+  "the integration switch must turn Omachord on without a confirmation")
+assert.match(panel, /Connections \{\s*target: root\.service/,
+  "the panel must mirror the in-process service instead of only polling the runner")
 assert.match(panel, /readonly property color enabledGreen:/,
   "the enabled integration state must use a dedicated green status color")
+assert.match(panel, /function requestSetRoutineEnabled[\s\S]*?routineEditor\.dirty[\s\S]*?showConfirmation/,
+  "list switches must confirm before replacing an unsaved routine draft")
 
 assert.doesNotMatch(editor, /onEditingFinished\s*:/,
   "staged action text must not rebuild delegates when focus changes")
@@ -46,6 +52,8 @@ assert.match(editor, /onBindingsChanged: clearResolvedBindingError\(\)/,
   "a refreshed binding catalogue must clear resolved server-side shortcut conflicts")
 assert.match(editor, /replace\(\/\\bOma: \/g, "Omachord: "\)/,
   "legacy binding names must never remain visible in editor errors")
+assert.match(editor, /persisted && isActive && draft\.enabled === false\) save\(\)/,
+  "saving an active routine as disabled must not run it again after apply")
 const service = fs.readFileSync(path.join(root, "Service.qml"), "utf8")
 assert.match(service, /runnerProc\.command = \[root\.runnerPath, job\.op, job\.id, job\.reason, job\.revision\]/,
   "the service must only ever execute the runner with a literal argv")
@@ -59,6 +67,8 @@ assert.match(service, /command: \[root\.runnerPath, "autostart"\]/,
   "the service must enable integration on first use")
 assert.match(service, /parsed\.committed !== true/,
   "the service must ignore uncommitted configurations")
+assert.doesNotMatch(service, /path: root\.stateDir\s*\n\s*watchChanges: true/,
+  "the service must not watch the whole state directory and feed read-only probe metadata back into itself")
 const card = fs.readFileSync(path.join(root, "ActionCard.qml"), "utf8")
 assert.doesNotMatch(card, /\broot\./,
   "ActionCard must stay list-agnostic and only speak to the editor through signals")

@@ -67,6 +67,23 @@ ShellRoot {
         && editor.draft.actions[0].args[0] === "argument-edit"
         && editor.draft.actions[0].sound === true
 
+    var saveRequests = 0
+    var saveAndRunRequests = 0
+    editor.saveRequested.connect(function() { saveRequests++ })
+    editor.saveAndRunRequested.connect(function() { saveAndRunRequests++ })
+    editor.routine = {
+      id: "active-disabled",
+      name: "Active disabled",
+      enabled: true,
+      triggers: [],
+      actions: [{ type: "dnd", value: true, restore: true }]
+    }
+    editor.isActive = true
+    editor.updateField("enabled", false)
+    editor.runOrSave()
+    var disabledActiveSavesOnly = saveRequests === 1 && saveAndRunRequests === 0
+    editor.isActive = false
+
     editor.routine = {
       id: "structure",
       name: "Structure",
@@ -153,7 +170,7 @@ ShellRoot {
     var conditionRemoved = editor.draft.conditions.length === 1
       && editor.draft.conditions[0].type === "power"
 
-    if (stagingPassed && sameTypePreserved && replacementPreservedOtherError
+    if (stagingPassed && disabledActiveSavesOnly && sameTypePreserved && replacementPreservedOtherError
         && moveRemapped && removalRemapped && normalizedDraft && endListIsolated
         && mainErrorSurvivedEndRemoval && endSetterCannotRestore
         && endReplacementCannotRestore && keepUntilStaged && conditionPreserved

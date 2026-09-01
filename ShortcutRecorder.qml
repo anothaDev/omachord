@@ -148,7 +148,7 @@ Item {
     repeat: false
     onTriggered: {
       if (!shortcutInhibitor.active && root.recording) {
-        root.errorText = "Hyprland did not grant shortcut capture"
+        root.errorText = "Could not capture keys. Click Record again."
         root.stopRecording()
       }
     }
@@ -181,48 +181,43 @@ Item {
           ? Style.focusFillFor(Color.foreground, Color.accent)
           : Style.normalFillFor(Color.foreground, Color.accent)
         borderSpec: Border.controlSpec(root.recording ? "focus" : "normal", Color.foreground, Color.accent)
+        Accessible.role: Accessible.StaticText
+        Accessible.name: "Keyboard shortcut: "
+          + (root.recording ? "recording, press a combination" : (root.value || "not assigned"))
+
+        Behavior on color { ColorAnimation { duration: 120 } }
 
         Row {
           id: keysRow
           anchors.left: parent.left
+          anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
           anchors.leftMargin: Style.spacing.controlPaddingX
+          anchors.rightMargin: Style.spacing.controlPaddingX
           spacing: Style.space(5)
 
           Text {
-
             textFormat: Text.PlainText
             visible: root.value === "" || root.recording
+            width: parent.width
             text: root.recording
-              ? (root.inhibitorActive ? "Press a combination..." : "Securing keyboard...")
+              ? (root.inhibitorActive
+                ? "Press a combination · Esc cancels · Backspace clears"
+                : "Waiting for the keyboard… Esc cancels")
               : "Not assigned"
-            color: Qt.darker(Color.foreground, 1.45)
+            color: Qt.darker(Color.foreground, 1.5)
             font.family: Style.font.family
             font.pixelSize: Style.font.body
+            elide: Text.ElideRight
           }
 
           Repeater {
             model: root.recording || !root.value ? [] : root.value.split(" + ")
 
-            BorderSurface {
+            KeyCap {
               required property string modelData
-              implicitWidth: keyText.implicitWidth + Style.space(12)
-              height: Style.space(24)
-              radius: Math.min(Style.cornerRadius, Style.space(4))
-              color: Util.alpha(Color.foreground, 0.07)
-              borderSpec: Border.flat(Util.alpha(Color.foreground, 0.24), 1)
-
-              Text {
-
-                textFormat: Text.PlainText
-                id: keyText
-                anchors.centerIn: parent
-                text: modelData.toUpperCase()
-                color: Color.foreground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
+              anchors.verticalCenter: parent.verticalCenter
+              text: modelData
             }
           }
         }
@@ -284,16 +279,18 @@ Item {
         event.accepted = root.recording
         return
       }
+      // Esc cancels even while the compositor is still deciding whether to
+      // grant the inhibitor, so a stuck grant never traps the user.
+      if (event.key === Qt.Key_Escape && event.modifiers === Qt.NoModifier) {
+        root.stopRecording()
+        event.accepted = true
+        return
+      }
       if (!shortcutInhibitor.active) {
         event.accepted = true
         return
       }
       if (root.isModifier(event.key)) {
-        event.accepted = true
-        return
-      }
-      if (event.key === Qt.Key_Escape && event.modifiers === Qt.NoModifier) {
-        root.stopRecording()
         event.accepted = true
         return
       }

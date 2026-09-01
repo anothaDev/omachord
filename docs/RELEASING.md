@@ -2,9 +2,11 @@
 
 ## Local Gate
 
-Release validation requires Omarchy 4.0.1, Hyprland 0.56.2, Quickshell 0.3.1, and the tools listed in the README.
+Release validation requires Omarchy 4.0.2, Hyprland 0.56.2, Quickshell 0.3.1, and the tools listed in the README.
 
-The manifest declares both a `panel` and a `service` kind; restart Omarchy Shell after checking out a manifest change so the condition service is loaded before any live check, and confirm it with `omarchy-shell omachord status`.
+The manifest declares `panel`, `service`, and `bar-widget` kinds; restart Omarchy Shell after checking out a manifest change or a new QML file so the condition service and the bar widget are loaded before any live check, and confirm them with `omarchy-shell omachord status` and `omachord widget status`.
+
+Review the offscreen renders (`test/render/render.sh`, output under `test/render/out/`) for each view, the compact layout, and the bar popup before tagging; the theme crossfade and the bar widget itself need a live shell.
 
 Run the complete local suite from a clean checkout:
 
@@ -12,13 +14,12 @@ Run the complete local suite from a clean checkout:
 test/run.sh
 ```
 
-Validate an extracted copy as well as the checkout so local symlinks or omitted files cannot mask packaging errors:
+Validate the exact committed artifact as well as the checkout so untracked files, local symlinks, or omitted files cannot mask packaging errors:
 
 ```bash
 release_dir=$(mktemp -d)
-tar -cf - . | tar -xf - -C "$release_dir"
-omarchy plugin validate "$release_dir"
-desktop-file-validate "$release_dir/desktop/anothadev.omachord.desktop"
+git archive --format=tar HEAD | tar -xf - -C "$release_dir"
+(cd "$release_dir" && test/run.sh)
 rm -rf "$release_dir"
 ```
 
@@ -26,7 +27,7 @@ Review the release diff for credentials, generated state, unexpected binaries, a
 
 ## Tagging
 
-Create an annotated `v*` tag only after the local gate and review pass, and sign it when a release signing identity is configured. Publish release notes that identify supported Omarchy, Hyprland, and Quickshell versions and call out security-relevant behavior changes.
+Create an annotated `v*` tag only after the local gate and review pass, and sign it when a release signing identity is configured. Confirm the tag name is `v$(jq -r .version manifest.json)` before pushing it. Publish release notes that identify supported Omarchy, Hyprland, and Quickshell versions and call out security-relevant behavior changes.
 
 ## Repository Rules
 

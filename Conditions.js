@@ -272,16 +272,192 @@ function settleMs(nextBoundaryMs, nextExpiry, safetyMs) {
   return Math.max(1000, best)
 }
 
-function routineSummary(routine, env, active, latched) {
+var SETTER_TYPES = ["nightlight", "dnd", "stay-awake", "theme", "brightness"]
+
+// A routine is stateful when ending it does something: a setter it will put
+// back, end actions to run, or a timer that ends it. Mirrors Model.isStateful
+// without normalizing, so the service can classify a committed routine as-is.
+function routineRestores(routine) {
+  if (!routine) return false
+  var actions = Array.isArray(routine.actions) ? routine.actions : []
+  for (var i = 0; i < actions.length; i++) {
+    var action = actions[i]
+    if (action && SETTER_TYPES.indexOf(String(action.type || "")) !== -1 && action.restore === true) return true
+  }
+  var onEnd = routine.onEnd && typeof routine.onEnd === "object" ? routine.onEnd : null
+  if (onEnd && onEnd.mode === "actions" && Array.isArray(onEnd.actions) && onEnd.actions.length > 0) return true
+  return !!routine.keepUntil && typeof routine.keepUntil === "object"
+}
+
+// ------------------------------------------------------------ describing
+// Human phrases for the UI. Nothing here decides anything: `matched` always
+// comes from evaluate(), these only explain what a condition wants and what
+// the environment currently provides.
+
+var WEEKDAY_ORDER = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+var WEEKDAY_LABELS = { mon: "Mon", tue: "Tue", wed: "Wed", thu: "Thu", fri: "Fri", sat: "Sat", sun: "Sun" }
+
+function pad2(value) {
+  return (value < 10 ? "0" : "") + value
+}
+
+function clockOf(date) {
+  return pad2(date.getHours()) + ":" + pad2(date.getMinutes())
+}
+
+function weekdayPhrase(weekdays) {
+  var chosen = Array.isArray(weekdays) ? weekdays : []
+  var labels = []
+  for (var i = 0; i < WEEKDAY_ORDER.length; i++)
+    if (chosen.indexOf(WEEKDAY_ORDER[i]) !== -1) labels.push(WEEKDAY_LABELS[WEEKDAY_ORDER[i]])
+  return labels.length ? " on " + labels.join(", ") : ""
+}
+
+function describeTime(condition, env) {
+  var start = parseHHMM(condition.start) >= 0 ? String(condition.start) : "--:--"
+  var end = parseHHMM(condition.end) >= 0 ? String(condition.end) : "--:--"
+  return {
+    summary: start + "–" + end + weekdayPhrase(condition.weekdays),
+    state: "now " + clockOf(env.now)
+  }
+}
+
+function describeWifi(condition, env) {
+  var names = Array.isArray(condition.ssids) ? condition.ssids.map(String) : []
+  var state
+  if (env && env.wifiAvailable === false) state = "Wi-Fi unavailable"
+  else if (env && env.ssid) state = "connected to " + String(env.ssid)
+  else state = "not connected"
+  return {
+    summary: names.length ? "Wi-Fi " + names.join(", ") : "Wi-Fi",
+    state: state
+  }
+}
+
+function describePower(condition, env) {
+  var summary
+  if (condition.source === "ac") summary = "plugged in"
+  else {
+    var below = Number(condition.batteryBelow || 0)
+    summary = below > 0 ? "on battery below " + below + "%" : "on battery"
+  }
+  var state
+  if (env && env.onBattery === true) {
+    var percent = env.batteryPercent
+    state = typeof percent === "number" && percent >= 0 ? "on battery " + percent + "%" : "on battery"
+  } else {
+    state = "plugged in"
+  }
+  return { summary: summary, state: state }
+}
+
+function describeToggle(condition, env) {
+  var flag = String(condition.flag || "")
+  return {
+    summary: "toggle " + flag + " on",
+    state: env && env.toggles && env.toggles[flag] === true ? "on" : "off"
+  }
+}
+
+function describeCondition(condition, env) {
+  if (!condition) return { type: "", matched: false, summary: "", state: "" }
+  var type = String(condition.type || "")
+  var text
+  switch (type) {
+    case "time": text = describeTime(condition, env); break
+    case "wifi": text = describeWifi(condition, env); break
+    case "power": text = describePower(condition, env); break
+    case "omarchy-toggle": text = describeToggle(condition, env); break
+    default: text = { summary: type, state: "" }
+  }
+  return { type: type, matched: evaluate(condition, env), summary: text.summary, state: text.state }
+}
+
+// The service's failure record for a routine, as the UI wants to show it:
+// what was attempted, when, why it failed, and when the service tries again.
+function describeFailure(failure, retryMs) {
+  if (!failure || typeof failure !== "object") return null
+  var at = Number(failure.at)
+  if (isNaN(at)) return null
+  return {
+    op: String(failure.op || ""),
+    at: at,
+    error: failure.error === undefined || failure.error === null ? "" : String(failure.error),
+    retryAt: at + (isNaN(Number(retryMs)) ? 0 : Number(retryMs))
+  }
+}
+
+function routineSummary(routine, env, active, latched, failures, retryMs) {
   var id = String(routine.id)
   var snapshot = active ? active[id] : null
+  var conditions = Array.isArray(routine.conditions) ? routine.conditions : []
+  var details = []
+  for (var i = 0; i < conditions.length; i++) details.push(describeCondition(conditions[i], env))
   return {
     id: id,
-    conditions: Array.isArray(routine.conditions) ? routine.conditions.length : 0,
+    conditions: conditions.length,
     matched: evaluateAll(routine.conditions, env),
     active: !!snapshot,
     trigger: snapshot ? snapshot.trigger : null,
     expiresAt: snapshot ? snapshot.expiresAt : null,
-    latched: !!(latched && latched[id])
+    latched: !!(latched && latched[id]),
+    details: details,
+    failure: describeFailure(failures ? failures[id] : null, retryMs)
   }
+}
+
+// ------------------------------------------------------------ clock text
+// Shared with the UI. Dates that come from another JS realm (the Node test
+// harness) are not `instanceof Date` here, so everything is duck-typed.
+
+function toMs(value) {
+  if (value === undefined || value === null || value === "") return null
+  var ms
+  if (typeof value === "number") ms = value
+  else if (typeof value === "object" && typeof value.getTime === "function") ms = value.getTime()
+  else ms = Date.parse(String(value))
+  return typeof ms === "number" && isFinite(ms) ? ms : null
+}
+
+function nowMsOf(nowDate) {
+  var ms = toMs(nowDate)
+  return ms === null ? Date.now() : ms
+}
+
+function startOfLocalDay(ms) {
+  var day = new Date(ms)
+  day.setHours(0, 0, 0, 0)
+  return day.getTime()
+}
+
+// "just now", "3 min ago", "2 h ago", "yesterday", "3 days ago"; "" when the
+// timestamp is missing or unreadable. Days are counted by local calendar date.
+function relativeTime(iso, nowDate) {
+  var at = toMs(iso)
+  if (at === null) return ""
+  var diff = nowMsOf(nowDate) - at
+  if (diff < 60000) return "just now"
+  var minutes = Math.floor(diff / 60000)
+  if (minutes < 60) return minutes + " min ago"
+  var hours = Math.floor(diff / 3600000)
+  if (hours < 24) return hours + " h ago"
+  var days = Math.round((startOfLocalDay(nowMsOf(nowDate)) - startOfLocalDay(at)) / DAY_MS)
+  if (days < 1) days = 1
+  return days === 1 ? "yesterday" : days + " days ago"
+}
+
+// Local wall-clock "HH:MM" of a timestamp, or "" when unreadable.
+function clockTime(iso) {
+  var at = toMs(iso)
+  return at === null ? "" : clockOf(new Date(at))
+}
+
+// Whole minutes until a timestamp, rounded up so a few seconds left still
+// reads as one minute. Negative once the moment has passed, counting elapsed
+// whole minutes the way relativeTime does; null without a usable timestamp.
+function minutesLeft(iso, nowDate) {
+  var at = toMs(iso)
+  if (at === null) return null
+  var minutes = Math.ceil((at - nowMsOf(nowDate)) / 60000)
+  return minutes === 0 ? 0 : minutes
 }

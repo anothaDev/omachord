@@ -22,6 +22,9 @@ LOCK_FILE="$STATE_DIR/config.lock"
 LOG_FILE="$STATE_DIR/runs.jsonl"
 OWNERSHIP_FILE="$STATE_DIR/connection.json"
 DISABLED_FILE="$STATE_DIR/connection.disabled.json"
+WIDGET_FILE="$STATE_DIR/bar-widget.json"
+WIDGET_PLACEMENT='{"section":"center","after":"omarchy.indicators"}'
+SHELL_CONFIG_FILE="${OMACHORD_SHELL_CONFIG:-$OMARCHY_CONFIG_DIR/shell.json}"
 COMMIT_FILE="$STATE_DIR/config.commit.json"
 
 if [[ -n ${OMACHORD_RUN_LOCK_DIR:-} ]]; then
@@ -489,13 +492,14 @@ ensure_private_directory_tree() {
 }
 
 secure_optional_private_directory() {
-  local path=$1 label=${2:-state directory}
+  local path=$1 label=${2:-state directory} mode
   [[ -e $path || -L $path ]] || return 0
   if [[ -L $path || ! -d $path || ! -O $path ]]; then
     LAST_ERROR="The $label must be a user-owned directory: $path"
     return 1
   fi
-  if ! chmod -h 700 -- "$path" \
+  mode=$(stat -c %a -- "$path" 2>/dev/null) || mode=""
+  if { [[ $mode != 700 ]] && ! chmod -h 700 -- "$path"; } \
     || [[ -L $path || ! -d $path || ! -O $path ]] \
     || [[ $(stat -c %a -- "$path" 2>/dev/null) != 700 ]]; then
     LAST_ERROR="Could not secure the $label: $path"
@@ -504,13 +508,14 @@ secure_optional_private_directory() {
 }
 
 secure_optional_private_file() {
-  local path=$1 mode=${2:-600} label=${3:-state file}
+  local path=$1 mode=${2:-600} label=${3:-state file} current_mode
   [[ -e $path || -L $path ]] || return 0
   if [[ -L $path || ! -f $path || ! -O $path ]]; then
     LAST_ERROR="The $label must be a user-owned regular file: $path"
     return 1
   fi
-  if ! chmod -h "$mode" -- "$path" \
+  current_mode=$(stat -c %a -- "$path" 2>/dev/null) || current_mode=""
+  if { [[ $current_mode != "$mode" ]] && ! chmod -h "$mode" -- "$path"; } \
     || [[ -L $path || ! -f $path || ! -O $path ]] \
     || [[ $(stat -c %a -- "$path" 2>/dev/null) != "$mode" ]]; then
     LAST_ERROR="Could not secure the $label: $path"
@@ -521,7 +526,7 @@ secure_optional_private_file() {
 prepare_state_dir() {
   local path
   ensure_private_directory_tree "$STATE_DIR" "state directory" || return 1
-  for path in "$LOCK_FILE" "$STATE_DIR/log.lock" "$LOG_FILE" "$OWNERSHIP_FILE" "$DISABLED_FILE" "$COMMIT_FILE"; do
+  for path in "$LOCK_FILE" "$STATE_DIR/log.lock" "$LOG_FILE" "$OWNERSHIP_FILE" "$DISABLED_FILE" "$COMMIT_FILE" "$WIDGET_FILE"; do
     secure_optional_private_file "$path" 600 "state file" || return 1
   done
   for path in "$STATE_DIR/backups" "$STATE_DIR/conflicts" "$STATE_DIR/retired" "$ACTIVE_DIR"; do
@@ -3368,6 +3373,292 @@ command_trigger_hook() {
   jq -cn --arg event "$event" --argjson matched "$matched" '{ok:true,event:$event,matched:$matched}'
 }
 
+# The bar widget is placed once per install. A fresh install already has the
+# widget on the bar when the plugin is enabled (bar-widget is one of the
+# manifest kinds, so the shell inserts the id into bar.layout), but installs
+# that were enabled before the widget existed carry the id in plugins[]
+# instead: the shell's putBarWidget verb then answers "ok" without adding the
+# widget, because setEnabled finds the plugins[] entry and skips the bar
+# insert. The runner therefore reads shell.json itself, moves such an entry
+# onto the bar with one atomic edit, and only records the marker once the
+# widget is verifiably on the bar. The marker keeps a widget the person later
+# took off the bar from being put back on the next shell start.
+#
+# The jq prelude is copied from omarchy-shell-config, which is not sourced
+# because it redefines fail and installs an EXIT trap of its own.
+SHELL_CONFIG_JQ_PRELUDE='
+  def object_or_empty: if type == "object" then . else {} end;
+  def array_or_empty: if type == "array" then . else [] end;
+  def normalize_shell_config:
+    object_or_empty
+    | .version = 1
+    | .bar = (.bar | object_or_empty)
+    | .bar.layout = (.bar.layout | object_or_empty)
+    | .bar.layout.left = (.bar.layout.left | array_or_empty)
+    | .bar.layout.center = (.bar.layout.center | array_or_empty)
+    | .bar.layout.right = (.bar.layout.right | array_or_empty)
+    | .plugins = (.plugins | array_or_empty);
+  def single_document:
+    if type == "array" and length == 1 then .[0]
+    else error("expected a single JSON document") end;
+  def supported_shell_config:
+    if type == "object"
+      and .version == 1
+      and (if has("plugins") then (.plugins | type == "array") else true end)
+      and (if has("bar") then
+        (.bar | type == "object" and
+          (if has("layout") then
+            (.layout | type == "object"
+              and (if has("left") then (.left | type == "array") else true end)
+              and (if has("center") then (.center | type == "array") else true end)
+              and (if has("right") then (.right | type == "array") else true end))
+          else true end))
+        else true end)
+    then .
+    else error("unsupported shell configuration") end;
+  def entry_matches($id): (type == "object" and .id == $id) or . == $id;
+  def bar_entries: [.bar.layout.left[], .bar.layout.center[], .bar.layout.right[]];
+'
+SHELL_WIDGET_IN_BAR=false
+SHELL_WIDGET_IN_PLUGINS=false
+
+# Reads the shell config and records whether the plugin id is on the bar
+# (bar.layout.{left,center,right}) or listed in plugins[]. Fails when the file
+# is missing, unreadable, oversized, or not a single JSON document.
+read_shell_widget_state() {
+  local state size in_bar in_plugins
+  SHELL_WIDGET_IN_BAR=false
+  SHELL_WIDGET_IN_PLUGINS=false
+  if [[ -L $SHELL_CONFIG_FILE || ! -f $SHELL_CONFIG_FILE \
+      || ! -O $SHELL_CONFIG_FILE || ! -r $SHELL_CONFIG_FILE ]]; then
+    LAST_ERROR="The Omarchy shell config must be a readable user-owned regular file: $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  size=$(stat -c %s -- "$SHELL_CONFIG_FILE" 2>/dev/null) || size=""
+  if [[ ! $size =~ ^[0-9]+$ ]] || ((size > MAX_CONFIG_BYTES)); then
+    LAST_ERROR="The Omarchy shell config exceeds the 1 MiB limit: $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  state=$(jq -rs --arg id "$PLUGIN_ID" "$SHELL_CONFIG_JQ_PRELUDE"'
+    single_document
+    | supported_shell_config
+    | normalize_shell_config
+    | "\(bar_entries | any(entry_matches($id))) \(.plugins | any(entry_matches($id)))"
+  ' "$SHELL_CONFIG_FILE" 2>/dev/null) || {
+    LAST_ERROR="The Omarchy shell config is not valid JSON: $SHELL_CONFIG_FILE"
+    return 1
+  }
+  read -r in_bar in_plugins <<<"$state"
+  if [[ $in_bar != true && $in_bar != false ]] || [[ $in_plugins != true && $in_plugins != false ]]; then
+    LAST_ERROR="The Omarchy shell config could not be inspected: $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  SHELL_WIDGET_IN_BAR=$in_bar
+  SHELL_WIDGET_IN_PLUGINS=$in_plugins
+}
+
+# Moves the plugins[] entry of an install enabled before the widget existed
+# onto the bar: one atomic jq edit that normalizes shell.json, drops every
+# plugins[] entry for this id, and inserts {id} into bar.layout.center right
+# after omarchy.indicators (else after omarchy.weather, else at the end). The
+# previous file is kept under the state backups first. Sets SHELL_CONFIG_BACKUP.
+SHELL_CONFIG_BACKUP=""
+migrate_shell_widget_entry() {
+  local snapshot source backup mode baseline error size
+  SHELL_CONFIG_BACKUP=""
+  prepare_private_subdirectory "$STATE_DIR/backups" || {
+    LAST_ERROR="Could not create the shell config backup directory"
+    return 1
+  }
+  baseline=$(config_file_fingerprint "$SHELL_CONFIG_FILE")
+  if [[ $baseline != file:* ]]; then
+    LAST_ERROR="Refusing to migrate a non-regular or unstable shell config: $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  snapshot=$(mktemp) || {
+    LAST_ERROR="Could not prepare the shell config snapshot"
+    return 1
+  }
+  if ! cp --preserve=mode -- "$SHELL_CONFIG_FILE" "$snapshot" \
+      || [[ $(config_file_fingerprint "$snapshot") != "$baseline" ]] \
+      || [[ $(config_file_fingerprint "$SHELL_CONFIG_FILE") != "$baseline" ]]; then
+    rm -f -- "$snapshot"
+    LAST_ERROR="The Omarchy shell config changed while it was being read: $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  mode=${baseline#file:}
+  mode=${mode%%:*}
+  backup=$(mktemp "$STATE_DIR/backups/shell.json.XXXXXXXX") || {
+    rm -f -- "$snapshot"
+    LAST_ERROR="Could not prepare the shell config backup"
+    return 1
+  }
+  if ! cp -- "$snapshot" "$backup" || ! chmod 600 "$backup"; then
+    rm -f -- "$snapshot" "$backup"
+    LAST_ERROR="Could not back up $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  SHELL_CONFIG_BACKUP=$backup
+  source=$(mktemp) || {
+    rm -f -- "$snapshot" "$backup"
+    SHELL_CONFIG_BACKUP=""
+    LAST_ERROR="Could not prepare the shell config update"
+    return 1
+  }
+  if ! jq -S -s --arg id "$PLUGIN_ID" "$SHELL_CONFIG_JQ_PRELUDE"'
+      def position_after($needle):
+        (map(entry_matches($needle)) | index(true)) as $index
+        | if $index == null then null else $index + 1 end;
+      single_document
+      | supported_shell_config
+      | normalize_shell_config
+      | if (bar_entries | any(entry_matches($id)))
+          or ((.plugins | any(entry_matches($id))) | not)
+        then error("widget state changed before migration")
+        else
+          .plugins |= map(select(entry_matches($id) | not))
+          | .bar.layout.center |= (
+              (position_after("omarchy.indicators") // position_after("omarchy.weather") // length) as $at
+              | .[:$at] + [{id: $id}] + .[$at:]
+            )
+        end
+    ' "$snapshot" >"$source" 2>/dev/null; then
+    rm -f -- "$snapshot" "$source" "$backup"
+    SHELL_CONFIG_BACKUP=""
+    LAST_ERROR="Could not build the Omarchy shell config update: $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  rm -f -- "$snapshot"
+  size=$(stat -c %s -- "$source" 2>/dev/null) || size=""
+  if [[ ! $size =~ ^[0-9]+$ ]] || ((size > MAX_CONFIG_BYTES)); then
+    rm -f -- "$source" "$backup"
+    SHELL_CONFIG_BACKUP=""
+    LAST_ERROR="The updated Omarchy shell config would exceed the 1 MiB limit: $SHELL_CONFIG_FILE"
+    return 1
+  fi
+  if ! atomic_replace_if_fingerprint "$source" "$SHELL_CONFIG_FILE" "$baseline" "$mode"; then
+    error=$LAST_ERROR
+    rm -f -- "$source"
+    LAST_ERROR=${error:-"Could not update the Omarchy shell config: $SHELL_CONFIG_FILE"}
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+reload_shell_config() {
+  command -v omarchy-shell >/dev/null 2>&1 || return 0
+  control_capture omarchy-shell -q shell reloadConfig >/dev/null 2>&1 || true
+}
+
+# The shell writes shell.json asynchronously after answering putBarWidget, so
+# the verification allows it a moment to land. Returns 0 once the widget is on
+# the bar, 1 when it is not, 2 when the config could not be read.
+wait_for_shell_widget_in_bar() {
+  local attempt state=1
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if read_shell_widget_state; then
+      state=1
+      [[ $SHELL_WIDGET_IN_BAR != true ]] || return 0
+    else
+      state=2
+    fi
+    ((attempt == 10)) || sleep 0.1
+  done
+  return "$state"
+}
+
+widget_marker_written() {
+  [[ -e $WIDGET_FILE || -L $WIDGET_FILE ]] || return 1
+  secure_optional_private_file "$WIDGET_FILE" 600 "bar widget record" || return 2
+  jq -e --arg id "$PLUGIN_ID" '
+    type == "object"
+    and (keys | sort) == ["placed", "pluginId", "version"]
+    and .version == 1
+    and .pluginId == $id
+  ' "$WIDGET_FILE" >/dev/null 2>&1 || {
+    LAST_ERROR="The Omachord bar widget record is invalid: $WIDGET_FILE"
+    return 2
+  }
+}
+
+write_widget_marker() {
+  local placed=$1 source
+  source=$(mktemp) || {
+    LAST_ERROR="Could not prepare the bar widget record"
+    return 1
+  }
+  if ! jq -cn --arg id "$PLUGIN_ID" --arg placed "$placed" \
+    '{version:1,pluginId:$id,placed:$placed}' >"$source" \
+    || ! write_atomic "$source" "$WIDGET_FILE" 600; then
+    rm -f -- "$source"
+    LAST_ERROR=${LAST_ERROR:-"Could not save the bar widget record"}
+    return 1
+  fi
+  rm -f -- "$source"
+}
+
+command_widget() {
+  local subcommand=${1:-} marker_state=0 result verified=0
+  (($# <= 1)) || fail "Usage: omachord widget <ensure|status|forget>" usage
+  case $subcommand in
+    ensure|status|forget) ;;
+    *) fail "Usage: omachord widget <ensure|status|forget>" usage ;;
+  esac
+  widget_marker_written || marker_state=$?
+  ((marker_state != 2)) || fail "$LAST_ERROR" unsafe-state
+  if [[ $subcommand == status ]]; then
+    read_shell_widget_state || true
+    jq -cn --argjson recorded "$([[ $marker_state == 0 ]] && printf true || printf false)" \
+      --arg placement "$WIDGET_PLACEMENT" \
+      --argjson inBar "$SHELL_WIDGET_IN_BAR" --argjson inPlugins "$SHELL_WIDGET_IN_PLUGINS" \
+      '{ok:true,recorded:$recorded,placement:($placement | fromjson),inBar:$inBar,inPlugins:$inPlugins}'
+    return
+  fi
+  if [[ $subcommand == forget ]]; then
+    if ((marker_state == 0)); then
+      rm -f -- "$WIDGET_FILE" || fail "Could not remove the bar widget record" unsafe-state
+    fi
+    jq -cn '{ok:true,recorded:false}'
+    return
+  fi
+  if ((marker_state == 0)); then
+    jq -cn '{ok:true,placed:false,skipped:true}'
+    return
+  fi
+  read_shell_widget_state || fail "$LAST_ERROR" shell-config-invalid
+  if [[ $SHELL_WIDGET_IN_BAR == true ]]; then
+    write_widget_marker "$(date --iso-8601=seconds)" || fail "$LAST_ERROR" unsafe-state
+    jq -cn '{ok:true,placed:false,alreadyPresent:true}'
+    return
+  fi
+  if [[ $SHELL_WIDGET_IN_PLUGINS == true ]]; then
+    migrate_shell_widget_entry || fail "$LAST_ERROR" unsafe-state
+    reload_shell_config
+    read_shell_widget_state || fail "$LAST_ERROR" shell-config-invalid
+    [[ $SHELL_WIDGET_IN_BAR == true ]] \
+      || fail "The bar widget entry did not land in $SHELL_CONFIG_FILE" shell-refused
+    write_widget_marker "$(date --iso-8601=seconds)" || fail "$LAST_ERROR" unsafe-state
+    jq -cn --arg backup "$SHELL_CONFIG_BACKUP" '{ok:true,placed:true,migrated:true,backup:$backup}'
+    return
+  fi
+  if ! command -v omarchy-shell >/dev/null 2>&1; then
+    fail "omarchy-shell is not available" shell-unavailable
+  fi
+  result=$(control_capture omarchy-shell shell putBarWidget "$PLUGIN_ID" "$WIDGET_PLACEMENT" 2>/dev/null) \
+    || fail "The Omarchy shell did not answer the bar widget request" shell-unavailable
+  result=$(trim "$result")
+  case $result in
+    ok) ;;
+    "not ready") fail "The Omarchy shell is still scanning plugins" shell-not-ready ;;
+    *) fail "The Omarchy shell refused the bar widget: ${result:-no answer}" shell-refused ;;
+  esac
+  wait_for_shell_widget_in_bar || verified=$?
+  ((verified != 2)) || fail "$LAST_ERROR" shell-config-invalid
+  ((verified == 0)) || fail "The Omarchy shell answered ok but did not put the bar widget in $SHELL_CONFIG_FILE" shell-refused
+  write_widget_marker "$(date --iso-8601=seconds)" || fail "$LAST_ERROR" unsafe-state
+  jq -cn '{ok:true,placed:true}'
+}
+
 command_logs() {
   local raw_limit=${1:-50} limit
   [[ $raw_limit =~ ^[0-9]+$ ]] || fail "Log limit must be a number" usage
@@ -3413,6 +3704,11 @@ Commands:
   active                Snapshots of currently active stateful routines
   trigger hook <event> [args...]
   logs [limit]
+  widget ensure         Put the bar widget on the bar once: moves a pre-widget
+                        plugins[] entry in shell.json onto the bar, otherwise
+                        asks the Omarchy shell to place it
+  widget status         Marker state plus where shell.json lists the plugin
+  widget forget         Allow the next ensure to place the widget again
 EOF
 }
 
@@ -3471,6 +3767,7 @@ main() {
       command_trigger_hook "$@"
       ;;
     logs) require_prepared_state; command_logs "$@" ;;
+    widget) require_prepared_state; command_widget "$@" ;;
     -h|--help|help|"") usage ;;
     *) fail "Unknown command: $command" usage ;;
   esac

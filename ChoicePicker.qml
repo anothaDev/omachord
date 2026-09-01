@@ -14,6 +14,11 @@ Item {
   property bool showLabel: true
   property bool searchable: false
   property bool hasCursor: false
+  // Optional Nerd Font glyph drawn before the current label.
+  property string leadingIcon: ""
+  // Paint the trigger as a bordered command button with a centred label,
+  // so a picker can double as a "+ New routine" style action.
+  property bool emphasized: false
   property color foreground: Color.popups.text
   property color background: Color.popups.background
   property color popupBorder: Color.popups.border
@@ -111,9 +116,16 @@ Item {
       readonly property bool focused: activeFocus
       readonly property bool hot: triggerHover.hovered || root.hasCursor
 
-      color: Style.controlFill(focused, hot, root.foreground, root.accent)
+      // At rest this is Style.normalFillFor + Border.controlSpec("normal"),
+      // the same chrome a bordered kit Button paints; emphasized pickers add
+      // the button's pressed fill on mouse down.
+      color: root.emphasized && triggerMouse.pressed
+        ? Style.pressedFillFor(root.foreground, root.accent)
+        : Style.controlFill(focused, hot, root.foreground, root.accent)
       borderSpec: Border.controlSpec(focused ? "focus" : (hot ? "hover-cursor" : "normal"),
         root.foreground, root.accent)
+
+      Behavior on color { ColorAnimation { duration: 120 } }
 
       HoverHandler {
         id: triggerHover
@@ -131,41 +143,79 @@ Item {
         }
       }
 
-      Text {
-
-        textFormat: Text.PlainText
+      Item {
+        id: labelBox
         anchors.left: parent.left
         anchors.right: chevron.left
-        anchors.verticalCenter: parent.verticalCenter
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
         anchors.leftMargin: trigger.borderLeft + Style.spacing.controlPaddingX
         anchors.rightMargin: Style.spacing.md
-        text: root.currentLabel() || root.placeholderText
-        color: root.currentLabel() ? root.foreground : Qt.darker(root.foreground, 1.5)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.body
-        elide: Text.ElideRight
+
+        Row {
+          id: labelRow
+          anchors.verticalCenter: parent.verticalCenter
+          x: root.emphasized ? Math.max(0, Math.round((labelBox.width - width) / 2)) : 0
+          spacing: Style.spacing.controlGap
+
+          Text {
+            textFormat: Text.PlainText
+            id: leadingIconText
+            visible: root.leadingIcon !== ""
+            anchors.verticalCenter: parent.verticalCenter
+            text: root.leadingIcon
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.icon
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.max(0, Math.min(implicitWidth, labelBox.width
+              - (leadingIconText.visible ? leadingIconText.width + labelRow.spacing : 0)))
+            text: root.currentLabel() || root.placeholderText
+            color: root.currentLabel() || root.emphasized
+              ? root.foreground : Qt.darker(root.foreground, 1.5)
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            elide: Text.ElideRight
+          }
+        }
       }
 
       Text {
-
         textFormat: Text.PlainText
         id: chevron
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
         anchors.rightMargin: trigger.borderRight + Style.spacing.controlGap
-        text: "v"
+        text: "󰅀"
         color: Qt.darker(root.foreground, 1.2)
         font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
+        font.pixelSize: Style.font.body
       }
 
       MouseArea {
+        id: triggerMouse
         anchors.fill: parent
         cursorShape: Qt.PointingHandCursor
         onClicked: {
           trigger.forceActiveFocus()
           root.toggle()
         }
+      }
+
+      // Accent keyboard-focus ring, drawn just outside the control so it
+      // stays visible whatever border the theme gives the focus state.
+      Rectangle {
+        anchors.fill: trigger
+        anchors.margins: -1
+        visible: trigger.activeFocus
+        color: "transparent"
+        radius: trigger.radius
+        border.width: Math.max(2, Style.focusBorderWidth)
+        border.color: root.accent
       }
     }
   }
@@ -331,6 +381,8 @@ Item {
           height: root.popupRowHeight
           color: index === optionList.currentIndex
             ? Style.hoverFillFor(root.foreground, root.accent) : "transparent"
+
+          Behavior on color { ColorAnimation { duration: 60 } }
 
           Column {
             anchors.left: parent.left

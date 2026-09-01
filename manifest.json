@@ -2,16 +2,45 @@
   "schemaVersion": 1,
   "id": "anothadev.omachord",
   "name": "Omachord",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": "anothaDev",
   "description": "Compose keyboard shortcuts, Omarchy automations, and condition-driven routines with restore.",
   "kinds": [
     "panel",
-    "service"
+    "service",
+    "bar-widget"
   ],
   "keepLoaded": true,
   "entryPoints": {
     "panel": "Panel.qml",
-    "service": "Service.qml"
+    "service": "Service.qml",
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Omachord",
+    "description": "Shows which routines are active and lets you end them",
+    "category": "Status",
+    "allowMultiple": false,
+    "defaultSection": "center",
+    "defaults": {
+      "alwaysShow": false,
+      "showName": false
+    },
+    "schema": [
+      {
+        "key": "alwaysShow",
+        "type": "boolean",
+        "label": "Always show",
+        "description": "Keep the icon in the bar while nothing is active, as a way to open Omachord.",
+        "defaultValue": false
+      },
+      {
+        "key": "showName",
+        "type": "boolean",
+        "label": "Show routine name",
+        "description": "Show the name of the active routine next to the icon on horizontal bars.",
+        "defaultValue": false
+      }
+    ]
   }
 }

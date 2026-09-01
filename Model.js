@@ -75,12 +75,41 @@ function microphoneTemplate(routines) {
   }
 }
 
+// The Omarchy events a routine can listen to. One list feeds the editor, the
+// Activity view, and the README so their wording cannot drift.
+var HOOKS = [
+  { value: "post-boot", label: "After desktop starts", description: "Runs after the graphical session starts", glyph: "\u{F0425}" },
+  { value: "theme-set", label: "Theme changed", description: "Theme slug is argument 1", glyph: "\u{F03D8}" },
+  { value: "font-set", label: "Font changed", description: "Font name is argument 1", glyph: "\u{F0130}" },
+  { value: "battery-low", label: "Battery low", description: "Battery percentage is argument 1", glyph: "\u{F0079}" },
+  { value: "post-update", label: "After update", description: "Runs after packages and migrations", glyph: "\u{F0450}" },
+  { value: "pre-refresh-pacman", label: "Before Pacman refresh", description: "Runs before repositories are refreshed", glyph: "\u{F0453}" }
+]
+
+function hookInfo(event) {
+  for (var i = 0; i < HOOKS.length; i++) if (HOOKS[i].value === event) return HOOKS[i]
+  return { value: String(event || ""), label: String(event || ""), description: "", glyph: "" }
+}
+
 // Curated starting points that mirror common phone "modes"; every template is
 // a draft the user still names, tweaks, and saves.
 var TEMPLATE_KEYS = ["in-the-dark", "focus-at-work", "on-battery"]
 
+// Everything the "New routine" picker offers, blank and microphone included.
+function templateOptions() {
+  return [
+    { value: "blank", label: "Blank routine", description: "Start from nothing" },
+    { value: "microphone", label: "Meeting microphone", description: "Mute or unmute the microphone with a sound cue" },
+    { value: "in-the-dark", label: "In the dark", description: "Night light and a dimmer screen every evening" },
+    { value: "focus-at-work", label: "Focus at work", description: "Do not disturb and stay awake on weekdays" },
+    { value: "on-battery", label: "On battery", description: "Lower brightness below 30% battery" }
+  ]
+}
+
 function templateRoutine(key, routines) {
   switch (key) {
+    case "blank": return blankRoutine(routines)
+    case "microphone": return microphoneTemplate(routines)
     case "in-the-dark": return {
       id: uniqueId("In the dark", routines),
       name: "In the dark",
@@ -284,6 +313,82 @@ function summarizeTriggers(routine) {
   return parts.length ? parts.join(" / ") : "Manual only"
 }
 
+var ACTION_TYPES = [
+  { value: "nightlight", label: "Night light" },
+  { value: "dnd", label: "Do not disturb" },
+  { value: "stay-awake", label: "Stay awake" },
+  { value: "theme", label: "Theme" },
+  { value: "brightness", label: "Display brightness" },
+  { value: "microphone-toggle", label: "Microphone toggle" },
+  { value: "launch-app", label: "Launch application" },
+  { value: "omarchy-command", label: "Omarchy command" },
+  { value: "notification", label: "Notification" },
+  { value: "osd", label: "On-screen display" },
+  { value: "sound", label: "Play sound" },
+  { value: "delay", label: "Delay" },
+  { value: "exec", label: "Program + arguments" },
+  { value: "shell", label: "Shell command (advanced)" }
+]
+
+function actionTypeLabel(type) {
+  for (var i = 0; i < ACTION_TYPES.length; i++) if (ACTION_TYPES[i].value === type) return ACTION_TYPES[i].label
+  return String(type || "")
+}
+
+// One short phrase per action, for list summaries and card headers.
+function actionLabel(action) {
+  if (!action) return ""
+  var on = action.value === true
+  switch (String(action.type || "")) {
+    case "nightlight": return "Night light " + (on ? "on" : "off")
+    case "dnd": return "Do not disturb " + (on ? "on" : "off")
+    case "stay-awake": return on ? "Stay awake" : "Allow idle"
+    case "theme": return action.value ? "Theme " + String(action.value) : "Theme"
+    case "brightness": return "Brightness " + (typeof action.value === "number" ? action.value + "%" : "")
+    case "microphone-toggle": return "Toggle microphone"
+    case "launch-app": return action.desktopId ? "Launch " + String(action.desktopId).replace(/\.desktop$/, "") : "Launch application"
+    case "omarchy-command": return action.route ? String(action.route) : "Omarchy command"
+    case "notification": return action.title ? "Notify: " + String(action.title) : "Notification"
+    case "osd": return action.message ? "OSD: " + String(action.message) : "On-screen display"
+    case "sound": return "Play sound"
+    case "delay": return "Wait " + (typeof action.milliseconds === "number" ? action.milliseconds + " ms" : "")
+    case "exec": return action.program ? "Run " + String(action.program) : "Run program"
+    case "shell": return action.command ? "Shell: " + String(action.command) : "Shell command"
+  }
+  return actionTypeLabel(action.type)
+}
+
+function summarizeActions(routine, limit) {
+  var actions = routine && Array.isArray(routine.actions) ? routine.actions : []
+  var max = typeof limit === "number" && limit > 0 ? limit : 3
+  var parts = []
+  for (var i = 0; i < actions.length && i < max; i++) parts.push(actionLabel(actions[i]))
+  if (actions.length > max) parts.push("+" + (actions.length - max) + " more")
+  return parts.join(", ")
+}
+
+// How an activation record says a routine was started.
+function triggerLabel(trigger) {
+  var value = String(trigger || "")
+  if (value.indexOf("hook:") === 0) return "by the " + hookInfo(value.slice(5)).label.toLowerCase() + " event"
+  switch (value) {
+    case "shortcut": return "by shortcut"
+    case "condition":
+    case "service": return "by its conditions"
+    case "timer": return "by timer"
+    case "test": return "as a test"
+    case "manual": return "by hand"
+  }
+  return ""
+}
+
+function nameFor(config, id) {
+  var routines = config && Array.isArray(config.routines) ? config.routines : []
+  for (var i = 0; i < routines.length; i++)
+    if (routines[i] && routines[i].id === id) return String(routines[i].name || id)
+  return String(id || "")
+}
+
 var SETTER_TYPES = ["nightlight", "dnd", "stay-awake", "theme", "brightness"]
 var CONDITION_TYPES = ["time", "wifi", "power", "omarchy-toggle"]
 var WEEKDAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -422,6 +527,30 @@ function validateAction(action, endList) {
   return ""
 }
 
+// Per-card messages so the editor can mark the failing card instead of only
+// naming it at the bottom.
+function validationByIndex(routine) {
+  var next = normalizeRoutine(routine)
+  var result = { conditions: {}, actions: {}, end: {}, routine: "" }
+  if (!next) return result
+  for (var c = 0; c < next.conditions.length; c++) {
+    var conditionMessage = validateCondition(next.conditions[c])
+    if (conditionMessage) result.conditions[c] = conditionMessage
+  }
+  for (var a = 0; a < next.actions.length; a++) {
+    var actionMessage = validateAction(next.actions[a], false)
+    if (actionMessage) result.actions[a] = actionMessage
+  }
+  for (var e = 0; e < next.onEnd.actions.length; e++) {
+    var endMessage = validateAction(next.onEnd.actions[e], true)
+    if (endMessage) result.end[e] = endMessage
+  }
+  if (typeof next.keepUntil === "object"
+      && !(next.keepUntil.minutes >= 1 && next.keepUntil.minutes <= 1440 && Math.floor(next.keepUntil.minutes) === next.keepUntil.minutes))
+    result.routine = "Keep the routine for 1 to 1440 minutes"
+  return result
+}
+
 function validateRoutineDetails(routine) {
   var next = normalizeRoutine(routine)
   var message = ""
@@ -450,7 +579,7 @@ function summarizeCondition(condition) {
       var days = Array.isArray(condition.weekdays) && condition.weekdays.length
         ? condition.weekdays.map(function(day) { return day.charAt(0).toUpperCase() + day.slice(1) }).join(" ") + " "
         : ""
-      return days + String(condition.start) + "-" + String(condition.end)
+      return days + String(condition.start) + "\u2013" + String(condition.end)
     }
     case "wifi": return "Wi-Fi " + (Array.isArray(condition.ssids) ? condition.ssids.join(", ") : "")
     case "power":

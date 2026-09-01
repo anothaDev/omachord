@@ -20,7 +20,7 @@ trap cleanup EXIT
 cp -- "$ROOT/test/qml-runtime/shell.qml" "$TEST_DIR/shell.qml"
 ln -s /usr/share/omarchy/shell/Commons "$TEST_DIR/Commons"
 ln -s /usr/share/omarchy/shell/Ui "$TEST_DIR/Ui"
-for file in RoutineEditor.qml ActionCard.qml ChoicePicker.qml ShortcutRecorder.qml PlainTextButton.qml Model.js Conditions.js; do
+for file in RoutineEditor.qml ActionCard.qml ChoicePicker.qml ShortcutRecorder.qml PlainTextButton.qml KeyCap.qml EmptyState.qml Collapsible.qml Model.js Conditions.js; do
   ln -s "$ROOT/$file" "$TEST_DIR/$file"
 done
 

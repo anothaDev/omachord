@@ -24,6 +24,12 @@ qmllint -I /usr/share/omarchy/shell \
   "$ROOT/RoutineEditor.qml" \
   "$ROOT/ActionCard.qml" \
   "$ROOT/Service.qml" \
-  "$ROOT/ShortcutRecorder.qml"
+  "$ROOT/ShortcutRecorder.qml" \
+  "$ROOT/BarWidget.qml" \
+  "$ROOT/RoutinePopup.qml" \
+  "$ROOT/ThemePalette.qml" \
+  "$ROOT/KeyCap.qml" \
+  "$ROOT/EmptyState.qml" \
+  "$ROOT/Collapsible.qml"
 
 printf 'All tests passed.\n'

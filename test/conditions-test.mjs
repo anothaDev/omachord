@@ -136,8 +136,10 @@ assert.equal(conditions.settleMs(0, null, 60000), 1000, "never spin faster than 
 
 const summary = conditions.routineSummary(routines[0], env({ now: at(31, 23, 0) }), activeByCondition, { dark: true })
 assert.deepEqual(JSON.parse(JSON.stringify(summary)), {
-  id: "dark", conditions: 1, matched: true, active: true, trigger: "condition", expiresAt: null, latched: true
-})
+  id: "dark", conditions: 1, matched: true, active: true, trigger: "condition", expiresAt: null, latched: true,
+  details: [{ type: "time", matched: true, summary: "18:30–08:00", state: "now 23:00" }],
+  failure: null
+}, "existing keys keep their meaning; details and failure are added")
 
 assert.equal(conditions.latchHorizonMs(routines[0], at(31, 23, 0)), 4.5 * 3600000, "most recent edge was 18:30")
 assert.equal(conditions.latchHorizonMs(routines[0], at(31, 8, 30)), 30 * 60000, "most recent edge was 08:00")
@@ -160,5 +162,129 @@ assert.deepEqual(plain(conditions.seedLatches(routines, [
 assert.deepEqual(plain(conditions.seedLatches(routines, [
   { timestamp: "garbage", routineId: "dark", trigger: "shortcut", status: "deactivated" }
 ], at(31, 23, 0))), {}, "unparseable timestamps are ignored")
+
+
+// ------------------------------------------------------------ describing
+const describe = (condition, overrides) => plain(conditions.describeCondition(condition, env(overrides)))
+
+assert.deepEqual(describe(night, { now: at(31, 23, 0) }),
+  { type: "time", matched: true, summary: "18:30–08:00", state: "now 23:00" })
+assert.deepEqual(describe(night, { now: at(31, 9, 12) }),
+  { type: "time", matched: false, summary: "18:30–08:00", state: "now 09:12" })
+assert.deepEqual(describe(office, { now: at(31, 10, 0) }),
+  { type: "time", matched: true, summary: "09:00–17:00 on Mon, Tue, Wed, Thu, Fri", state: "now 10:00" })
+assert.equal(describe(office, { now: at(30, 10, 0) }).matched, false, "Sunday is described as not matched")
+assert.equal(describe({ type: "time", start: "09:00", end: "17:00", weekdays: ["tue", "mon"] }).summary,
+  "09:00–17:00 on Mon, Tue", "weekdays are listed in week order")
+assert.equal(describe({ type: "time", start: "9:00", end: "17:00", weekdays: [] }).summary,
+  "--:--–17:00", "an unreadable edge is shown as a placeholder")
+
+assert.deepEqual(describe(wifi, { ssid: "Office" }),
+  { type: "wifi", matched: true, summary: "Wi-Fi Office, Office-5G", state: "connected to Office" })
+assert.deepEqual(describe(wifi, { ssid: "Home" }),
+  { type: "wifi", matched: false, summary: "Wi-Fi Office, Office-5G", state: "connected to Home" })
+assert.deepEqual(describe(wifi, { ssid: null }),
+  { type: "wifi", matched: false, summary: "Wi-Fi Office, Office-5G", state: "not connected" })
+assert.deepEqual(describe(wifi, { ssid: "Office", wifiAvailable: false }),
+  { type: "wifi", matched: false, summary: "Wi-Fi Office, Office-5G", state: "Wi-Fi unavailable" })
+assert.equal(describe({ type: "wifi", ssids: [] }).summary, "Wi-Fi")
+
+assert.deepEqual(describe({ type: "power", source: "ac", batteryBelow: 0 }, { onBattery: false, batteryPercent: 80 }),
+  { type: "power", matched: true, summary: "plugged in", state: "plugged in" })
+assert.deepEqual(describe({ type: "power", source: "ac", batteryBelow: 0 }, { onBattery: true, batteryPercent: 80 }),
+  { type: "power", matched: false, summary: "plugged in", state: "on battery 80%" })
+assert.deepEqual(describe({ type: "power", source: "battery", batteryBelow: 30 }, { onBattery: true, batteryPercent: 14 }),
+  { type: "power", matched: true, summary: "on battery below 30%", state: "on battery 14%" })
+assert.deepEqual(describe({ type: "power", source: "battery", batteryBelow: 30 }, { onBattery: true, batteryPercent: 50 }),
+  { type: "power", matched: false, summary: "on battery below 30%", state: "on battery 50%" })
+assert.deepEqual(describe({ type: "power", source: "battery", batteryBelow: 30 }, { onBattery: true, batteryPercent: -1 }),
+  { type: "power", matched: false, summary: "on battery below 30%", state: "on battery" },
+  "an unknown level is neither shown nor matched against a threshold")
+assert.deepEqual(describe({ type: "power", source: "battery", batteryBelow: 0 }, { onBattery: true, batteryPercent: -1 }),
+  { type: "power", matched: true, summary: "on battery", state: "on battery" })
+assert.deepEqual(describe({ type: "power", source: "battery", batteryBelow: 0 }, { onBattery: false, batteryPercent: 90 }),
+  { type: "power", matched: false, summary: "on battery", state: "plugged in" })
+
+assert.deepEqual(describe({ type: "omarchy-toggle", flag: "suspend-off" }, { toggles: { "suspend-off": true } }),
+  { type: "omarchy-toggle", matched: true, summary: "toggle suspend-off on", state: "on" })
+assert.deepEqual(describe({ type: "omarchy-toggle", flag: "suspend-off" }, { toggles: {} }),
+  { type: "omarchy-toggle", matched: false, summary: "toggle suspend-off on", state: "off" })
+
+assert.deepEqual(describe({ type: "moon-phase" }),
+  { type: "moon-phase", matched: false, summary: "moon-phase", state: "" })
+assert.deepEqual(plain(conditions.describeCondition(null, env())),
+  { type: "", matched: false, summary: "", state: "" })
+
+const failure = { at: 1000, op: "activate", revision, error: "activate: shell not running" }
+let detailed = plain(conditions.routineSummary(routines[1],
+  env({ now: at(31, 10, 0), ssid: "Home" }), {}, {}, { work: failure }, 300000))
+assert.deepEqual(detailed, {
+  id: "work", conditions: 2, matched: false, active: false, trigger: null, expiresAt: null, latched: false,
+  details: [
+    { type: "time", matched: true, summary: "09:00–17:00 on Mon, Tue, Wed, Thu, Fri", state: "now 10:00" },
+    { type: "wifi", matched: false, summary: "Wi-Fi Office, Office-5G", state: "connected to Home" }
+  ],
+  failure: { op: "activate", at: 1000, error: "activate: shell not running", retryAt: 301000 }
+}, "details follow routine order and the failure carries its retry moment")
+assert.equal(plain(conditions.routineSummary(routines[0], env(), {}, {}, { work: failure }, 300000)).failure, null,
+  "another routine's failure is not reported")
+assert.deepEqual(plain(conditions.routineSummary(routines[0], env(), {}, {},
+  { dark: { at: 5, op: "deactivate", revision } }, 10)).failure,
+  { op: "deactivate", at: 5, error: "", retryAt: 15 }, "a failure without an error text is still reported")
+assert.equal(plain(conditions.routineSummary(routines[0], env(), {}, {},
+  { dark: { at: "garbage", op: "activate", revision } }, 10)).failure, null, "an unreadable failure time is dropped")
+assert.deepEqual(plain(conditions.routineSummary(routines[3], env(), {}, {})).details, [],
+  "an unconditioned routine has no details")
+
+// ------------------------------------------------------------ clock text
+const now = at(31, 12, 0)
+const ago = (ms) => new Date(now.getTime() - ms).toISOString()
+assert.equal(conditions.relativeTime(ago(0), now), "just now")
+assert.equal(conditions.relativeTime(ago(59 * 1000), now), "just now")
+assert.equal(conditions.relativeTime(ago(-5 * 60000), now), "just now", "a future time is not in the past")
+assert.equal(conditions.relativeTime(ago(60 * 1000), now), "1 min ago")
+assert.equal(conditions.relativeTime(ago(3 * 60000 + 59000), now), "3 min ago")
+assert.equal(conditions.relativeTime(ago(59 * 60000 + 59000), now), "59 min ago")
+assert.equal(conditions.relativeTime(ago(60 * 60000), now), "1 h ago")
+assert.equal(conditions.relativeTime(ago(2 * 3600000 + 1800000), now), "2 h ago")
+assert.equal(conditions.relativeTime(ago(23 * 3600000 + 3599000), now), "23 h ago")
+assert.equal(conditions.relativeTime(ago(24 * 3600000), now), "yesterday")
+assert.equal(conditions.relativeTime(ago(30 * 3600000), now), "yesterday")
+assert.equal(conditions.relativeTime(ago(3 * 86400000), now), "3 days ago")
+assert.equal(conditions.relativeTime(at(29, 23, 30).toISOString(), at(31, 0, 30)), "2 days ago",
+  "days are counted by local calendar date, not 24 h buckets")
+assert.equal(conditions.relativeTime(at(28, 12, 0), now), "3 days ago", "a Date is accepted")
+assert.equal(conditions.relativeTime(now.getTime() - 120000, now), "2 min ago", "a millisecond number is accepted")
+assert.equal(conditions.relativeTime("garbage", now), "")
+assert.equal(conditions.relativeTime("", now), "")
+assert.equal(conditions.relativeTime(null, now), "")
+assert.equal(conditions.relativeTime(undefined, now), "")
+assert.equal(conditions.relativeTime(new Date().toISOString()), "just now", "the clock defaults to now")
+
+assert.equal(conditions.clockTime(iso(31, 9, 5)), "09:05")
+assert.equal(conditions.clockTime(iso(31, 23, 59)), "23:59")
+assert.equal(conditions.clockTime(iso(31, 0, 0)), "00:00")
+assert.equal(conditions.clockTime(at(31, 14, 7)), "14:07", "a Date is accepted")
+assert.equal(conditions.clockTime("garbage"), "")
+assert.equal(conditions.clockTime(""), "")
+assert.equal(conditions.clockTime(null), "")
+assert.equal(conditions.clockTime(undefined), "")
+
+const ahead = (ms) => new Date(now.getTime() + ms).toISOString()
+assert.equal(conditions.minutesLeft(ahead(5 * 60000), now), 5)
+assert.equal(conditions.minutesLeft(ahead(90 * 1000), now), 2, "a partial minute still counts")
+assert.equal(conditions.minutesLeft(ahead(30 * 1000), now), 1)
+assert.equal(conditions.minutesLeft(ahead(0), now), 0)
+assert.equal(Object.is(conditions.minutesLeft(ahead(0), now), 0), true, "never negative zero")
+assert.equal(Object.is(conditions.minutesLeft(ahead(-1), now), 0), true, "never negative zero")
+assert.equal(conditions.minutesLeft(ahead(-30 * 1000), now), 0, "a moment just passed is not yet a minute overdue")
+assert.equal(conditions.minutesLeft(ahead(-90 * 1000), now), -1, "elapsed minutes count like relativeTime")
+assert.equal(conditions.minutesLeft(ahead(-5 * 60000), now), -5, "past moments are negative")
+assert.equal(conditions.minutesLeft(now.getTime() + 180000, now), 3, "a millisecond number is accepted")
+assert.equal(conditions.minutesLeft("garbage", now), null)
+assert.equal(conditions.minutesLeft("", now), null)
+assert.equal(conditions.minutesLeft(null, now), null)
+assert.equal(conditions.minutesLeft(undefined, now), null)
+assert.equal(conditions.minutesLeft(new Date(Date.now() + 10 * 60000).toISOString()), 10, "the clock defaults to now")
 
 console.log("Condition tests passed.")

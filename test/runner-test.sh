@@ -200,7 +200,25 @@ if [[ -f $TEST_ROOT/hold-generated-removal \
   while [[ -f $TEST_ROOT/hold-generated-removal ]]; do sleep 0.01; done
   exit "$status"
 fi
+if [[ -f $TEST_ROOT/inject-shell-config-race \
+    && $destination == "$HOME/.config/omarchy/shell.json" \
+    && " $* " == *" --exchange "* ]]; then
+  cp -- "$TEST_ROOT/concurrent-shell-config.json" "$destination"
+  rm -f "$TEST_ROOT/inject-shell-config-race"
+fi
 exec /usr/bin/mv "$@"
+STUB
+
+cat >"$TEST_ROOT/bin/stat" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+if [[ -f $TEST_ROOT/inject-shell-config-before-baseline \
+    && ${!#} == "$HOME/.config/omarchy/shell.json" \
+    && " $* " == *" %d:%i:%s:%a:%y:%z "* ]]; then
+  /usr/bin/cp -- "$TEST_ROOT/concurrent-shell-config.json" "${!#}"
+  rm -f "$TEST_ROOT/inject-shell-config-before-baseline"
+fi
+exec /usr/bin/stat "$@"
 STUB
 
 cat >"$TEST_ROOT/bin/rm" <<'STUB'
@@ -275,6 +293,7 @@ if [[ -f $TEST_ROOT/shell-down ]]; then
   exit 1
 fi
 flag() { if [[ -f $state/$1 ]]; then echo true; else echo false; fi; }
+[[ ${1:-} != -q ]] || shift
 case "${1:-} ${2:-}" in
   "nightlight status") printf '{"enabled":%s,"temperature":4000}\n' "$(flag nightlight)" ;;
   "nightlight enable") touch "$state/nightlight"; echo enabled ;;
@@ -305,6 +324,27 @@ case "${1:-} ${2:-}" in
       off) rm -f "$state/dnd"; echo off ;;
       *) echo "Too few arguments provided" >&2; exit 1 ;;
     esac
+    ;;
+  "shell putBarWidget")
+    printf '%s %s\n' "${3:-}" "${4:-}" >>"$TEST_ROOT/widget.log"
+    if [[ -f $TEST_ROOT/shell-scanning ]]; then
+      echo "not ready"
+    else
+      # Like the real shell, the stub answers ok whether or not it placed the
+      # widget; it only edits shell.json when asked to behave.
+      if [[ -f $TEST_ROOT/shell-applies-widget ]]; then
+        placed=$(jq -c --arg id "${3:-}" '
+          ((.bar.layout.center | map(.id == "omarchy.indicators") | index(true) // -1) + 1) as $at
+          | .bar.layout.center |= (.[:$at] + [{id: $id}] + .[$at:])
+        ' "$HOME/.config/omarchy/shell.json")
+        printf '%s\n' "$placed" >"$HOME/.config/omarchy/shell.json"
+      fi
+      echo ok
+    fi
+    ;;
+  "shell reloadConfig")
+    printf 'reloadConfig\n' >>"$TEST_ROOT/widget.log"
+    echo ok
     ;;
   *) echo "Target not found." >&2; exit 1 ;;
 esac
@@ -545,6 +585,20 @@ state_dir="$XDG_STATE_HOME/omarchy/omachord"
 chmod 755 "$state_dir"
 "$RUNNER" status >/dev/null
 assert_eq "$(stat -c %a "$state_dir")" 700 "state directory mode was not repaired"
+
+# Read-only service probes must not touch metadata on the paths watched by
+# Service.qml, or their chmod events feed straight back into another probe.
+"$RUNNER" config snapshot >/dev/null
+"$RUNNER" active >/dev/null
+"$RUNNER" logs >/dev/null
+metadata_before=$(find "$state_dir" -maxdepth 2 -printf '%p %C@\n' | sort)
+"$RUNNER" status >/dev/null
+"$RUNNER" config snapshot >/dev/null
+"$RUNNER" active >/dev/null
+"$RUNNER" logs >/dev/null
+metadata_after=$(find "$state_dir" -maxdepth 2 -printf '%p %C@\n' | sort)
+assert_eq "$metadata_after" "$metadata_before" "read-only probes changed watched state metadata"
+pass "read-only probes preserve state metadata"
 
 state_sentinel="$TEST_ROOT/state-sentinel"
 printf '%s\n' 'state sentinel' >"$state_sentinel"
@@ -1920,5 +1974,204 @@ log_count=$($RUNNER logs 100 | jq 'length')
 ((log_count >= 6)) || fail "expected run history entries"
 "$RUNNER" logs 08 | jq -e 'type == "array" and length <= 8' >/dev/null
 pass "structured run history"
+
+widget_result=$(mktemp)
+widget_marker="$XDG_STATE_HOME/omarchy/omachord/bar-widget.json"
+widget_backups="$XDG_STATE_HOME/omarchy/omachord/backups"
+shell_config="$OMARCHY_CONFIG_DIR/shell.json"
+shell_center='[{"id":"omarchy.indicators"},{"id":"omarchy.keyboard-layout"},{"id":"omarchy.weather"},{"id":"omarchy.clock"}]'
+write_shell_config() {
+  printf '%s\n' "$1" >"$shell_config"
+  chmod "${2:-600}" "$shell_config"
+}
+shell_config_neither="{\"version\":1,\"bar\":{\"layout\":{\"left\":[{\"id\":\"omarchy.menu\"}],\"center\":$shell_center,\"right\":[]}},\"plugins\":[]}"
+shell_config_plugins_only="{\"version\":1,\"bar\":{\"layout\":{\"left\":[{\"id\":\"omarchy.menu\"}],\"center\":$shell_center,\"right\":[]}},\"plugins\":[{\"id\":\"anothadev.omachord\"}]}"
+shell_config_in_bar='{"version":1,"bar":{"layout":{"left":[],"center":[{"id":"omarchy.indicators"},{"id":"anothadev.omachord"},{"id":"omarchy.clock"}],"right":[]}},"plugins":[]}'
+
+# A fresh install: the plugin is enabled nowhere, so the shell is asked.
+write_shell_config "$shell_config_neither"
+touch "$TEST_ROOT/shell-scanning"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must report a shell that is still scanning"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-not-ready "widget ensure returned the wrong error while scanning"
+assert_missing "$widget_marker" "a refused placement must not be recorded"
+rm -f "$TEST_ROOT/shell-scanning"
+: >"$TEST_ROOT/widget.log"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must not trust an ok answer that left shell.json unchanged"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-refused "an unapplied ok answer returned the wrong error"
+assert_missing "$widget_marker" "an unapplied placement must not be recorded"
+assert_eq "$(cat "$TEST_ROOT/widget.log")" 'anothadev.omachord {"section":"center","after":"omarchy.indicators"}' "widget ensure sent the wrong placement"
+assert_eq "$(jq -c '.bar.layout.center | map(.id)' "$shell_config")" '["omarchy.indicators","omarchy.keyboard-layout","omarchy.weather","omarchy.clock"]' \
+  "the putBarWidget path must not edit shell.json itself"
+: >"$TEST_ROOT/widget.log"
+touch "$TEST_ROOT/shell-applies-widget"
+"$RUNNER" widget ensure | jq -e '.ok and .placed == true and (.migrated | not)' >/dev/null
+rm -f "$TEST_ROOT/shell-applies-widget"
+assert_eq "$(cat "$TEST_ROOT/widget.log")" 'anothadev.omachord {"section":"center","after":"omarchy.indicators"}' "widget ensure sent the wrong placement"
+assert_eq "$(stat -c %a "$widget_marker")" 600 "the widget record must be private"
+assert_eq "$(jq -c '.bar.layout.center | map(.id)' "$shell_config")" '["omarchy.indicators","anothadev.omachord","omarchy.keyboard-layout","omarchy.weather","omarchy.clock"]' \
+  "the shell stub did not place the widget where expected"
+"$RUNNER" widget ensure | jq -e '.ok and .placed == false and .skipped == true' >/dev/null
+assert_eq "$(wc -l <"$TEST_ROOT/widget.log")" 1 "a recorded placement must not ask the shell again"
+"$RUNNER" widget status \
+  | jq -e '.ok and .recorded == true and .placement.section == "center" and .inBar == true and .inPlugins == false' >/dev/null
+"$RUNNER" widget forget | jq -e '.ok and .recorded == false' >/dev/null
+assert_missing "$widget_marker" "forget must remove the widget record"
+write_shell_config "$shell_config_neither"
+touch "$TEST_ROOT/shell-down"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must fail when the shell is not running"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-unavailable "widget ensure returned the wrong error without a shell"
+assert_missing "$widget_marker" "an unanswered placement must not be recorded"
+rm -f "$TEST_ROOT/shell-down"
+
+# Enabled after the widget existed: the id is already on the bar.
+write_shell_config "$shell_config_in_bar"
+: >"$TEST_ROOT/widget.log"
+"$RUNNER" widget ensure | jq -e '.ok and .placed == false and .alreadyPresent == true' >/dev/null
+assert_eq "$(stat -c %a "$widget_marker")" 600 "the widget record must be private"
+assert_eq "$(wc -c <"$TEST_ROOT/widget.log")" 0 "a widget already on the bar must not involve the shell"
+assert_eq "$(jq -c . "$shell_config")" "$shell_config_in_bar" "an already-present widget must leave shell.json alone"
+"$RUNNER" widget status | jq -e '.ok and .recorded == true and .inBar == true and .inPlugins == false' >/dev/null
+"$RUNNER" widget forget | jq -e '.ok and .recorded == false' >/dev/null
+
+# Upgraded from 0.2.0: the id sits in plugins[], where putBarWidget answers ok
+# without placing anything, so the runner moves it onto the bar itself.
+write_shell_config "$shell_config_plugins_only"
+: >"$TEST_ROOT/widget.log"
+"$RUNNER" widget status | jq -e '.ok and .recorded == false and .inBar == false and .inPlugins == true' >/dev/null
+"$RUNNER" widget ensure >"$widget_result" || fail "widget ensure must migrate a plugins[] entry"
+jq -e '.ok and .placed == true and .migrated == true' "$widget_result" >/dev/null \
+  || fail "widget ensure did not report the migration"
+assert_eq "$(jq -c '.plugins' "$shell_config")" '[]' "the migrated id must leave plugins[]"
+assert_eq "$(jq -c '.bar.layout.center | map(.id)' "$shell_config")" '["omarchy.indicators","anothadev.omachord","omarchy.keyboard-layout","omarchy.weather","omarchy.clock"]' \
+  "the migrated widget must follow omarchy.indicators"
+assert_eq "$(jq -c '[.version, (.bar.layout.left | map(.id)), .bar.layout.right]' "$shell_config")" '[1,["omarchy.menu"],[]]' \
+  "the migration changed unrelated shell.json content"
+assert_eq "$(stat -c %a "$shell_config")" 600 "the migration must preserve the shell.json mode"
+widget_backup=$(jq -r '.backup' "$widget_result")
+[[ $widget_backup == "$widget_backups"/shell.json.* ]] || fail "the migration backup was not recorded under the state backups: $widget_backup"
+[[ -f $widget_backup ]] || fail "the migration must back up the previous shell.json"
+assert_eq "$(stat -c %a "$widget_backup")" 600 "the shell.json backup must be private"
+assert_eq "$(jq -c . "$widget_backup")" "$shell_config_plugins_only" "the shell.json backup must hold the previous content"
+assert_eq "$(stat -c %a "$widget_marker")" 600 "the widget record must be private"
+assert_eq "$(cat "$TEST_ROOT/widget.log")" reloadConfig "the migration must reload the shell config and never call putBarWidget"
+"$RUNNER" widget status | jq -e '.ok and .recorded == true and .inBar == true and .inPlugins == false' >/dev/null
+"$RUNNER" widget ensure | jq -e '.ok and .placed == false and .skipped == true' >/dev/null
+"$RUNNER" widget forget | jq -e '.ok and .recorded == false' >/dev/null
+
+shell_config_concurrent='{"version":1,"bar":{"layout":{"left":[],"center":[{"id":"omarchy.clock"}],"right":[]}},"plugins":[{"id":"anothadev.omachord"}],"concurrent":true}'
+shell_config_disabled='{"version":1,"bar":{"layout":{"left":[],"center":[{"id":"omarchy.clock"}],"right":[]}},"plugins":[],"concurrent":"disabled"}'
+write_shell_config "$shell_config_plugins_only"
+printf '%s\n' "$shell_config_disabled" >"$TEST_ROOT/concurrent-shell-config.json"
+touch "$TEST_ROOT/inject-shell-config-before-baseline"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget migration must not undo a concurrent removal before its baseline"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" unsafe-state "a pre-baseline shell.json edit returned the wrong error"
+assert_eq "$(jq -c . "$shell_config")" "$shell_config_disabled" "widget migration undid a concurrent removal"
+assert_missing "$widget_marker" "a rejected pre-baseline migration must not be recorded"
+rm -f "$TEST_ROOT/concurrent-shell-config.json" "$TEST_ROOT/inject-shell-config-before-baseline"
+
+write_shell_config "$shell_config_plugins_only"
+printf '%s\n' "$shell_config_concurrent" >"$TEST_ROOT/concurrent-shell-config.json"
+touch "$TEST_ROOT/inject-shell-config-race"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget migration must reject a concurrent shell.json edit"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" unsafe-state "a concurrent shell.json edit returned the wrong error"
+assert_eq "$(jq -c . "$shell_config")" "$shell_config_concurrent" "widget migration overwrote a concurrent shell.json edit"
+assert_missing "$widget_marker" "a rejected concurrent migration must not be recorded"
+rm -f "$TEST_ROOT/concurrent-shell-config.json" "$TEST_ROOT/inject-shell-config-race"
+
+jq -cn --arg id 'anothadev.omachord' '
+  {version:1,bar:{layout:{left:[],center:[],right:[]}},plugins:[{id:$id}],large:[range(0;200000) | 0]}
+' >"$shell_config"
+cp -- "$shell_config" "$TEST_ROOT/large-shell-config.json"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget migration must reject an oversized generated shell.json"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" unsafe-state "an oversized generated shell.json returned the wrong error"
+cmp -s "$shell_config" "$TEST_ROOT/large-shell-config.json" \
+  || fail "widget migration published an oversized generated shell.json"
+assert_missing "$widget_marker" "a rejected oversized migration must not be recorded"
+rm -f "$TEST_ROOT/large-shell-config.json"
+
+write_shell_config "$shell_config_plugins_only" 644
+: >"$TEST_ROOT/widget.log"
+touch "$TEST_ROOT/shell-down"
+"$RUNNER" widget ensure | jq -e '.ok and .placed == true and .migrated == true' >/dev/null
+rm -f "$TEST_ROOT/shell-down"
+assert_eq "$(stat -c %a "$shell_config")" 644 "the migration must preserve the shell.json mode"
+assert_eq "$(jq -c '[.plugins, (.bar.layout.center | map(.id))]' "$shell_config")" \
+  '[[],["omarchy.indicators","anothadev.omachord","omarchy.keyboard-layout","omarchy.weather","omarchy.clock"]]' \
+  "the migration must not depend on a running shell"
+assert_eq "$(wc -c <"$TEST_ROOT/widget.log")" 0 "a shell that is down must not be asked to place the widget"
+"$RUNNER" widget forget | jq -e '.ok and .recorded == false' >/dev/null
+write_shell_config '{"version":1,"bar":{"layout":{"center":[{"id":"omarchy.clock"}]}},"plugins":[{"id":"anothadev.omachord"}]}'
+"$RUNNER" widget ensure | jq -e '.ok and .migrated == true' >/dev/null
+assert_eq "$(jq -c '.bar.layout.center | map(.id)' "$shell_config")" '["omarchy.clock","anothadev.omachord"]' \
+  "without an anchor the migrated widget must be appended to the center"
+"$RUNNER" widget forget | jq -e '.ok and .recorded == false' >/dev/null
+
+# An unreadable shell config is never migrated or recorded.
+: >"$TEST_ROOT/widget.log"
+write_shell_config 'not json'
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must fail on an invalid shell.json"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-config-invalid "an invalid shell.json returned the wrong error"
+assert_missing "$widget_marker" "an invalid shell.json must not be recorded"
+assert_eq "$(cat "$shell_config")" 'not json' "an invalid shell.json must be left untouched"
+assert_eq "$(stat -c %a "$shell_config")" 600 "an invalid shell.json must be left untouched"
+assert_eq "$(wc -c <"$TEST_ROOT/widget.log")" 0 "an invalid shell.json must not involve the shell"
+"$RUNNER" widget status | jq -e '.ok and .recorded == false and .inBar == false and .inPlugins == false' >/dev/null
+
+write_shell_config '{"version":2,"bar":{"layout":{"left":[],"center":[],"right":[]}},"plugins":[{"id":"anothadev.omachord"}]}'
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must reject an unsupported shell.json version"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-config-invalid "an unsupported shell.json version returned the wrong error"
+assert_eq "$(jq -r '.version' "$shell_config")" 2 "widget migration downgraded shell.json"
+
+write_shell_config '{"version":1,"bar":{"layout":"future-layout"},"plugins":[{"id":"anothadev.omachord"}]}'
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must reject malformed existing shell.json sections"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-config-invalid "malformed shell.json sections returned the wrong error"
+assert_eq "$(jq -r '.bar.layout' "$shell_config")" future-layout "widget migration replaced malformed shell.json sections"
+
+shell_config_target="$TEST_ROOT/dotfiles-shell.json"
+printf '%s\n' "$shell_config_plugins_only" >"$shell_config_target"
+rm -f "$shell_config"
+ln -s "$shell_config_target" "$shell_config"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must reject a symlinked shell.json"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-config-invalid "a symlinked shell.json returned the wrong error"
+[[ -L $shell_config ]] || fail "widget migration replaced the shell.json symlink"
+assert_eq "$(jq -c . "$shell_config_target")" "$shell_config_plugins_only" "widget migration changed a symlink target"
+rm -f "$shell_config" "$shell_config_target"
+
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "widget ensure must fail without a shell.json"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" shell-config-invalid "a missing shell.json returned the wrong error"
+assert_missing "$widget_marker" "a missing shell.json must not be recorded"
+assert_missing "$shell_config" "a missing shell.json must not be created"
+
+# An invalid marker fails closed instead of placing the widget again.
+write_shell_config "$shell_config_in_bar"
+printf 'garbage\n' >"$widget_marker"
+if "$RUNNER" widget ensure >"$widget_result"; then
+  fail "an invalid widget record must fail closed"
+fi
+assert_eq "$(jq -r '.code' "$widget_result")" unsafe-state "an invalid widget record returned the wrong error"
+rm -f "$widget_result" "$widget_marker" "$shell_config"
+pass "bar widget placement is recorded once"
 
 printf 'Runner tests passed.\n'

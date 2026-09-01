@@ -113,7 +113,7 @@ assert.equal(model.summarizeConditions({ conditions: [
   { type: "power", source: "battery", batteryBelow: 30 },
   { type: "power", source: "ac", batteryBelow: 0 },
   { type: "omarchy-toggle", flag: "suspend-off" }
-] }), "Mon Fri 18:30-08:00, Wi-Fi Office, Office-5G, Battery below 30%, Plugged in, Toggle suspend-off")
+] }), "Mon Fri 18:30–08:00, Wi-Fi Office, Office-5G, Battery below 30%, Plugged in, Toggle suspend-off")
 
 assert.equal(model.validateCondition({ type: "time", start: "24:00", end: "08:00", weekdays: [] }), "Times must use 24-hour HH:MM")
 assert.equal(model.validateCondition({ type: "time", start: "08:00", end: "08:00", weekdays: [] }), "A time period must start and end at different times")
@@ -142,3 +142,42 @@ assert.equal(model.templateRoutine("in-the-dark", [{ id: "in-the-dark" }]).id, "
 assert.equal(model.templateRoutine("unknown", []), null)
 
 console.log("Model tests passed.")
+
+// Catalogues and summaries shared by the panel, editor, and bar popup.
+assert.equal(model.HOOKS.length, 6)
+assert.equal(model.hookInfo("theme-set").label, "Theme changed")
+assert.equal(model.hookInfo("nope").label, "nope")
+const templateValues = model.templateOptions().map(option => option.value)
+assert.deepEqual(JSON.parse(JSON.stringify(templateValues)), ["blank", "microphone", "in-the-dark", "focus-at-work", "on-battery"])
+assert.equal(model.templateRoutine("blank", []).actions.length, 0)
+assert.equal(model.templateRoutine("microphone", []).actions[0].type, "microphone-toggle")
+assert.equal(model.templateRoutine("unknown", []), null)
+assert.equal(model.actionTypeLabel("dnd"), "Do not disturb")
+assert.equal(model.actionLabel({ type: "nightlight", value: true }), "Night light on")
+assert.equal(model.actionLabel({ type: "brightness", value: 40 }), "Brightness 40%")
+assert.equal(model.actionLabel({ type: "launch-app", desktopId: "firefox.desktop" }), "Launch firefox")
+assert.equal(model.actionLabel({ type: "notification", title: "Hi" }), "Notify: Hi")
+assert.equal(model.summarizeActions({ actions: [
+  { type: "nightlight", value: true }, { type: "dnd", value: true }, { type: "brightness", value: 40 }, { type: "delay", milliseconds: 5 }
+] }), "Night light on, Do not disturb on, Brightness 40%, +1 more")
+assert.equal(model.summarizeActions({ actions: [] }), "")
+assert.equal(model.triggerLabel("hook:theme-set"), "by the theme changed event")
+assert.equal(model.triggerLabel("shortcut"), "by shortcut")
+assert.equal(model.triggerLabel("condition"), "by its conditions")
+assert.equal(model.triggerLabel(""), "")
+assert.equal(model.nameFor({ routines: [{ id: "a", name: "Alpha" }] }, "a"), "Alpha")
+assert.equal(model.nameFor({ routines: [] }, "b"), "b")
+const byIndex = model.validationByIndex({
+  id: "x", name: "x", enabled: true, triggers: [],
+  conditions: [{ type: "time", start: "6pm", end: "08:00", weekdays: [] }, { type: "power", source: "battery", batteryBelow: 0 }],
+  actions: [{ type: "theme", value: "", restore: true }, { type: "delay", milliseconds: 5 }],
+  onEnd: { mode: "actions", actions: [{ type: "dnd", value: true, restore: true }] },
+  keepUntil: { minutes: 0 }
+})
+assert.equal(byIndex.conditions[0], "Times must use 24-hour HH:MM")
+assert.equal(byIndex.conditions[1], undefined)
+assert.equal(byIndex.actions[0], "Choose a theme")
+assert.equal(byIndex.end[0], "Actions that run when a routine ends cannot restore")
+assert.equal(byIndex.routine, "Keep the routine for 1 to 1440 minutes")
+assert.equal(model.summarizeCondition({ type: "time", start: "18:30", end: "08:00", weekdays: ["mon"] }), "Mon 18:30–08:00")
+console.log("Model catalogue tests passed.")

@@ -38,6 +38,9 @@ Item {
   property bool configLoaded: false
   property string configRevision: ""
   property var routines: []
+  // Every routine in the committed configuration, keyed by id, so the bar
+  // widget can name an activation record without reading the config itself.
+  property var routineMeta: ({})
   property bool activeLoaded: false
   property var active: ({})
   property var latched: ({})
@@ -54,6 +57,21 @@ Item {
   property var lastResult: null
   property real lastTick: Date.now()
   property real lastReconcile: 0
+  // Manual start/end requests from the panel or bar widget. They run through
+  // their own process so a person's request never waits behind, or reorders,
+  // the condition queue; the runner's locks arbitrate the rest.
+  property var manualQueue: []
+  property var manualJob: null
+  property var lastManualResult: null
+  readonly property bool manualBusy: manualJob !== null || manualQueue.length > 0
+  readonly property var activeList: buildActiveList(active, routineMeta)
+  readonly property int activeCount: activeList.length
+
+  signal manualFinished(var job, var result)
+
+  // The bar widget is put in place once per install, after the shell's plugin
+  // scan has finished so the registry knows this plugin's widget kind.
+  property bool widgetEnsured: false
 
   // ------------------------------------------------------------ inputs
   readonly property bool wifiAvailable: Networking.backend === NetworkBackendType.NetworkManager
@@ -157,6 +175,27 @@ Item {
     else if (parsed && parsed.connected === true) logEvent("autostart", "connected")
     else logEvent("autostart", parsed && parsed.error ? parsed.error : "unavailable")
     reconcile("autostart")
+    ensureWidget()
+  }
+
+  function ensureWidget() {
+    if (widgetEnsured || widgetProc.running) return
+    if (!pluginRegistry || pluginRegistry.scanning === true) return
+    widgetProc.running = true
+  }
+
+  function finishWidget(text, exitCode) {
+    var parsed = exitCode === 0 ? parseJson(text, null) : parseJson(text, null)
+    if (parsed && parsed.ok === true) {
+      widgetEnsured = true
+      logEvent("bar-widget", parsed.placed === true ? "placed" : "already recorded")
+    } else if (parsed && parsed.code === "shell-not-ready") {
+      logEvent("bar-widget", "shell not ready, waiting for the plugin scan")
+    } else {
+      // Nothing to retry: an old runner, a refused placement, or no shell.
+      widgetEnsured = true
+      logEvent("bar-widget", parsed && parsed.error ? parsed.error : "unavailable")
+    }
   }
 
   function reconcile(why) {
@@ -185,13 +224,22 @@ Item {
       return
     }
     var rows = []
+    var meta = ({})
     for (var i = 0; i < parsed.config.routines.length; i++) {
       var routine = parsed.config.routines[i]
-      if (!routine || routine.enabled !== true) continue
+      if (!routine || !routine.id) continue
+      meta[String(routine.id)] = {
+        name: String(routine.name || routine.id),
+        enabled: routine.enabled === true,
+        conditions: Array.isArray(routine.conditions) ? routine.conditions.length : 0,
+        stateful: Conditions.routineRestores(routine)
+      }
+      if (routine.enabled !== true) continue
       if (!Array.isArray(routine.conditions) || routine.conditions.length === 0) continue
       rows.push(routine)
     }
     routines = rows
+    routineMeta = meta
     configRevision = String(parsed.revision || "")
     configLoaded = true
     var revisionLatches = Object.assign({}, latched)
@@ -457,7 +505,10 @@ Item {
       var next = Object.assign({}, failures)
       if (job.revision === configRevision) {
         if (job.op === "activate") latch(job.id)
-        next[job.id] = { at: Date.now(), op: job.op, revision: job.revision }
+        next[job.id] = {
+          at: Date.now(), op: job.op, revision: job.revision,
+          error: parsed && parsed.error ? String(parsed.error) : "runner exited " + exitCode
+        }
         failures = next
       }
       if (parsed && parsed.code === "stale-config") refresh(configProc)
@@ -465,12 +516,93 @@ Item {
     refresh(activeProc)
   }
 
+  // ------------------------------------------------------- manual requests
+  function buildActiveList(activeMap, meta) {
+    var rows = []
+    for (var id in activeMap) {
+      var record = activeMap[id] || {}
+      var info = meta && meta[id] ? meta[id] : null
+      rows.push({
+        id: id,
+        name: info ? info.name : id,
+        activatedAt: String(record.activatedAt || ""),
+        trigger: String(record.trigger || ""),
+        keepUntil: record.keepUntil === undefined ? "conditions" : record.keepUntil,
+        expiresAt: record.expiresAt ? String(record.expiresAt) : "",
+        onEndMode: String(record.onEndMode || "restore"),
+        setterCount: Number(record.setterCount || 0),
+        conditions: info ? info.conditions : 0,
+        stateful: info ? info.stateful : Number(record.setterCount || 0) > 0
+      })
+    }
+    rows.sort(function(left, right) { return left.activatedAt.localeCompare(right.activatedAt) })
+    return rows
+  }
+
+  function isRoutineId(id) {
+    return /^[a-z0-9]+(-[a-z0-9]+)*$/.test(String(id || ""))
+  }
+
+  function endRoutine(id) { return enqueueManual("deactivate", id) }
+  function startRoutine(id) { return enqueueManual("activate", id) }
+  function toggleRoutine(id) { return enqueueManual("run", id) }
+  // The bar switch turns the whole integration on or off; the window keeps
+  // its own confirmation for the same call.
+  function requestConnect() { return enqueueManual("connect", "") }
+  function requestDisconnect() { return enqueueManual("disconnect", "") }
+
+  function enqueueManual(op, id) {
+    var routineId = String(id || "")
+    var connection = op === "connect" || op === "disconnect"
+    if (!connection && !isRoutineId(routineId)) return false
+    if (!connection && op !== "deactivate" && op !== "activate" && op !== "run") return false
+    for (var i = 0; i < manualQueue.length; i++)
+      if (manualQueue[i].op === op && manualQueue[i].id === routineId) return true
+    manualQueue = manualQueue.concat([{ op: op, id: routineId }])
+    runNextManual()
+    return true
+  }
+
+  function runNextManual() {
+    if (manualProc.running || manualJob || !manualQueue.length) return
+    manualJob = manualQueue[0]
+    manualQueue = manualQueue.slice(1)
+    logEvent("manual-start", manualJob.op + " " + manualJob.id)
+    manualProc.command = manualJob.id === ""
+      ? [root.runnerPath, manualJob.op]
+      : [root.runnerPath, manualJob.op, manualJob.id, "manual"]
+    manualProc.running = true
+  }
+
+  function finishManual(text, exitCode) {
+    var job = manualJob
+    manualJob = null
+    var parsed = parseJson(text, null)
+    var result = exitCode === 0 && parsed ? parsed : (parsed && parsed.ok === false ? parsed
+      : { ok: false, error: "runner exited " + exitCode })
+    lastManualResult = result
+    if (job) {
+      logEvent("manual-exit", job.op + " " + job.id + " " + (result.ok ? "ok" : "failed: " + (result.error || exitCode)))
+      manualFinished(job, result)
+    }
+    refresh(activeProc)
+    refresh(logsProc)
+    if (job && job.id === "") refresh(statusProc)
+    runNextManual()
+  }
+
+  function openPanel(view) {
+    if (!shell || typeof shell.summon !== "function") return false
+    var id = manifest && manifest.id ? String(manifest.id) : "anothadev.omachord"
+    return shell.summon(id, JSON.stringify(view ? { view: String(view) } : {})) === true
+  }
+
   function statusJson() {
     var now = new Date()
     var env = currentEnv(now)
     var rows = []
     for (var i = 0; i < routines.length; i++)
-      rows.push(Conditions.routineSummary(routines[i], env, active, latched))
+      rows.push(Conditions.routineSummary(routines[i], env, active, latched, root.failures, root.failureRetryMs))
     return JSON.stringify({
       ready: configLoaded && activeLoaded && latchesSeeded,
       enabled: enabled,
@@ -485,9 +617,11 @@ Item {
         toggles: Object.keys(toggles)
       },
       routines: rows,
+      active: activeList,
       activeCount: Object.keys(active).length,
       queue: pending.length,
       running: runnerProc.running,
+      manualQueue: manualQueue.length + (manualJob ? 1 : 0),
       lastEvent: lastEvent,
       lastEventAt: lastEventAt,
       lastResult: lastResult
@@ -616,6 +750,36 @@ Item {
     }
   }
 
+  Process {
+    id: manualProc
+    stdout: StdioCollector { id: manualStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.finishManual(manualStdout.text, exitCode)
+    }
+    onRunningChanged: {
+      if (!running && root.manualJob) {
+        Qt.callLater(function() {
+          if (root.manualJob && !manualProc.running) root.finishManual("", -1)
+        })
+      }
+    }
+  }
+
+  Process {
+    id: widgetProc
+    command: [root.runnerPath, "widget", "ensure"]
+    stdout: StdioCollector { id: widgetStdout; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.finishWidget(widgetStdout.text, exitCode)
+    }
+  }
+
+  Connections {
+    target: root.pluginRegistry
+    ignoreUnknownSignals: true
+    function onScanFinished() { root.ensureWidget() }
+  }
+
   // ------------------------------------------------------- watchers
   FileView {
     path: root.configPath
@@ -646,13 +810,6 @@ Item {
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh(activeProc)
-  }
-
-  FileView {
-    path: root.stateDir
-    watchChanges: true
-    printErrors: false
-    onFileChanged: root.refresh(logsProc)
   }
 
   FileView {
@@ -704,6 +861,14 @@ Item {
     function reload(): string {
       root.reconcile("ipc")
       return "reloading"
+    }
+
+    function end(id: string): string {
+      return root.endRoutine(id) ? "queued" : "invalid"
+    }
+
+    function start(id: string): string {
+      return root.startRoutine(id) ? "queued" : "invalid"
     }
   }
 }

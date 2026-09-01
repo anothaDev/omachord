@@ -32,7 +32,8 @@ sub inspect_directory {
 
   if ($final) {
     fail("Private directory is not user-owned: $path") unless $owner == $>;
-    chmod 0700, $handle or fail("Could not secure directory: $path");
+    chmod 0700, $handle or fail("Could not secure directory: $path")
+      unless $mode == 0700;
     @stat = stat($handle);
     fail("Could not secure directory: $path")
       unless @stat && S_ISDIR($stat[2]) && $stat[4] == $>
@@ -90,7 +91,8 @@ sub open_private_file {
     unless @stat && S_ISREG($stat[2]) && $stat[4] == $> && $stat[3] == 1;
 
   my $expected_mode = oct($mode_text);
-  chmod $expected_mode, $file or fail("Could not secure private file: $path");
+  chmod $expected_mode, $file or fail("Could not secure private file: $path")
+    unless ($stat[2] & 07777) == $expected_mode;
   @stat = stat($file);
   fail("Could not secure private file: $path")
     unless @stat && S_ISREG($stat[2]) && $stat[4] == $> && $stat[3] == 1
