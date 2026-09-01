@@ -36,6 +36,8 @@ assert.match(panel, /readonly property color enabledGreen:/,
   "the enabled integration state must use a dedicated green status color")
 assert.match(panel, /active: root\.activeView === modelData\.id/,
   "sidebar navigation must keep its glyph and label on the panel foreground")
+assert.match(panel, /id: navigationCopy[\s\S]*?x: root\.compact[\s\S]*?navigationButton\.width/,
+  "sidebar copy must use explicit compact positioning instead of swapping anchors after launch")
 assert.match(panel, /function requestSetRoutineEnabled[\s\S]*?routineEditor\.dirty[\s\S]*?showConfirmation/,
   "list switches must confirm before replacing an unsaved routine draft")
 

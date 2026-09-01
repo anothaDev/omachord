@@ -1230,23 +1230,56 @@ Item {
                 ]
 
                 Button {
+                  id: navigationButton
                   required property var modelData
                   width: parent.width
-                  iconText: modelData.glyph
-                  text: root.compact ? "" : modelData.label
+                  implicitHeight: Math.max(Style.spacing.controlHeight,
+                    navigationCopy.implicitHeight + verticalPadding * 2)
+                  iconText: ""
+                  text: ""
                   tooltipText: root.compact ? modelData.label : ""
-                  leftAlign: !root.compact
                   focusable: true
                   foreground: root.fg
                   accent: root.accent
                   enabled: !root.mutating
-                  // Keep navigation copy on the panel foreground. Button's
-                  // selected state substitutes the shared selected-color
-                  // token, which can be stale during a live theme handoff.
                   active: root.activeView === modelData.id
                   onClicked: root.setActiveView(modelData.id)
                   Accessible.name: modelData.label
                   Accessible.role: Accessible.Button
+
+                  // Button's own copy swaps left/center anchors when compact
+                  // changes. The host restores window geometry after opening,
+                  // and that anchor swap can remain stale until a resize.
+                  Row {
+                    id: navigationCopy
+                    z: 2
+                    width: implicitWidth
+                    x: root.compact
+                      ? Math.round((navigationButton.width - width) / 2)
+                      : navigationButton.horizontalPadding
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.spacing.controlGap
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: navigationButton.modelData.glyph
+                      color: root.fg
+                      font.family: navigationButton.fontFamily
+                      font.pixelSize: navigationButton.iconSize
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      visible: !root.compact
+                      text: navigationButton.modelData.label
+                      color: root.fg
+                      font.family: navigationButton.fontFamily
+                      font.pixelSize: navigationButton.fontSize
+                      font.bold: navigationButton.active
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
                 }
               }
             }
