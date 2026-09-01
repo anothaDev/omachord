@@ -1240,7 +1240,10 @@ Item {
                   foreground: root.fg
                   accent: root.accent
                   enabled: !root.mutating
-                  selected: root.activeView === modelData.id
+                  // Keep navigation copy on the panel foreground. Button's
+                  // selected state substitutes the shared selected-color
+                  // token, which can be stale during a live theme handoff.
+                  active: root.activeView === modelData.id
                   onClicked: root.setActiveView(modelData.id)
                   Accessible.name: modelData.label
                   Accessible.role: Accessible.Button
