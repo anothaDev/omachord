@@ -76,6 +76,7 @@ Item {
   property bool revisionRefreshPending: false
   property bool revisionStarted: false
   property string runningRoutineId: ""
+  property date displayNow: new Date()
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: (manifest && manifest.id) || "anothadev.omachord"
@@ -344,7 +345,7 @@ Item {
     if (since) parts.push("Since " + since + (started ? " " + started : ""))
     else if (started) parts.push("Started " + started)
     if (row.expiresAt) {
-      var left = Conditions.minutesLeft(row.expiresAt, new Date())
+      var left = Conditions.minutesLeft(row.expiresAt, displayNow)
       parts.push(left !== null && left >= 0 ? (left < 1 ? "ending now" : left + " min left") : "until " + Conditions.clockTime(row.expiresAt))
     } else if (row.conditions > 0) parts.push("while its conditions hold")
     return parts.join(" · ")
@@ -853,6 +854,14 @@ Item {
     interval: 4000
     repeat: false
     onTriggered: if (!root.noticeError) root.noticeText = ""
+  }
+
+  Timer {
+    interval: 60000
+    repeat: true
+    running: window.visible
+    onRunningChanged: if (running) root.displayNow = new Date()
+    onTriggered: root.displayNow = new Date()
   }
 
   Connections {
@@ -1732,7 +1741,7 @@ Item {
                                       + (routineRow.lastRun && !routineRow.isOn
                                         ? (Model.isStateful(routineRow.routine) ? " · " : "")
                                           + (routineRow.lastRun.status === "failed" ? "FAILED " : "RAN ")
-                                          + Conditions.relativeTime(routineRow.lastRun.timestamp, new Date()).toUpperCase()
+                                          + Conditions.relativeTime(routineRow.lastRun.timestamp, root.displayNow).toUpperCase()
                                         : ""))
                                 color: routineRow.isDirty ? root.accent
                                   : (routineRow.isOn ? root.enabledGreen
@@ -2239,7 +2248,7 @@ Item {
                           Text {
                             textFormat: Text.PlainText
                             width: Style.space(72)
-                            text: Conditions.relativeTime(runRow.modelData.timestamp, new Date())
+                            text: Conditions.relativeTime(runRow.modelData.timestamp, root.displayNow)
                             color: root.subtle
                             font.family: Style.font.family
                             font.pixelSize: Style.font.caption

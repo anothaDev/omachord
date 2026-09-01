@@ -8,6 +8,7 @@ const panel = fs.readFileSync(path.join(root, "Panel.qml"), "utf8")
 const editor = fs.readFileSync(path.join(root, "RoutineEditor.qml"), "utf8")
 const picker = fs.readFileSync(path.join(root, "ChoicePicker.qml"), "utf8")
 const recorder = fs.readFileSync(path.join(root, "ShortcutRecorder.qml"), "utf8")
+const popup = fs.readFileSync(path.join(root, "RoutinePopup.qml"), "utf8")
 
 assert.match(panel, /write\(root\.pendingPayload \+ "\\n"\)\s*\n\s*stdinEnabled = false/,
   "apply must close stdin after writing its bounded payload")
@@ -54,6 +55,10 @@ assert.match(editor, /replace\(\/\\bOma: \/g, "Omachord: "\)/,
   "legacy binding names must never remain visible in editor errors")
 assert.match(editor, /persisted && isActive && draft\.enabled === false\) save\(\)/,
   "saving an active routine as disabled must not run it again after apply")
+assert.match(panel, /property date displayNow:[\s\S]*?Conditions\.relativeTime\([^)]*root\.displayNow\)/,
+  "panel relative timestamps must depend on a live display clock")
+assert.match(popup, /property date displayNow:[\s\S]*?Conditions\.minutesLeft\([^)]*displayNow\)/,
+  "popup countdowns must depend on a live display clock")
 const service = fs.readFileSync(path.join(root, "Service.qml"), "utf8")
 assert.match(service, /runnerProc\.command = \[root\.runnerPath, job\.op, job\.id, job\.reason, job\.revision\]/,
   "the service must only ever execute the runner with a literal argv")

@@ -490,6 +490,25 @@ function isThemeSlug(value) {
   return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(text) && text.length <= 100
 }
 
+function isBoundedString(value, minimum, maximum) {
+  if (typeof value !== "string") return false
+  var length = codePointLength(value)
+  return length >= minimum && length <= maximum
+}
+
+function isAbsolutePath(value) {
+  return isBoundedString(value, 1, 1000) && value.charAt(0) === "/"
+}
+
+function validateArguments(args) {
+  if (!Array.isArray(args)) return "Arguments must be a JSON array of strings"
+  for (var i = 0; i < args.length; i++) {
+    if (typeof args[i] !== "string") return "Every argument must be a string"
+    if (codePointLength(args[i]) > 500) return "Arguments cannot exceed 500 characters each"
+  }
+  return ""
+}
+
 function validateCondition(condition) {
   if (!condition) return "Condition is missing"
   switch (condition.type) {
@@ -518,13 +537,60 @@ function validateCondition(condition) {
 
 function validateAction(action, endList) {
   if (!action) return "Action is missing"
-  if (!isSetterAction(action)) return ""
-  if (endList && action.restore === true) return "Actions that run when a routine ends cannot restore"
-  if (action.type === "theme" && !isThemeSlug(action.value)) return "Choose a theme"
-  if (action.type === "brightness"
-      && !(typeof action.value === "number" && action.value >= 0 && action.value <= 100 && Math.floor(action.value) === action.value))
-    return "Brightness must be a whole number from 0 to 100"
-  return ""
+  if (isSetterAction(action)) {
+    if (endList && action.restore === true) return "Actions that run when a routine ends cannot restore"
+    if (typeof action.restore !== "boolean") return "Choose whether to restore the previous value"
+    if ((action.type === "nightlight" || action.type === "dnd" || action.type === "stay-awake")
+        && typeof action.value !== "boolean") return "Choose whether this setting is on or off"
+    if (action.type === "theme" && !isThemeSlug(action.value)) return "Choose a theme"
+    if (action.type === "brightness"
+        && !(typeof action.value === "number" && action.value >= 0 && action.value <= 100 && Math.floor(action.value) === action.value))
+      return "Brightness must be a whole number from 0 to 100"
+    return ""
+  }
+  switch (action.type) {
+    case "microphone-toggle":
+      if (typeof action.sound !== "boolean") return "Choose whether to play microphone sounds"
+      if (!isAbsolutePath(action.mutedSound)) return "Enter an absolute path for the muted sound"
+      if (!isAbsolutePath(action.liveSound)) return "Enter an absolute path for the live sound"
+      return ""
+    case "launch-app":
+      if (!isBoundedString(action.desktopId, 1, 300) || action.desktopId.indexOf("/") !== -1)
+        return "Choose an application"
+      return ""
+    case "omarchy-command":
+      if (!isBoundedString(action.route, 8, 300) || action.route.indexOf("omarchy ") !== 0)
+        return "Choose an Omarchy command"
+      return validateArguments(action.args)
+    case "notification":
+      if (!isBoundedString(action.title, 1, 200)) return "Enter a notification title of at most 200 characters"
+      if (action.title.charAt(0) === "-") return "A notification title cannot start with -"
+      if (!isBoundedString(action.body, 0, 1000)) return "Notification detail cannot exceed 1000 characters"
+      if (action.body.charAt(0) === "-") return "Notification detail cannot start with -"
+      if (["low", "normal", "critical"].indexOf(action.urgency) === -1) return "Choose a notification urgency"
+      if (!isBoundedString(action.glyph, 0, 20)) return "Notification glyph cannot exceed 20 characters"
+      return ""
+    case "osd":
+      if (!isBoundedString(action.icon, 0, 100)) return "OSD icon cannot exceed 100 characters"
+      if (!isBoundedString(action.message, 0, 300)) return "OSD message cannot exceed 300 characters"
+      if (!(typeof action.progress === "number" && action.progress >= -1 && action.progress <= 100 && Math.floor(action.progress) === action.progress))
+        return "OSD progress must be a whole number from -1 to 100"
+      if (!(typeof action.duration === "number" && action.duration >= 0 && action.duration <= 60000 && Math.floor(action.duration) === action.duration))
+        return "OSD duration must be a whole number from 0 to 60000 milliseconds"
+      return ""
+    case "sound":
+      return isAbsolutePath(action.path) ? "" : "Enter an absolute audio file path"
+    case "delay":
+      return typeof action.milliseconds === "number" && action.milliseconds >= 0
+        && action.milliseconds <= 300000 && Math.floor(action.milliseconds) === action.milliseconds
+        ? "" : "Delay must be a whole number from 0 to 300000 milliseconds"
+    case "exec":
+      if (!isBoundedString(action.program, 1, 1000)) return "Enter a program to run"
+      return validateArguments(action.args)
+    case "shell":
+      return isBoundedString(action.command, 1, 10000) ? "" : "Enter a shell command"
+  }
+  return "Choose an action type"
 }
 
 // Per-card messages so the editor can mark the failing card instead of only

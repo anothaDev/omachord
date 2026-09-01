@@ -24,6 +24,7 @@ Column {
   property string summary: ""
   property int cursorIndex: -1
   property bool cursorOnFooter: false
+  property date displayNow: new Date()
 
   signal endRequested(string id)
   signal openRequested()
@@ -39,7 +40,7 @@ Column {
     var since = Conditions.clockTime(row.activatedAt)
     if (since) parts.push("Since " + since)
     if (row.expiresAt) {
-      var left = Conditions.minutesLeft(row.expiresAt, new Date())
+      var left = Conditions.minutesLeft(row.expiresAt, displayNow)
       parts.push(left !== null && left >= 0 ? (left < 1 ? "ending now" : left + " min left") : "until " + Conditions.clockTime(row.expiresAt))
     } else if (row.conditions > 0) parts.push("while conditions hold")
     else {
@@ -62,6 +63,14 @@ Column {
   }
 
   spacing: Style.space(14)
+
+  Timer {
+    interval: 60000
+    repeat: true
+    running: popup.visible && popup.rows.length > 0
+    onRunningChanged: if (running) popup.displayNow = new Date()
+    onTriggered: popup.displayNow = new Date()
+  }
 
   PanelHero {
     width: parent.width
