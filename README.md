@@ -4,7 +4,7 @@ Omachord is an accessibility-oriented shortcut and routine composer for Omarchy.
 
 The panel, the condition service, and a small bar widget run inside the existing `omarchy-shell` process. A separate Bash/`jq` runner owns validation, persistence, integration, and execution so shortcuts, hooks, and restores keep working when the panel is closed.
 
-The microphone routine is inspired by [Easy-Mic-Mute-Hyprland](https://github.com/anothaDev/Easy-Mic-Mute-Hyprland), expanded here to preserve Omarchy's native mute behavior and compose with other actions.
+Omachord started with an old microphone automation. While revisiting it, something clicked: composable, restorable routines felt like a missing piece in the OS.
 
 ## Requirements
 
