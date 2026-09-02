@@ -1,4 +1,8 @@
-# Omachord
+<p align="center">
+  <img src="assets/omachord-icon.svg" alt="Omachord logo" width="112" height="112">
+</p>
+
+<h1 align="center">Omachord</h1>
 
 Omachord is an accessibility-oriented shortcut and routine composer for Omarchy. It shows the effective Hyprland shortcut catalogue and lets you compose app-owned routines from ordered actions, one optional keyboard shortcut, Omarchy event hooks, and conditions such as a time period or a Wi-Fi network. Routines can change Omarchy state (night light, do not disturb, stay awake, theme, brightness) and put it back when they end; a routine that does is a *mode* that can be on or off.
 
