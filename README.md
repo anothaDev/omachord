@@ -10,6 +10,10 @@ The panel, the condition service, and a small bar widget run inside the existing
 
 Omachord started with an old microphone automation. While revisiting it, something clicked: composable, restorable routines felt like a missing piece in the OS.
 
+## Showcase
+
+https://github.com/user-attachments/assets/2935cbac-b03b-42b8-9f2b-069006ace5c3
+
 ## Requirements
 
 - Omarchy 4.0.2
