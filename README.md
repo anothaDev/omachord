@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/omachord-icon.svg" alt="Omachord logo" width="112" height="112">
+  <img src="assets/omachord-icon.svg" alt="Omachord logo" width="80" height="80">
 </p>
 
 <h1 align="center">Omachord</h1>
