@@ -35,6 +35,16 @@ assert_missing() {
   [[ ! -e $1 ]] || fail "${2:-$1 should not exist}"
 }
 
+action_supervisor_for() {
+  pgrep -P "$1" -f 'omachord-action-supervisor' 2>/dev/null | head -n 1
+}
+
+action_timeout_for() {
+  local supervisor
+  supervisor=$(action_supervisor_for "$1") || return 1
+  pgrep -P "$supervisor" -x timeout 2>/dev/null | head -n 1
+}
+
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/config/hypr" "$TEST_ROOT/state" "$TEST_ROOT/data"
 : >"$TEST_ROOT/bindings.txt"
 : >"$TEST_ROOT/command.log"
@@ -135,80 +145,6 @@ cat >"$TEST_ROOT/bin/uwsm-app" <<'STUB'
 printf '<%s>' "$@" >"$TEST_ROOT/launch.args"
 STUB
 
-cat >"$TEST_ROOT/bin/mv" <<'STUB'
-#!/bin/bash
-set -euo pipefail
-destination=${!#}
-if [[ -f $TEST_ROOT/fail-bindings-exchange-back \
-    && $destination == "$HOME/.config/hypr/bindings.lua" \
-    && " $* " == *" --exchange "* ]]; then
-  count=$(cat "$TEST_ROOT/bindings-exchange-count" 2>/dev/null || printf 0)
-  count=$((count + 1))
-  printf '%s\n' "$count" >"$TEST_ROOT/bindings-exchange-count"
-  if ((count == 1)); then
-    printf '%s\n' 'concurrent version from failed exchange-back' >"$destination"
-  elif ((count == 2)); then
-    rm -f "$TEST_ROOT/fail-bindings-exchange-back"
-    exit 1
-  fi
-fi
-if [[ -f $TEST_ROOT/inject-ownership-race \
-    && $destination == "$XDG_STATE_HOME/omarchy/omachord/connection.json" ]]; then
-  mkdir -p "$(dirname -- "$destination")"
-  printf '%s\n' 'concurrently created ownership' >"$destination"
-  rm -f "$TEST_ROOT/inject-ownership-race"
-fi
-if [[ -f $TEST_ROOT/inject-generated-remove-race \
-    && $destination == "$HOME/.config/hypr/omachord.lua" ]]; then
-  printf '%s\n' 'concurrently edited generated file' >"$destination"
-  rm -f "$TEST_ROOT/inject-generated-remove-race"
-fi
-if [[ -f $TEST_ROOT/inject-bindings-write-race \
-    && $destination == "$HOME/.config/hypr/bindings.lua" ]]; then
-  printf '%s\n' 'concurrently edited bindings' >"$destination"
-  rm -f "$TEST_ROOT/inject-bindings-write-race"
-fi
-if [[ -f $TEST_ROOT/inject-config-rollback-race \
-    && $destination == "$HOME/.config/omarchy/omachord.json" ]]; then
-  count=$(cat "$TEST_ROOT/config-mv-count" 2>/dev/null || printf 0)
-  count=$((count + 1))
-  printf '%s\n' "$count" >"$TEST_ROOT/config-mv-count"
-  if ((count == 2)); then
-    printf '%s\n' 'concurrently edited configuration' >"$destination"
-    rm -f "$TEST_ROOT/inject-config-rollback-race"
-  fi
-fi
-if [[ -f $TEST_ROOT/hold-config-publish \
-    && $destination == "$HOME/.config/omarchy/omachord.json" \
-    && " $* " == *" --exchange "* ]]; then
-  set +e
-  /usr/bin/mv "$@"
-  status=$?
-  set -e
-  touch "$TEST_ROOT/config-published"
-  while [[ -f $TEST_ROOT/hold-config-publish ]]; do sleep 0.01; done
-  exit "$status"
-fi
-if [[ -f $TEST_ROOT/hold-generated-removal \
-    && " $* " == *" $HOME/.config/hypr/omachord.lua "* \
-    && $destination == "$HOME/.config/hypr/.omachord-unlink."* ]]; then
-  set +e
-  /usr/bin/mv "$@"
-  status=$?
-  set -e
-  touch "$TEST_ROOT/generated-removal-window"
-  while [[ -f $TEST_ROOT/hold-generated-removal ]]; do sleep 0.01; done
-  exit "$status"
-fi
-if [[ -f $TEST_ROOT/inject-shell-config-race \
-    && $destination == "$HOME/.config/omarchy/shell.json" \
-    && " $* " == *" --exchange "* ]]; then
-  cp -- "$TEST_ROOT/concurrent-shell-config.json" "$destination"
-  rm -f "$TEST_ROOT/inject-shell-config-race"
-fi
-exec /usr/bin/mv "$@"
-STUB
-
 cat >"$TEST_ROOT/bin/stat" <<'STUB'
 #!/bin/bash
 set -euo pipefail
@@ -219,26 +155,6 @@ if [[ -f $TEST_ROOT/inject-shell-config-before-baseline \
   rm -f "$TEST_ROOT/inject-shell-config-before-baseline"
 fi
 exec /usr/bin/stat "$@"
-STUB
-
-cat >"$TEST_ROOT/bin/rm" <<'STUB'
-#!/bin/bash
-set -euo pipefail
-if [[ -f $TEST_ROOT/fail-active-snapshot-remove ]]; then
-  for argument in "$@"; do
-    if [[ $argument == "$XDG_STATE_HOME/omarchy/omachord/active/interrupted-activation.json" ]]; then
-      exit 1
-    fi
-  done
-fi
-if [[ -f $TEST_ROOT/fail-end-snapshot-remove ]]; then
-  for argument in "$@"; do
-    if [[ $argument == "$XDG_STATE_HOME/omarchy/omachord/active/end-actions.json" ]]; then
-      exit 1
-    fi
-  done
-fi
-exec /usr/bin/rm "$@"
 STUB
 
 cat >"$TEST_ROOT/bin/capture-args" <<'STUB'
@@ -477,6 +393,63 @@ printf '{\n  "version": 1,\n  "routines": []\n}\n' \
 rm -f -- "$oversized_config" "$oversized_result" "$nul_config" "$fifo_config"
 pass "byte-bounded configuration input"
 
+toggles_dir="$XDG_STATE_HOME/omarchy/toggles"
+assert_eq "$("$RUNNER" toggles)" '[]' "missing toggle directory was not empty"
+mkdir -p "$toggles_dir/subdirectory"
+long_toggle=$(printf 'a%.0s' {1..64})
+too_long_toggle="${long_toggle}a"
+touch "$toggles_dir/scratch" "$toggles_dir/constructor" "$toggles_dir/$long_toggle" \
+  "$toggles_dir/$too_long_toggle" "$toggles_dir/.hidden" "$toggles_dir/bad flag" \
+  "$toggles_dir/a..b" "$toggles_dir/"$'bad\nline'
+ln -s scratch "$toggles_dir/linked"
+cat >"$TEST_ROOT/shadow/find" <<'STUB'
+#!/bin/bash
+touch "$TEST_ROOT/shadow-find-ran"
+exit 1
+STUB
+chmod +x "$TEST_ROOT/shadow/find"
+toggle_result=$("$RUNNER" toggles)
+jq -e --arg long "$long_toggle" '
+  . == (["scratch", "constructor", $long] | sort)
+  and all(.[]; type == "string")
+' <<<"$toggle_result" >/dev/null || fail "toggle scan accepted an invalid entry"
+assert_missing "$TEST_ROOT/shadow-find-ran" "toggle scan used a PATH-shadowed find"
+rm -f -- "$TEST_ROOT/shadow/find"
+chmod 777 "$toggles_dir"
+if "$RUNNER" toggles >/dev/null; then
+  fail "toggle scan trusted an externally writable directory"
+fi
+chmod 755 "$toggles_dir"
+
+rm -rf -- "$toggles_dir"
+mkdir -p "$toggles_dir"
+toggle_paths=()
+for number in {0000..4096}; do toggle_paths+=("$toggles_dir/t$number"); done
+touch "${toggle_paths[@]}"
+toggle_limit_result=$(mktemp)
+if "$RUNNER" toggles >"$toggle_limit_result"; then
+  fail "toggle entry limit should reject 4097 entries"
+fi
+assert_eq "$(jq -r .code "$toggle_limit_result")" toggles-unavailable \
+  "toggle entry limit returned the wrong error"
+assert_file_contains "$toggle_limit_result" '4096 entry limit'
+
+rm -rf -- "$toggles_dir"
+mkdir -p "$toggles_dir"
+toggle_paths=()
+toggle_padding=$(printf 'x%.0s' {1..250})
+for number in {0000..2040}; do toggle_paths+=("$toggles_dir/t$number$toggle_padding"); done
+touch "${toggle_paths[@]}"
+if "$RUNNER" toggles >"$toggle_limit_result"; then
+  fail "toggle byte limit should reject an oversized directory scan"
+fi
+assert_eq "$(jq -r .code "$toggle_limit_result")" toggles-unavailable \
+  "toggle byte limit returned the wrong error"
+assert_file_contains "$toggle_limit_result" 'byte limit'
+rm -rf -- "$toggles_dir"
+rm -f -- "$toggle_limit_result"
+pass "bounded trusted toggle discovery"
+
 CONFIG=$(jq -cn '{
   version: 1,
   routines: [
@@ -556,7 +529,7 @@ CONFIG=$(jq -cn '{
       name: "Post-supervisor cleanup",
       enabled: true,
       triggers: [],
-      actions: [{type:"shell",command:"(trap \"\" TERM; sleep 2; touch \"$TEST_ROOT/post-supervisor-survived\") & sleep 0.2"}]
+      actions: [{type:"shell",command:"(trap \"\" TERM; sleep 2; touch \"$TEST_ROOT/post-supervisor-survived\") & echo $! >\"$TEST_ROOT/post-holder.pid\"; touch \"$TEST_ROOT/post-ready\"; while [[ ! -e \"$TEST_ROOT/post-release\" ]]; do sleep 0.01; done"}]
     }
   ]
 }')
@@ -749,10 +722,14 @@ UNCOMMITTED_CONFIG=$(jq -c '.routines += [{
   actions:[{type:"exec",program:"should-not-run",args:[]}]
 }]' <<<"$CONFIG")
 uncommitted_revision=$(config_revision)
-rm -f "$TEST_ROOT/reload-count" "$TEST_ROOT/reloaded" "$TEST_ROOT/should-not-run"
-touch "$TEST_ROOT/error-after-reload" "$TEST_ROOT/hold-config-publish"
+rm -f "$TEST_ROOT/reload-count" "$TEST_ROOT/reloaded" "$TEST_ROOT/should-not-run" \
+  "$TEST_ROOT/config-published" "$TEST_ROOT/release-config-publish"
+touch "$TEST_ROOT/error-after-reload"
 printf '%s\n' "$UNCOMMITTED_CONFIG" \
-  | "$RUNNER" config apply "$uncommitted_revision" >"$TEST_ROOT/uncommitted-apply.result" &
+  | env OMACHORD_FS_TEST_MATCH="$CONFIG_PATH" OMACHORD_FS_TEST_PAUSE=after-exchange \
+      OMACHORD_FS_TEST_READY="$TEST_ROOT/config-published" \
+      OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/release-config-publish" \
+      "$RUNNER" config apply "$uncommitted_revision" >"$TEST_ROOT/uncommitted-apply.result" &
 uncommitted_apply_pid=$!
 for _ in {1..500}; do
   [[ -f $TEST_ROOT/config-published ]] && break
@@ -763,7 +740,7 @@ done
 uncommitted_run_pid=$!
 sleep 0.2
 assert_missing "$TEST_ROOT/should-not-run" "uncommitted routine executed while apply was pending"
-rm -f "$TEST_ROOT/hold-config-publish"
+touch "$TEST_ROOT/release-config-publish"
 set +e
 wait "$uncommitted_apply_pid"
 uncommitted_apply_status=$?
@@ -777,6 +754,7 @@ assert_eq "$(jq -r '.code' "$TEST_ROOT/uncommitted-apply.result")" reload-rolled
   "forced apply did not report rollback"
 "$RUNNER" status | jq -e '.integrationComplete and .configValid' >/dev/null
 rm -f "$TEST_ROOT/error-after-reload" "$TEST_ROOT/config-published" \
+  "$TEST_ROOT/release-config-publish" \
   "$TEST_ROOT/reload-count" "$TEST_ROOT/reloaded" \
   "$TEST_ROOT/uncommitted-apply.result" "$TEST_ROOT/uncommitted-run.result"
 
@@ -926,7 +904,7 @@ delay_runner=$!
 delay_timeout=""
 delay_child=""
 for _ in {1..100}; do
-  delay_timeout=$(pgrep -P "$delay_runner" -x timeout 2>/dev/null || true)
+  delay_timeout=$(action_timeout_for "$delay_runner" || true)
   [[ -z $delay_timeout ]] || delay_child=$(pgrep -P "$delay_timeout" -x sleep 2>/dev/null || true)
   [[ -z $delay_child ]] || break
   sleep 0.01
@@ -948,23 +926,21 @@ delay_runner=$!
 delay_timeout=""
 delay_child=""
 for _ in {1..100}; do
-  delay_timeout=$(pgrep -P "$delay_runner" -x timeout 2>/dev/null || true)
+  delay_timeout=$(action_timeout_for "$delay_runner" || true)
   [[ -z $delay_timeout ]] || delay_child=$(pgrep -P "$delay_timeout" -x sleep 2>/dev/null || true)
   [[ -z $delay_child ]] || break
   sleep 0.01
 done
 [[ -n $delay_child ]] || fail "SIGKILL lock test did not start its action"
+if flock -n "$XDG_RUNTIME_DIR/omachord/routine-delay-lock.lock" true; then
+  fail "routine lock was available while its action was alive"
+fi
 kill -KILL "$delay_runner"
 wait "$delay_runner" 2>/dev/null || true
-if kill -0 "$delay_child" 2>/dev/null \
-  && flock -n "$XDG_RUNTIME_DIR/omachord/routine-delay-lock.lock" true; then
-  kill -KILL -- "-$delay_timeout" 2>/dev/null || true
-  fail "SIGKILL released a routine lock while its action was alive"
-fi
-kill -TERM -- "-$delay_timeout" 2>/dev/null || true
 lock_released=false
 for _ in {1..100}; do
-  if flock -n "$XDG_RUNTIME_DIR/omachord/routine-delay-lock.lock" true; then
+  if ! kill -0 "$delay_child" 2>/dev/null \
+    && flock -n "$XDG_RUNTIME_DIR/omachord/routine-delay-lock.lock" true; then
     lock_released=true
     break
   fi
@@ -974,34 +950,55 @@ done
 rm -f "$TEST_ROOT/delay-kill-result"
 pass "runner termination preserves action and lock ownership"
 
-rm -f "$TEST_ROOT/post-supervisor-survived"
+rm -f "$TEST_ROOT/post-supervisor-survived" "$TEST_ROOT/post-holder.pid" \
+  "$TEST_ROOT/post-ready" "$TEST_ROOT/post-release"
 setsid "$RUNNER" run post-supervisor test >"$TEST_ROOT/post-supervisor.result" &
 post_runner=$!
 post_timeout=""
 for _ in {1..500}; do
-  post_timeout=$(pgrep -P "$post_runner" -x timeout 2>/dev/null || true)
-  [[ -z $post_timeout ]] || break
-  sleep 0.001
+  post_timeout=$(action_timeout_for "$post_runner" || true)
+  [[ -z $post_timeout || ! -s $TEST_ROOT/post-holder.pid || ! -e $TEST_ROOT/post-ready ]] || break
+  sleep 0.002
 done
 [[ -n $post_timeout ]] || fail "post-supervisor cleanup test did not start"
-post_window=false
+[[ -s $TEST_ROOT/post-holder.pid && -e $TEST_ROOT/post-ready ]] \
+  || fail "post-supervisor cleanup test did not become ready"
+post_holder=$(cat "$TEST_ROOT/post-holder.pid")
+post_start=$(awk '{print $22}' "/proc/$post_timeout/stat")
+kill -STOP "$post_runner"
+touch "$TEST_ROOT/post-release"
+post_anchored=false
 for _ in {1..500}; do
-  if ! kill -0 "$post_timeout" 2>/dev/null && kill -0 "$post_runner" 2>/dev/null; then
-    post_window=true
+  if [[ -r /proc/$post_timeout/stat ]] \
+    && [[ $(awk '{print $3}' "/proc/$post_timeout/stat") == Z ]]; then
+    post_anchored=true
     break
   fi
-  sleep 0.001
+  sleep 0.002
 done
-[[ $post_window == true ]] || fail "post-supervisor cleanup window was not observed"
+[[ $post_anchored == true ]] || fail "exited timeout leader was not retained"
+assert_eq "$(awk '{print $22}' "/proc/$post_timeout/stat")" "$post_start" \
+  "retained timeout identity changed"
+assert_eq "$(awk '{print $5}' "/proc/$post_timeout/stat")" "$post_timeout" \
+  "retained timeout does not anchor its process group"
+assert_eq "$(awk '{print $5}' "/proc/$post_holder/stat")" "$post_timeout" \
+  "output holder is not in the anchored action group"
 kill -KILL -- "-$post_runner"
 wait "$post_runner" 2>/dev/null || true
-sleep 2.2
+for _ in {1..500}; do
+  ! kill -0 "$post_holder" 2>/dev/null && break
+  sleep 0.004
+done
+if kill -0 "$post_holder" 2>/dev/null; then
+  fail "output-holding descendant survived anchored supervisor cleanup"
+fi
 assert_missing "$TEST_ROOT/post-supervisor-survived" \
   "output-holding descendant survived a post-supervisor SIGKILL"
 if ! flock -n "$XDG_RUNTIME_DIR/omachord/routine-post-supervisor.lock" true; then
   fail "post-supervisor guard retained the routine lock after cleanup"
 fi
-rm -f "$TEST_ROOT/post-supervisor.result"
+rm -f "$TEST_ROOT/post-supervisor.result" "$TEST_ROOT/post-holder.pid" \
+  "$TEST_ROOT/post-ready" "$TEST_ROOT/post-release"
 
 zombie_pid_file="$TEST_ROOT/zombie-runner.pid"
 rm -f "$zombie_pid_file"
@@ -1025,7 +1022,7 @@ done
 zombie_runner=$(cat "$zombie_pid_file")
 zombie_timeout=""
 for _ in {1..500}; do
-  zombie_timeout=$(pgrep -P "$zombie_runner" -x timeout 2>/dev/null || true)
+  zombie_timeout=$(action_timeout_for "$zombie_runner" || true)
   [[ -z $zombie_timeout ]] || break
   sleep 0.002
 done
@@ -1082,17 +1079,34 @@ assert_eq "$(jq -r '.code' "$rollback_result")" rollback-failed "failed recovery
 rm -f "$rollback_result" "$TEST_ROOT/always-error-after-reload" "$TEST_ROOT/reloaded" "$TEST_ROOT/reload-count"
 pass "rollback reload failure reporting"
 
-touch "$TEST_ROOT/error-after-reload" "$TEST_ROOT/inject-config-rollback-race"
+rm -f "$TEST_ROOT/config-rollback-ready" "$TEST_ROOT/config-rollback-release" \
+  "$TEST_ROOT/config-rollback-count"
+touch "$TEST_ROOT/error-after-reload"
 rollback_result=$(mktemp)
-if apply_config "$ROLLBACK_CONFIG" >"$rollback_result"; then
-  fail "concurrent rollback edit should prevent restoration"
-fi
+printf '%s\n' "$ROLLBACK_CONFIG" \
+  | env OMACHORD_FS_TEST_MATCH="$CONFIG_PATH" OMACHORD_FS_TEST_PAUSE=before-publish \
+      OMACHORD_FS_TEST_ORDINAL=2 \
+      OMACHORD_FS_TEST_COUNT_FILE="$TEST_ROOT/config-rollback-count" \
+      OMACHORD_FS_TEST_READY="$TEST_ROOT/config-rollback-ready" \
+      OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/config-rollback-release" \
+      "$RUNNER" config apply "$(config_revision)" >"$rollback_result" &
+rollback_pid=$!
+for _ in {1..500}; do
+  [[ -e $TEST_ROOT/config-rollback-ready ]] && break
+  sleep 0.01
+done
+[[ -e $TEST_ROOT/config-rollback-ready ]] || fail "rollback did not reach its compare-and-swap"
+printf '%s\n' 'concurrently edited configuration' >"$CONFIG_PATH"
+chmod 600 "$CONFIG_PATH"
+touch "$TEST_ROOT/config-rollback-release"
+if wait "$rollback_pid"; then fail "concurrent rollback edit should prevent restoration"; fi
 assert_eq "$(jq -r '.code' "$rollback_result")" rollback-failed "concurrent rollback edit was not reported"
 assert_eq "$(cat "$CONFIG_PATH")" 'concurrently edited configuration' "rollback overwrote a concurrent configuration edit"
 printf '%s\n' "$OLD_CONFIG" >"$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
-rm -f "$rollback_result" "$TEST_ROOT/error-after-reload" "$TEST_ROOT/inject-config-rollback-race" \
-  "$TEST_ROOT/config-mv-count" "$TEST_ROOT/reloaded" "$TEST_ROOT/reload-count"
+rm -f "$rollback_result" "$TEST_ROOT/error-after-reload" "$TEST_ROOT/config-rollback-ready" \
+  "$TEST_ROOT/config-rollback-release" "$TEST_ROOT/config-rollback-count" \
+  "$TEST_ROOT/reloaded" "$TEST_ROOT/reload-count"
 "$RUNNER" status | jq -e '.integrationComplete and .configValid' >/dev/null
 pass "rollback preserves concurrent edits"
 
@@ -1204,47 +1218,82 @@ pass "concurrent loader collision"
 
 printf '%s\n' 'bindings before transaction' >"$HYPR_CONFIG_DIR/bindings.lua"
 chmod 640 "$HYPR_CONFIG_DIR/bindings.lua"
-touch "$TEST_ROOT/inject-bindings-write-race"
+rm -f "$TEST_ROOT/bindings-race-ready" "$TEST_ROOT/bindings-race-release"
 connect_result=$(mktemp)
-if "$RUNNER" connect >"$connect_result"; then
-  fail "Connect overwrote bindings edited at atomic replacement"
-fi
+env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/bindings.lua" \
+  OMACHORD_FS_TEST_PAUSE=before-publish \
+  OMACHORD_FS_TEST_READY="$TEST_ROOT/bindings-race-ready" \
+  OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/bindings-race-release" \
+  "$RUNNER" connect >"$connect_result" &
+connect_pid=$!
+for _ in {1..500}; do
+  [[ -e $TEST_ROOT/bindings-race-ready ]] && break
+  sleep 0.01
+done
+[[ -e $TEST_ROOT/bindings-race-ready ]] || fail "bindings write did not reach compare-and-swap"
+printf '%s\n' 'concurrently edited bindings' >"$HYPR_CONFIG_DIR/bindings.lua"
+chmod 640 "$HYPR_CONFIG_DIR/bindings.lua"
+touch "$TEST_ROOT/bindings-race-release"
+if wait "$connect_pid"; then fail "Connect overwrote bindings edited at atomic replacement"; fi
 assert_eq "$(cat "$HYPR_CONFIG_DIR/bindings.lua")" 'concurrently edited bindings' "atomic replacement lost a concurrent bindings edit"
 assert_missing "$XDG_STATE_HOME/omarchy/omachord/connection.json" "failed binding transaction claimed ownership"
 assert_missing "$HYPR_CONFIG_DIR/omachord.lua" "failed binding transaction installed generated Lua"
-rm -f "$connect_result" "$TEST_ROOT/inject-bindings-write-race"
+rm -f "$connect_result" "$TEST_ROOT/bindings-race-ready" "$TEST_ROOT/bindings-race-release"
 pass "atomic bindings collision"
 
 printf '%s\n' '-- user bindings' >"$HYPR_CONFIG_DIR/bindings.lua"
 chmod 640 "$HYPR_CONFIG_DIR/bindings.lua"
-touch "$TEST_ROOT/inject-ownership-race"
+rm -f "$TEST_ROOT/ownership-race-ready" "$TEST_ROOT/ownership-race-release"
 connect_result=$(mktemp)
-if "$RUNNER" connect >"$connect_result"; then
-  fail "Connect overwrote ownership created at atomic installation"
-fi
+env OMACHORD_FS_TEST_MATCH="$XDG_STATE_HOME/omarchy/omachord/connection.json" \
+  OMACHORD_FS_TEST_PAUSE=before-publish \
+  OMACHORD_FS_TEST_READY="$TEST_ROOT/ownership-race-ready" \
+  OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/ownership-race-release" \
+  "$RUNNER" connect >"$connect_result" &
+connect_pid=$!
+for _ in {1..500}; do
+  [[ -e $TEST_ROOT/ownership-race-ready ]] && break
+  sleep 0.01
+done
+[[ -e $TEST_ROOT/ownership-race-ready ]] || fail "ownership write did not reach compare-and-swap"
+printf '%s\n' 'concurrently created ownership' >"$XDG_STATE_HOME/omarchy/omachord/connection.json"
+chmod 600 "$XDG_STATE_HOME/omarchy/omachord/connection.json"
+touch "$TEST_ROOT/ownership-race-release"
+if wait "$connect_pid"; then fail "Connect overwrote ownership created at atomic installation"; fi
 assert_eq "$(cat "$XDG_STATE_HOME/omarchy/omachord/connection.json")" 'concurrently created ownership' "atomic installation lost concurrent ownership"
 if grep -Fq 'Oma Chord managed loader' "$HYPR_CONFIG_DIR/bindings.lua"; then
   fail "ownership-collision Connect installed its loader"
 fi
-rm -f "$connect_result" "$TEST_ROOT/inject-ownership-race" "$XDG_STATE_HOME/omarchy/omachord/connection.json"
+rm -f "$connect_result" "$TEST_ROOT/ownership-race-ready" "$TEST_ROOT/ownership-race-release" \
+  "$XDG_STATE_HOME/omarchy/omachord/connection.json"
 pass "atomic ownership collision"
 
 printf '%s\n' 'bindings before failed exchange-back' >"$HYPR_CONFIG_DIR/bindings.lua"
 chmod 640 "$HYPR_CONFIG_DIR/bindings.lua"
-touch "$TEST_ROOT/fail-bindings-exchange-back"
+rm -f "$TEST_ROOT/exchange-back-ready" "$TEST_ROOT/exchange-back-release"
 connect_result=$(mktemp)
-if "$RUNNER" connect >"$connect_result"; then
-  fail "Connect succeeded after its exchange-back failed"
-fi
-assert_eq "$(jq -r '.code' "$connect_result")" connect-rolled-back "failed exchange-back was not transactionally recovered"
-assert_eq "$(cat "$HYPR_CONFIG_DIR/bindings.lua")" 'bindings before failed exchange-back' "failed exchange-back left the loader installed"
-assert_missing "$XDG_STATE_HOME/omarchy/omachord/connection.json" "failed exchange-back left ownership state"
+env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/bindings.lua" \
+  OMACHORD_FS_TEST_PAUSE=before-exchange \
+  OMACHORD_FS_TEST_READY="$TEST_ROOT/exchange-back-ready" \
+  OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/exchange-back-release" \
+  "$RUNNER" connect >"$connect_result" &
+connect_pid=$!
+for _ in {1..500}; do
+  [[ -e $TEST_ROOT/exchange-back-ready ]] && break
+  sleep 0.01
+done
+[[ -e $TEST_ROOT/exchange-back-ready ]] || fail "bindings update did not reach its race window"
+printf '%s\n' 'concurrent version from failed exchange-back' >"$HYPR_CONFIG_DIR/bindings.lua"
+chmod 640 "$HYPR_CONFIG_DIR/bindings.lua"
+touch "$TEST_ROOT/exchange-back-release"
+if wait "$connect_pid"; then fail "Connect succeeded after a post-check bindings edit"; fi
+assert_eq "$(jq -r '.code' "$connect_result")" rollback-failed "post-check edit was not reported as a concurrent rollback conflict"
+assert_eq "$(cat "$HYPR_CONFIG_DIR/bindings.lua")" 'concurrent version from failed exchange-back' "compare-mismatch recovery lost the concurrent bindings"
+assert_missing "$XDG_STATE_HOME/omarchy/omachord/connection.json" "compare-mismatch recovery left ownership state"
 [[ -f $XDG_STATE_HOME/omarchy/omachord/connection.disabled.json ]] \
   || fail "failed Enable discarded the disabled preference"
-find "$XDG_STATE_HOME/omarchy/omachord/conflicts" -type f -exec grep -Fl 'concurrent version from failed exchange-back' {} + \
-  | grep -q . || fail "failed exchange-back did not preserve the concurrent bindings"
-rm -f "$connect_result" "$TEST_ROOT/fail-bindings-exchange-back" "$TEST_ROOT/bindings-exchange-count"
-pass "failed exchange-back recovery"
+rm -f "$connect_result" "$TEST_ROOT/exchange-back-ready" "$TEST_ROOT/exchange-back-release"
+pass "post-check compare-mismatch recovery"
 
 printf '%s\n' 'open descriptor baseline' >"$HYPR_CONFIG_DIR/bindings.lua"
 chmod 640 "$HYPR_CONFIG_DIR/bindings.lua"
@@ -1326,8 +1375,12 @@ assert_eq "$(stat -c %a "$XDG_DATA_HOME/applications/anothadev.omachord.desktop"
 assert_eq "$(stat -c %a "$HOOK_CONFIG_DIR/theme-set.d/anothadev.omachord")" 755 "repair left hook wrapper writable"
 pass "managed integration permissions"
 
-touch "$TEST_ROOT/hold-generated-removal"
-"$RUNNER" disconnect >"$TEST_ROOT/interrupted-disconnect-result" &
+rm -f "$TEST_ROOT/generated-removal-window" "$TEST_ROOT/release-generated-removal"
+env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/omachord.lua" \
+  OMACHORD_FS_TEST_PAUSE=after-exchange \
+  OMACHORD_FS_TEST_READY="$TEST_ROOT/generated-removal-window" \
+  OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/release-generated-removal" \
+  "$RUNNER" disconnect >"$TEST_ROOT/interrupted-disconnect-result" &
 disconnect_pid=$!
 for _ in {1..500}; do
   [[ ! -f $TEST_ROOT/generated-removal-window ]] || break
@@ -1335,25 +1388,39 @@ for _ in {1..500}; do
 done
 [[ -f $TEST_ROOT/generated-removal-window ]] || fail "Disconnect did not reach the atomic removal window"
 kill -TERM "$disconnect_pid"
-rm -f "$TEST_ROOT/hold-generated-removal"
+touch "$TEST_ROOT/release-generated-removal"
 wait "$disconnect_pid" 2>/dev/null || true
 "$RUNNER" status | jq -e '.connected and .ownedConnection and .integrationComplete' >/dev/null
 if find "$HYPR_CONFIG_DIR" -maxdepth 1 -type f \
   \( -name '.omachord-remove.*' -o -name '.omachord-unlink.*' \) -print -quit | grep -q .; then
   fail "interrupted removal stranded a transaction inode"
 fi
-rm -f "$TEST_ROOT/generated-removal-window" "$TEST_ROOT/interrupted-disconnect-result"
+rm -f "$TEST_ROOT/generated-removal-window" "$TEST_ROOT/release-generated-removal" \
+  "$TEST_ROOT/interrupted-disconnect-result"
 pass "atomic removal signal deferral"
 
-touch "$TEST_ROOT/inject-generated-remove-race"
+rm -f "$TEST_ROOT/generated-remove-race-ready" "$TEST_ROOT/generated-remove-race-release"
 disconnect_result=$(mktemp)
-if "$RUNNER" disconnect >"$disconnect_result"; then
-  fail "Disconnect removed a generated file edited at atomic removal"
-fi
+env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/omachord.lua" \
+  OMACHORD_FS_TEST_PAUSE=after-exchange \
+  OMACHORD_FS_TEST_READY="$TEST_ROOT/generated-remove-race-ready" \
+  OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/generated-remove-race-release" \
+  "$RUNNER" disconnect >"$disconnect_result" &
+disconnect_pid=$!
+for _ in {1..500}; do
+  [[ -e $TEST_ROOT/generated-remove-race-ready ]] && break
+  sleep 0.01
+done
+[[ -e $TEST_ROOT/generated-remove-race-ready ]] || fail "generated removal did not reach its race window"
+printf '%s\n' 'concurrently edited generated file' >"$HYPR_CONFIG_DIR/omachord.lua.concurrent"
+mv -fT -- "$HYPR_CONFIG_DIR/omachord.lua.concurrent" "$HYPR_CONFIG_DIR/omachord.lua"
+touch "$TEST_ROOT/generated-remove-race-release"
+if wait "$disconnect_pid"; then fail "Disconnect removed a generated file edited at atomic removal"; fi
 assert_eq "$(jq -r '.code' "$disconnect_result")" rollback-failed "concurrent removal edit was incorrectly reported as rolled back"
 assert_eq "$(cat "$HYPR_CONFIG_DIR/omachord.lua")" 'concurrently edited generated file' "atomic removal lost a concurrent generated-file edit"
 "$RUNNER" status | jq -e '.connected and .ownedConnection and (.integrationComplete | not)' >/dev/null
-rm -f "$disconnect_result" "$TEST_ROOT/inject-generated-remove-race"
+rm -f "$disconnect_result" "$TEST_ROOT/generated-remove-race-ready" \
+  "$TEST_ROOT/generated-remove-race-release"
 "$RUNNER" connect | jq -e '.ok and .connected and .repaired' >/dev/null
 luac -p "$HYPR_CONFIG_DIR/omachord.lua" || fail "repair after removal collision left invalid Lua"
 pass "atomic removal collision"
@@ -1720,13 +1787,12 @@ pass "end actions retain recovery state"
 
 end_runs_before=$(grep -Fxc '<ended>' "$TEST_ROOT/capture-history" 2>/dev/null || printf 0)
 "$RUNNER" run end-actions test | jq -e '.state == "activated"' >/dev/null
-touch "$TEST_ROOT/fail-end-snapshot-remove"
 end_failure=$(mktemp)
-if "$RUNNER" deactivate end-actions test >"$end_failure"; then
+if OMACHORD_FS_TEST_MATCH="$ACTIVE_DIR/end-actions.json" OMACHORD_FS_TEST_FAIL_REMOVE=1 \
+    "$RUNNER" deactivate end-actions test >"$end_failure"; then
   fail "end-action snapshot removal failure should be reported"
 fi
 jq -e '.code == "action-failed" and (.error | test("Could not remove.*recovery record kept"))' "$end_failure" >/dev/null
-/usr/bin/rm -f "$TEST_ROOT/fail-end-snapshot-remove"
 "$RUNNER" deactivate end-actions test | jq -e '.ok and .state == "deactivated"' >/dev/null
 end_runs_after=$(grep -Fxc '<ended>' "$TEST_ROOT/capture-history")
 assert_eq "$end_runs_after" "$((end_runs_before + 1))" "completed end actions repeated while retrying snapshot removal"
@@ -1897,14 +1963,13 @@ assert_eq "$(cat "$TEST_ROOT/brightness")" 80 "the retried restore did not finis
 pass "failed restore keeps the recovery record"
 
 "$RUNNER" activate interrupted-activation test | jq -e '.state == "activated"' >/dev/null
-touch "$TEST_ROOT/fail-active-snapshot-remove"
 snapshot_remove_failure=$(mktemp)
-if "$RUNNER" deactivate interrupted-activation test >"$snapshot_remove_failure"; then
+if OMACHORD_FS_TEST_MATCH="$ACTIVE_DIR/interrupted-activation.json" OMACHORD_FS_TEST_FAIL_REMOVE=1 \
+    "$RUNNER" deactivate interrupted-activation test >"$snapshot_remove_failure"; then
   fail "deactivation should fail when its completed snapshot cannot be removed"
 fi
 jq -e '.code == "action-failed" and (.error | test("Could not remove.*recovery record kept"))' "$snapshot_remove_failure" >/dev/null
 [[ -f $ACTIVE_DIR/interrupted-activation.json ]] || fail "failed snapshot removal lost the recovery record"
-/usr/bin/rm -f "$TEST_ROOT/fail-active-snapshot-remove"
 "$RUNNER" deactivate interrupted-activation test | jq -e '.ok and .skipped == 1' >/dev/null
 rm -f "$snapshot_remove_failure"
 pass "snapshot removal failure is propagated"
@@ -2079,14 +2144,26 @@ rm -f "$TEST_ROOT/concurrent-shell-config.json" "$TEST_ROOT/inject-shell-config-
 
 write_shell_config "$shell_config_plugins_only"
 printf '%s\n' "$shell_config_concurrent" >"$TEST_ROOT/concurrent-shell-config.json"
-touch "$TEST_ROOT/inject-shell-config-race"
-if "$RUNNER" widget ensure >"$widget_result"; then
-  fail "widget migration must reject a concurrent shell.json edit"
-fi
+rm -f "$TEST_ROOT/shell-config-race-ready" "$TEST_ROOT/shell-config-race-release"
+env OMACHORD_FS_TEST_MATCH="$shell_config" OMACHORD_FS_TEST_PAUSE=before-publish \
+  OMACHORD_FS_TEST_READY="$TEST_ROOT/shell-config-race-ready" \
+  OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/shell-config-race-release" \
+  "$RUNNER" widget ensure >"$widget_result" &
+widget_pid=$!
+for _ in {1..500}; do
+  [[ -e $TEST_ROOT/shell-config-race-ready ]] && break
+  sleep 0.01
+done
+[[ -e $TEST_ROOT/shell-config-race-ready ]] || fail "widget migration did not reach compare-and-swap"
+cp -- "$TEST_ROOT/concurrent-shell-config.json" "$shell_config"
+chmod 600 "$shell_config"
+touch "$TEST_ROOT/shell-config-race-release"
+if wait "$widget_pid"; then fail "widget migration must reject a concurrent shell.json edit"; fi
 assert_eq "$(jq -r '.code' "$widget_result")" unsafe-state "a concurrent shell.json edit returned the wrong error"
 assert_eq "$(jq -c . "$shell_config")" "$shell_config_concurrent" "widget migration overwrote a concurrent shell.json edit"
 assert_missing "$widget_marker" "a rejected concurrent migration must not be recorded"
-rm -f "$TEST_ROOT/concurrent-shell-config.json" "$TEST_ROOT/inject-shell-config-race"
+rm -f "$TEST_ROOT/concurrent-shell-config.json" "$TEST_ROOT/shell-config-race-ready" \
+  "$TEST_ROOT/shell-config-race-release"
 
 jq -cn --arg id 'anothadev.omachord' '
   {version:1,bar:{layout:{left:[],center:[],right:[]}},plugins:[{id:$id}],large:[range(0;200000) | 0]}

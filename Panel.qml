@@ -31,8 +31,6 @@ Item {
   property var toggleOptions: []
   property var activeIds: ({})
   property var serviceStatus: null
-  readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || (home + "/.local/state")
-  readonly property string togglesDir: stateHome + "/omarchy/toggles"
   readonly property bool wifiAvailable: Networking.backend === NetworkBackendType.NetworkManager
   readonly property var networkDevices: Networking.devices ? Networking.devices.values : []
   readonly property var wifiOptions: buildWifiOptions()
@@ -80,8 +78,12 @@ Item {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: (manifest && manifest.id) || "anothadev.omachord"
-  readonly property string runnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-    || (home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
+  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
+  readonly property string runnerPath: configuredRunnerPath.indexOf("/") === 0
+    ? configuredRunnerPath
+    : (manifest && manifest.__sourceDir
+      ? String(manifest.__sourceDir) + "/bin/omachord"
+      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
   readonly property var filteredBindings: Model.filterBindings(bindings, shortcutQuery, shortcutFilter)
   readonly property bool compact: window.width < Style.space(920)
   readonly property bool uiLocked: loading || mutating || revisionRefreshPending || !configLoaded
@@ -170,6 +172,7 @@ Item {
       return false
     }
     process.refreshQueued = false
+    if (process === togglesProc) togglesProc.startPending = true
     process.running = true
     return true
   }
@@ -179,7 +182,10 @@ Item {
     process.refreshQueued = false
     Qt.callLater(function() {
       if (process.running) process.refreshQueued = true
-      else process.running = true
+      else {
+        if (process === togglesProc) togglesProc.startPending = true
+        process.running = true
+      }
     })
   }
 
@@ -253,12 +259,13 @@ Item {
     return rows
   }
 
-  function rebuildToggleOptions(text) {
-    var lines = String(text || "").split("\n")
+  function rebuildToggleOptions(names) {
     var rows = []
-    for (var i = 0; i < lines.length; i++) {
-      var name = lines[i].trim()
-      if (name) rows.push({ value: name, label: name, description: "Currently on" })
+    if (Array.isArray(names)) {
+      for (var i = 0; i < names.length; i++) {
+        var name = String(names[i])
+        rows.push({ value: name, label: name, description: "Currently on" })
+      }
     }
     rows.sort(function(left, right) { return left.label.localeCompare(right.label) })
     toggleOptions = rows
@@ -1005,12 +1012,23 @@ Item {
   Process {
     id: togglesProc
     property bool refreshQueued: false
-    command: ["find", root.togglesDir, "-mindepth", "1", "-maxdepth", "1", "-type", "f", "-printf", "%f\n"]
+    property bool startPending: false
+    command: [root.runnerPath, "toggles"]
     stdout: StdioCollector { id: togglesStdout; waitForEnd: true }
+    onStarted: startPending = false
     onExited: function(exitCode) {
-      root.rebuildToggleOptions(exitCode === 0 ? togglesStdout.text : "")
+      startPending = false
+      root.rebuildToggleOptions(exitCode === 0 ? root.parseJson(togglesStdout.text, null) : null)
       root.finishRefreshProcess(togglesProc)
     }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (!togglesProc.running && togglesProc.startPending) {
+          togglesProc.startPending = false
+          root.rebuildToggleOptions(null)
+          root.finishRefreshProcess(togglesProc)
+        }
+      })
   }
 
   Process {

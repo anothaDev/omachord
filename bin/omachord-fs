@@ -2,121 +2,1105 @@
 
 use strict;
 use warnings;
+use Digest::SHA;
 use Errno qw(EEXIST ENOENT);
-use Fcntl qw(O_DIRECTORY O_NOFOLLOW O_NONBLOCK O_RDONLY O_RDWR S_ISDIR S_ISREG);
+use Fcntl qw(F_SETFD LOCK_EX O_CREAT O_DIRECTORY O_EXCL O_NOFOLLOW O_NONBLOCK O_RDONLY O_RDWR O_WRONLY S_ISDIR S_ISREG);
 use IO::Handle;
+use JSON::PP qw(encode_json);
 
-sub fail {
-  print STDERR "$_[0]\n";
-  exit 1;
+{
+  package Omachord::FsError;
+  use overload '""' => sub { $_[0]->{error} . "\n" }, fallback => 1;
+  sub new {
+    my ($class, $code, $error, $preserved) = @_;
+    bless { code => $code, error => $error, preserved => $preserved }, $class;
+  }
+}
+
+our $ACTIVE_SYNC_PATH = "";
+our $SYNC_COUNT = 0;
+our $FINGERPRINT_COUNT = 0;
+
+sub abort_operation {
+  die Omachord::FsError->new(@_);
 }
 
 sub path_parts {
   my ($path) = @_;
-  fail("Path must be normalized and absolute: $path")
-    unless $path =~ m{^/} && $path ne "/" && $path !~ m{//|/\z};
+  abort_operation("unsafe-path", "Path must be normalized and absolute: $path")
+    unless defined($path) && $path =~ m{^/} && $path ne "/" && $path !~ m{//|/\z};
   my @parts = split m{/}, substr($path, 1);
-  fail("Path must be normalized and absolute: $path")
+  abort_operation("unsafe-path", "Path must be normalized and absolute: $path")
     if grep { $_ eq "" || $_ eq "." || $_ eq ".." } @parts;
   return @parts;
 }
 
+sub component_path {
+  my ($directory, $name) = @_;
+  abort_operation("unsafe-path", "Invalid path component")
+    unless defined($name) && $name ne "" && $name ne "." && $name ne ".." && $name !~ m{/|\0};
+  return "/proc/self/fd/" . fileno($directory) . "/$name";
+}
+
+sub sync_handle {
+  my ($handle, $label) = @_;
+  if (defined($ENV{OMACHORD_FS_TEST_MATCH})
+      && $ENV{OMACHORD_FS_TEST_MATCH} eq $ACTIVE_SYNC_PATH
+      && defined($ENV{OMACHORD_FS_TEST_FAIL_SYNC})) {
+    $SYNC_COUNT++;
+    abort_operation("durability-error", "Forced filesystem test sync failure: $label")
+      if $SYNC_COUNT == $ENV{OMACHORD_FS_TEST_FAIL_SYNC};
+  }
+  $handle->sync or abort_operation("durability-error", "Could not sync $label: $!");
+}
+
 sub inspect_directory {
-  my ($handle, $path, $final) = @_;
+  my ($handle, $path, $final_policy, $secure) = @_;
   my @stat = stat($handle);
-  fail("Could not inspect directory: $path") unless @stat && S_ISDIR($stat[2]);
+  abort_operation("unsafe-path", "Could not inspect directory: $path")
+    unless @stat && S_ISDIR($stat[2]);
   my $owner = $stat[4];
   my $mode = $stat[2] & 07777;
-  fail("Directory has a foreign-owned ancestor: $path")
+  abort_operation("unsafe-path", "Directory has a foreign-owned ancestor: $path")
     unless $owner == 0 || $owner == $>;
 
-  if ($final) {
-    fail("Private directory is not user-owned: $path") unless $owner == $>;
-    chmod 0700, $handle or fail("Could not secure directory: $path")
-      unless $mode == 0700;
+  if ($final_policy eq "private") {
+    abort_operation("unsafe-path", "Private directory is not user-owned: $path")
+      unless $owner == $>;
+    if ($mode != 0700) {
+      abort_operation("unsafe-path", "Private directory has unsafe permissions: $path")
+        unless $secure;
+      chmod 0700, $handle
+        or abort_operation("io-error", "Could not secure directory: $path: $!");
+      sync_handle($handle, "directory $path");
+    }
     @stat = stat($handle);
-    fail("Could not secure directory: $path")
+    abort_operation("unsafe-path", "Could not secure directory: $path")
       unless @stat && S_ISDIR($stat[2]) && $stat[4] == $>
         && ($stat[2] & 07777) == 0700;
+  } elsif ($final_policy eq "owned") {
+    abort_operation("unsafe-path", "Directory is not safely user-owned: $path")
+      unless $owner == $> && ($mode & 0022) == 0;
   } elsif (($mode & 0022) != 0 && ($mode & 01000) == 0) {
-    fail("Directory has an unsafe writable ancestor: $path");
+    abort_operation("unsafe-path", "Directory has an unsafe writable ancestor: $path");
   }
+  return @stat;
 }
 
 sub walk_directory {
-  my ($path, $create) = @_;
+  my ($path, $create, $final_policy, $secure) = @_;
   my @parts = path_parts($path);
   sysopen(my $directory, "/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
-    or fail("Could not open root directory: $!");
+    or abort_operation("io-error", "Could not open root directory: $!");
+  fcntl($directory, F_SETFD, 0)
+    or abort_operation("io-error", "Could not retain root directory descriptor: $!");
 
   my $display = "";
   for my $index (0 .. $#parts) {
     my $component = $parts[$index];
     $display .= "/$component";
-    my $relative = "/proc/self/fd/" . fileno($directory) . "/$component";
+    my $relative = component_path($directory, $component);
     my $next;
+    my $created = 0;
     if (!sysopen($next, $relative,
         O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)) {
       if ($create && $! == ENOENT) {
         if (!mkdir($relative, 0700) && $! != EEXIST) {
-          fail("Could not create directory: $display: $!");
+          abort_operation("io-error", "Could not create directory: $display: $!");
         }
+        $created = 1;
         sysopen($next, $relative,
           O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
-          or fail("Could not open directory: $display: $!");
+          or abort_operation("unsafe-path", "Could not open directory: $display: $!");
       } else {
-        fail("Could not open directory without following links: $display: $!");
+        abort_operation("unsafe-path", "Could not open directory without following links: $display: $!");
       }
     }
-    inspect_directory($next, $display, $index == $#parts);
+    inspect_directory($next, $display,
+      $index == $#parts ? $final_policy : "ancestor", $secure);
+    fcntl($next, F_SETFD, 0)
+      or abort_operation("io-error", "Could not retain directory descriptor: $display: $!");
+    if ($created) {
+      sync_handle($next, "new directory $display");
+      sync_handle($directory, "parent of $display");
+    }
     $directory = $next;
   }
   return $directory;
 }
 
-sub open_private_file {
-  my ($path, $mode_text) = @_;
-  fail("Invalid private-file mode") unless $mode_text =~ /\A[0-7]{3,4}\z/;
+sub parent_for_path {
+  my ($path, $create, $policy) = @_;
   my @parts = path_parts($path);
   my $name = pop @parts;
-  fail("Invalid private-file path: $path") unless @parts;
+  abort_operation("unsafe-path", "Path has no parent: $path") unless @parts;
   my $parent = "/" . join("/", @parts);
-  my $directory = walk_directory($parent, 0);
-  my $relative = "/proc/self/fd/" . fileno($directory) . "/$name";
+  my $directory = walk_directory($parent, $create, $policy, 1);
+  my @identity = stat($directory);
+  return ($directory, $name, $parent, "$identity[0]:$identity[1]");
+}
 
-  sysopen(my $file, $relative, O_RDWR | O_NOFOLLOW | O_NONBLOCK)
-    or fail("Could not open private file without following links: $path: $!");
-  my @stat = stat($file);
-  fail("Private file is not a regular user-owned file: $path")
-    unless @stat && S_ISREG($stat[2]) && $stat[4] == $> && $stat[3] == 1;
+sub parent_is_current {
+  my ($parent, $policy, $identity) = @_;
+  my $current;
+  my $ok = eval {
+    $current = walk_directory($parent, 0, $policy, 0);
+    1;
+  };
+  return 0 unless $ok;
+  my @stat = stat($current);
+  return @stat && "$stat[0]:$stat[1]" eq $identity;
+}
 
-  my $expected_mode = oct($mode_text);
-  chmod $expected_mode, $file or fail("Could not secure private file: $path")
-    unless ($stat[2] & 07777) == $expected_mode;
-  @stat = stat($file);
-  fail("Could not secure private file: $path")
-    unless @stat && S_ISREG($stat[2]) && $stat[4] == $> && $stat[3] == 1
-      && ($stat[2] & 07777) == $expected_mode;
+sub stable_fingerprint_handle {
+  my ($file, $path, $require_private) = @_;
+  if (defined($ENV{OMACHORD_FS_TEST_MATCH})
+      && $ENV{OMACHORD_FS_TEST_MATCH} eq $ACTIVE_SYNC_PATH
+      && defined($ENV{OMACHORD_FS_TEST_FAIL_FINGERPRINT})) {
+    $FINGERPRINT_COUNT++;
+    abort_operation("compare-mismatch", "Forced unstable filesystem test fingerprint: $path")
+      if $FINGERPRINT_COUNT == $ENV{OMACHORD_FS_TEST_FAIL_FINGERPRINT};
+  }
+  my @initial = stat($file);
+  abort_operation("unsafe-entry", "File is not a regular user-owned file: $path")
+    unless @initial && S_ISREG($initial[2]) && $initial[4] == $>
+      && (!$require_private || $initial[3] == 1);
+  my ($hash, @before, @after);
+  for my $pass (1 .. 2) {
+    @before = stat($file);
+    seek($file, 0, 0) or abort_operation("io-error", "Could not seek file: $path: $!");
+    my $digest = Digest::SHA->new(256);
+    my $buffer;
+    while (1) {
+      my $read = sysread($file, $buffer, 65536);
+      abort_operation("io-error", "Could not read file: $path: $!") unless defined $read;
+      last if $read == 0;
+      $digest->add(substr($buffer, 0, $read));
+    }
+    my $observed = $digest->hexdigest;
+    @after = stat($file);
+    my $before_state = join(":", @before[0, 1, 2, 4, 7, 9, 10]);
+    my $after_state = join(":", @after[0, 1, 2, 4, 7, 9, 10]);
+    abort_operation("compare-mismatch", "File changed while it was being read: $path")
+      unless $before_state eq $after_state;
+    abort_operation("compare-mismatch", "File changed while it was being read: $path")
+      if defined($hash) && $hash ne $observed;
+    $hash = $observed;
+  }
+  return "file:" . sprintf("%o", $after[2] & 07777) . ":$hash";
+}
+
+sub open_regular_entry {
+  my ($directory, $name, $display, $require_private) = @_;
+  my $relative = component_path($directory, $name);
+  sysopen(my $file, $relative, O_RDONLY | O_NOFOLLOW | O_NONBLOCK)
+    or abort_operation("unsafe-entry", "Could not open regular file without following links: $display: $!");
+  my @opened = stat($file);
+  my @named = lstat($relative);
+  abort_operation("unsafe-entry", "File changed while it was being opened: $display")
+    unless @opened && @named && S_ISREG($opened[2]) && S_ISREG($named[2])
+      && $opened[0] == $named[0] && $opened[1] == $named[1];
+  stable_fingerprint_handle($file, $display, $require_private);
   return $file;
 }
 
+sub fingerprint_entry {
+  my ($directory, $name, $display, $require_private) = @_;
+  my $relative = component_path($directory, $name);
+  my @entry = lstat($relative);
+  return "missing" unless @entry;
+  return "other" unless S_ISREG($entry[2]);
+  my $file = open_regular_entry($directory, $name, $display, $require_private);
+  return stable_fingerprint_handle($file, $display, $require_private);
+}
+
+my $temporary_counter = 0;
+sub unused_name {
+  my ($directory, $prefix) = @_;
+  for (1 .. 100) {
+    my $name = sprintf("%s%08x%08x", $prefix, $$, ++$temporary_counter ^ int(rand(0xffffffff)));
+    my @entry = lstat(component_path($directory, $name));
+    return $name unless @entry;
+  }
+  abort_operation("io-error", "Could not allocate a transaction name");
+}
+
+sub create_file {
+  my ($directory, $prefix, $mode) = @_;
+  for (1 .. 100) {
+    my $name = unused_name($directory, $prefix);
+    my $relative = component_path($directory, $name);
+    if (sysopen(my $file, $relative,
+        O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK, $mode)) {
+      chmod $mode, $file
+        or abort_operation("io-error", "Could not set transaction-file permissions: $!");
+      return ($name, $file);
+    }
+    next if $! == EEXIST;
+    abort_operation("io-error", "Could not create transaction file: $!");
+  }
+  abort_operation("io-error", "Could not create transaction file");
+}
+
+sub write_stdin {
+  my ($file, $display) = @_;
+  binmode STDIN;
+  my $buffer;
+  while (1) {
+    my $read = sysread(STDIN, $buffer, 65536);
+    abort_operation("io-error", "Could not read staged content: $!") unless defined $read;
+    last if $read == 0;
+    my $offset = 0;
+    while ($offset < $read) {
+      my $written = syswrite($file, $buffer, $read - $offset, $offset);
+      abort_operation("io-error", "Could not write $display: $!") unless defined $written;
+      $offset += $written;
+    }
+  }
+  sync_handle($file, "staged file for $display");
+}
+
+sub quiet_system {
+  my (@command) = @_;
+  open my $saved, ">&", STDERR
+    or abort_operation("io-error", "Could not preserve helper diagnostics: $!");
+  open STDERR, ">", "/dev/null"
+    or abort_operation("io-error", "Could not suppress helper diagnostics: $!");
+  my $status = system(@command);
+  open STDERR, ">&", $saved
+    or abort_operation("io-error", "Could not restore helper diagnostics: $!");
+  return $status == 0;
+}
+
+sub exchange_entries {
+  my ($left_directory, $left, $right_directory, $right, $destination) = @_;
+  return quiet_system("/usr/bin/mv", "--exchange", "--no-copy", "-T", "--",
+    component_path($left_directory, $left), component_path($right_directory, $right));
+}
+
+sub move_noreplace {
+  my ($from_directory, $from, $to_directory, $to) = @_;
+  return quiet_system("/usr/bin/mv", "--update=none-fail", "--no-copy", "-T", "--",
+    component_path($from_directory, $from), component_path($to_directory, $to));
+}
+
+sub unlink_entry {
+  my ($directory, $name, $display) = @_;
+  unlink(component_path($directory, $name))
+    or abort_operation("io-error", "Could not remove $display: $!");
+}
+
+sub open_adjacent_directory {
+  my ($parent, $name, $display) = @_;
+  my $relative = component_path($parent, $name);
+  if (!mkdir($relative, 0700) && $! != EEXIST) {
+    return;
+  }
+  sysopen(my $directory, $relative,
+    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK) or return;
+  fcntl($directory, F_SETFD, 0) or return;
+  my $ok = eval { inspect_directory($directory, $display, "private", 1); 1 };
+  return unless $ok;
+  sync_handle($directory, "archive directory $display");
+  sync_handle($parent, "parent of $display");
+  return $directory;
+}
+
+sub file_open_state {
+  my ($path) = @_;
+  return -1 if $ENV{OMACHORD_FS_TEST_FAIL_FUSER};
+  open my $saved, ">&", STDERR
+    or return -1;
+  open STDERR, ">", "/dev/null"
+    or return -1;
+  my $status = system("/usr/bin/fuser", "-sI", $path);
+  open STDERR, ">&", $saved or return -1;
+  return 1 if $status == 0;
+  return 0 if $status == 256;
+  return -1;
+}
+
+sub archive_entry {
+  my ($source_directory, $source_name, $destination, $kind, $archive_root, $stable) = @_;
+  my $source = component_path($source_directory, $source_name);
+  if ($kind eq "retired" && defined($stable)) {
+    my $current = eval { fingerprint_entry($source_directory, $source_name, $destination, 0) };
+    if (defined($current) && $current eq $stable && file_open_state($source) == 0) {
+      my $again = eval { fingerprint_entry($source_directory, $source_name, $destination, 0) };
+      if (defined($again) && $again eq $stable) {
+        unlink_entry($source_directory, $source_name, $destination);
+        sync_handle($source_directory, "directory containing $destination");
+        return;
+      }
+    }
+  }
+
+  my ($archive, $archive_display);
+  my $opened = eval {
+    $archive = walk_directory($archive_root, 1, "private", 1);
+    $archive_display = $archive_root;
+    1;
+  };
+  if (!$opened) {
+    my @destination_parts = path_parts($destination);
+    pop @destination_parts;
+    my $adjacent_name = ".omachord-$kind";
+    $archive_display = "/" . join("/", @destination_parts) . "/$adjacent_name";
+    $archive = open_adjacent_directory($source_directory, $adjacent_name, $archive_display);
+  }
+  my @destination_parts = path_parts($destination);
+  pop @destination_parts;
+  my $source_display = "/" . join("/", @destination_parts) . "/$source_name";
+  return $source_display unless $archive;
+
+  my @parts = path_parts($destination);
+  my $base = $parts[-1];
+  $base =~ s/[^A-Za-z0-9._-]/_/g;
+  my $target_name = unused_name($archive, "$base.");
+  my $target = component_path($archive, $target_name);
+  if (!link($source, $target)) {
+    my $adjacent_name = ".omachord-$kind";
+    my $adjacent_display = "/" . join("/", @destination_parts) . "/$adjacent_name";
+    my $adjacent = open_adjacent_directory($source_directory, $adjacent_name, $adjacent_display);
+    return $source_display unless $adjacent;
+    $archive = $adjacent;
+    $archive_display = $adjacent_display;
+    $target_name = unused_name($archive, "$base.");
+    $target = component_path($archive, $target_name);
+    return $source_display unless link($source, $target);
+  }
+  my $target_file = open_regular_entry($archive, $target_name,
+    "$archive_display/$target_name", 0);
+  sync_handle($target_file, "archived file $archive_display/$target_name");
+  sync_handle($archive, "archive directory $archive_display");
+  unlink_entry($source_directory, $source_name, $destination);
+  sync_handle($source_directory, "directory containing $destination");
+  return "$archive_display/$target_name";
+}
+
+sub pause_for_test {
+  my ($destination, $phase) = @_;
+  return unless defined($ENV{OMACHORD_FS_TEST_MATCH})
+    && $ENV{OMACHORD_FS_TEST_MATCH} eq $destination
+    && defined($ENV{OMACHORD_FS_TEST_PAUSE})
+    && $ENV{OMACHORD_FS_TEST_PAUSE} eq $phase;
+  my $ready = $ENV{OMACHORD_FS_TEST_READY} // "";
+  my $release = $ENV{OMACHORD_FS_TEST_RELEASE} // "";
+  abort_operation("io-error", "Incomplete filesystem test synchronization")
+    unless $ready =~ m{^/} && $release =~ m{^/};
+  my $ordinal = $ENV{OMACHORD_FS_TEST_ORDINAL} // 1;
+  abort_operation("io-error", "Invalid filesystem test ordinal")
+    unless $ordinal =~ /\A[1-9][0-9]*\z/;
+  if (defined $ENV{OMACHORD_FS_TEST_COUNT_FILE}) {
+    my $count_path = $ENV{OMACHORD_FS_TEST_COUNT_FILE};
+    abort_operation("io-error", "Invalid filesystem test count path")
+      unless $count_path =~ m{^/};
+    sysopen(my $count_file, $count_path, O_RDWR | O_CREAT, 0600)
+      or abort_operation("io-error", "Could not open filesystem test count: $!");
+    flock($count_file, LOCK_EX)
+      or abort_operation("io-error", "Could not lock filesystem test count: $!");
+    seek($count_file, 0, 0);
+    my $count = <$count_file> // 0;
+    $count = 0 unless $count =~ /\A[0-9]+\s*\z/;
+    $count++;
+    seek($count_file, 0, 0);
+    truncate($count_file, 0);
+    print {$count_file} "$count\n";
+    sync_handle($count_file, "filesystem test count");
+    return if $count != $ordinal;
+  } else {
+    return if -e $ready;
+  }
+  sysopen(my $marker, $ready, O_WRONLY | O_CREAT | O_EXCL, 0600)
+    or abort_operation("io-error", "Could not publish filesystem test phase: $!");
+  close $marker;
+  select undef, undef, undef, 0.005 until -e $release;
+}
+
+sub stage_from_stdin {
+  my ($directory, $destination, $mode, $prefix) = @_;
+  my ($name, $file) = create_file($directory, $prefix, $mode);
+  my ($fingerprint, @identity);
+  my $ok = eval {
+    write_stdin($file, $destination);
+    @identity = stat($file);
+    $fingerprint = stable_fingerprint_handle($file, $destination, 0);
+    1;
+  };
+  if (!$ok) {
+    my $error = $@;
+    close $file;
+    unlink(component_path($directory, $name));
+    eval { sync_handle($directory, "directory containing $destination") };
+    die $error;
+  }
+  return ($name, $file, "$identity[0]:$identity[1]", $fingerprint);
+}
+
+sub verify_published {
+  my ($directory, $name, $destination, $identity, $fingerprint) = @_;
+  my $file = open_regular_entry($directory, $name, $destination, 0);
+  my @stat = stat($file);
+  abort_operation("compare-mismatch", "File changed while completing the transaction: $destination")
+    unless "$stat[0]:$stat[1]" eq $identity;
+  my $observed = stable_fingerprint_handle($file, $destination, 0);
+  abort_operation("compare-mismatch", "File changed while completing the transaction: $destination")
+    unless $observed eq $fingerprint;
+  sync_handle($file, "published file $destination");
+}
+
+sub entry_display_path {
+  my ($destination, $name) = @_;
+  my @parts = path_parts($destination);
+  pop @parts;
+  return "/" . join("/", @parts) . "/$name";
+}
+
+sub preserve_entry {
+  my ($directory, $name, $destination, $archive_root) = @_;
+  return unless lstat(component_path($directory, $name));
+  my $preserved = entry_display_path($destination, $name);
+  eval {
+    my $archived = archive_entry($directory, $name, $destination, "conflicts",
+      "$archive_root/conflicts", undef);
+    $preserved = $archived if defined $archived;
+  };
+  return $preserved;
+}
+
+sub entry_matches_stage {
+  my ($directory, $name, $identity, $fingerprint, $destination) = @_;
+  my @entry = lstat(component_path($directory, $name));
+  return 0 unless @entry && "$entry[0]:$entry[1]" eq $identity;
+  return 1 unless defined $fingerprint;
+  my $observed = eval { fingerprint_entry($directory, $name, $destination, 0) };
+  return defined($observed) && $observed eq $fingerprint;
+}
+
+sub retract_published_stage {
+  my ($directory, $name, $destination, $stage_identity, $stage_fingerprint,
+      $archive_root) = @_;
+  my $quarantine = unused_name($directory, ".omachord-rollback.");
+  my $moved = eval { move_noreplace($directory, $name, $directory, $quarantine) } // 0;
+  return unless $moved;
+  if (entry_matches_stage($directory, $quarantine, $stage_identity,
+      $stage_fingerprint, $destination)) {
+    my $removed;
+    if (defined $archive_root && defined $stage_fingerprint) {
+      $removed = eval {
+        archive_entry($directory, $quarantine, $destination, "retired",
+          "$archive_root/retired", $stage_fingerprint);
+        1;
+      };
+    } else {
+      $removed = eval {
+        unlink_entry($directory, $quarantine, $destination);
+        sync_handle($directory, "directory containing $destination");
+        1;
+      };
+    }
+    return unless lstat(component_path($directory, $quarantine));
+    return entry_display_path($destination, $quarantine) unless $removed;
+  }
+  return if eval { move_noreplace($directory, $quarantine, $directory, $name) };
+  return entry_display_path($destination, $quarantine);
+}
+
+sub rollback_is_stable {
+  my ($directory, $name, $destination, $stage_identity, $stage_fingerprint) = @_;
+  return 0 unless lstat(component_path($directory, $name));
+  return !entry_matches_stage($directory, $name, $stage_identity,
+    $stage_fingerprint, $destination);
+}
+
+sub rethrow_after_rollback {
+  my ($error, $rolled_back, $preserved, $destination) = @_;
+  if (!$rolled_back) {
+    my $detail = ref($error) eq "Omachord::FsError"
+      ? $error->{error}
+      : "Filesystem operation failed";
+    abort_operation("rollback-failed",
+      "$detail. Rollback could not restore $destination", $preserved);
+  }
+  if (ref($error) eq "Omachord::FsError") {
+    $error->{preserved} = $preserved if defined($preserved) && !defined($error->{preserved});
+  }
+  die $error;
+}
+
+sub rollback_publication {
+  my ($directory, $temporary, $name, $destination, $stage_identity,
+      $stage_fingerprint, $archive_root) = @_;
+  my $quarantine = unused_name($directory, ".omachord-rollback.");
+  my $moved = eval {
+    move_noreplace($directory, $name, $directory, $quarantine)
+  } // 0;
+  if (!$moved) {
+    my $preserved = preserve_entry($directory, $temporary, $destination, $archive_root);
+    eval { sync_handle($directory, "directory containing $destination") };
+    return (rollback_is_stable($directory, $name, $destination,
+      $stage_identity, $stage_fingerprint), $preserved);
+  }
+
+  if (!entry_matches_stage($directory, $quarantine, $stage_identity,
+      $stage_fingerprint, $destination)) {
+    my $restored = eval {
+      move_noreplace($directory, $quarantine, $directory, $name)
+    } // 0;
+    preserve_entry($directory, $quarantine, $destination, $archive_root)
+      unless $restored;
+    my $preserved = preserve_entry($directory, $temporary, $destination, $archive_root);
+    eval { sync_handle($directory, "directory containing $destination") };
+    return (rollback_is_stable($directory, $name, $destination,
+      $stage_identity, $stage_fingerprint), $preserved);
+  }
+
+  my $restored = eval {
+    move_noreplace($directory, $temporary, $directory, $name)
+  } // 0;
+  if ($restored) {
+    retract_published_stage($directory, $quarantine, $destination,
+      $stage_identity, $stage_fingerprint, $archive_root);
+    eval { sync_handle($directory, "directory containing $destination") };
+    return (1, undef);
+  }
+
+  my $preserved = preserve_entry($directory, $temporary, $destination, $archive_root);
+  if (lstat(component_path($directory, $name))) {
+    retract_published_stage($directory, $quarantine, $destination,
+      $stage_identity, $stage_fingerprint, $archive_root);
+  } else {
+    eval { move_noreplace($directory, $quarantine, $directory, $name) };
+  }
+  eval { sync_handle($directory, "directory containing $destination") };
+  return (rollback_is_stable($directory, $name, $destination,
+    $stage_identity, $stage_fingerprint), $preserved);
+}
+
+sub recover_remove {
+  my ($directory, $name, $temporary, $quarantine, $destination,
+      $placeholder_identity, $placeholder_fingerprint, $archive_root) = @_;
+  if (!defined $quarantine) {
+    return rollback_publication($directory, $temporary, $name, $destination,
+      $placeholder_identity, $placeholder_fingerprint, $archive_root);
+  }
+
+  if (entry_matches_stage($directory, $quarantine, $placeholder_identity,
+      $placeholder_fingerprint, $destination)) {
+    my $restored = !lstat(component_path($directory, $name))
+      && (eval { move_noreplace($directory, $temporary, $directory, $name) } // 0);
+    if ($restored) {
+      retract_published_stage($directory, $quarantine, $destination,
+        $placeholder_identity, $placeholder_fingerprint, $archive_root);
+    } else {
+      preserve_entry($directory, $temporary, $destination, $archive_root);
+      if (lstat(component_path($directory, $name))) {
+        retract_published_stage($directory, $quarantine, $destination,
+          $placeholder_identity, $placeholder_fingerprint, $archive_root);
+      } else {
+        eval { move_noreplace($directory, $quarantine, $directory, $name) };
+      }
+    }
+  } else {
+    my $restored = !lstat(component_path($directory, $name))
+      && (eval { move_noreplace($directory, $quarantine, $directory, $name) } // 0);
+    preserve_entry($directory, $quarantine, $destination, $archive_root)
+      unless $restored;
+    preserve_entry($directory, $temporary, $destination, $archive_root);
+  }
+  eval { sync_handle($directory, "directory containing $destination") };
+  return (rollback_is_stable($directory, $name, $destination,
+    $placeholder_identity, $placeholder_fingerprint), undef);
+}
+
+sub publish_cas {
+  my ($directory, $name, $parent, $parent_identity, $destination,
+      $policy, $expected, $mode, $archive_root) = @_;
+  my ($temporary, $stage, $stage_identity, $expected_new) =
+    stage_from_stdin($directory, $destination, $mode, ".omachord.");
+  pause_for_test($destination, "before-publish");
+  if (!parent_is_current($parent, $policy, $parent_identity)) {
+    close $stage;
+    unlink_entry($directory, $temporary, $destination);
+    sync_handle($directory, "directory containing $destination");
+    abort_operation("parent-changed", "The parent directory changed before publishing $destination");
+  }
+
+  if ($expected eq "missing") {
+    if (!move_noreplace($directory, $temporary, $directory, $name)) {
+      unlink_entry($directory, $temporary, $destination);
+      sync_handle($directory, "directory containing $destination");
+      abort_operation("compare-mismatch", "A file appeared during the transaction: $destination");
+    }
+    my $synced = eval {
+      verify_published($directory, $name, $destination, $stage_identity, $expected_new);
+      sync_handle($directory, "directory containing $destination");
+      1;
+    };
+    if (!$synced) {
+      my $error = $@;
+      close $stage;
+      retract_published_stage($directory, $name, $destination,
+        $stage_identity, $expected_new, $archive_root);
+      die $error;
+    }
+    if (!parent_is_current($parent, $policy, $parent_identity)) {
+      close $stage;
+      my $preserved = retract_published_stage($directory, $name, $destination,
+        $stage_identity, $expected_new, $archive_root);
+      abort_operation("parent-changed", "The parent directory changed while publishing $destination", $preserved);
+    }
+    close $stage;
+    return $expected_new;
+  }
+
+  abort_operation("unsafe-entry", "Refusing to replace a non-regular file: $destination")
+    unless $expected =~ /\Afile:[0-7]{1,4}:[0-9a-f]{64}\z/;
+  my $current;
+  my $inspected = eval {
+    $current = fingerprint_entry($directory, $name, $destination, $policy eq "private");
+    1;
+  };
+  if (!$inspected) {
+    my $error = $@;
+    close $stage;
+    retract_published_stage($directory, $temporary, $destination,
+      $stage_identity, $expected_new, $archive_root);
+    die $error;
+  }
+  if ($current ne $expected) {
+    close $stage;
+    unlink_entry($directory, $temporary, $destination);
+    sync_handle($directory, "directory containing $destination");
+    abort_operation("compare-mismatch", "A file changed during the transaction: $destination");
+  }
+  pause_for_test($destination, "before-exchange");
+  if (!exchange_entries($directory, $temporary, $directory, $name, $destination)) {
+    close $stage;
+    unlink_entry($directory, $temporary, $destination);
+    abort_operation("io-error", "Could not atomically exchange $destination");
+  }
+  pause_for_test($destination, "after-exchange");
+  my $observed;
+  my $observed_ok = eval {
+    $observed = fingerprint_entry($directory, $temporary, $destination, 0);
+    1;
+  };
+  if (!$observed_ok) {
+    my $error = $@;
+    close $stage;
+    my ($rolled_back, $preserved) = rollback_publication(
+      $directory, $temporary, $name, $destination,
+      $stage_identity, $expected_new, $archive_root);
+    rethrow_after_rollback($error, $rolled_back, $preserved, $destination);
+  }
+  if ($observed ne $expected) {
+    close $stage;
+    my ($rolled_back, $preserved) = rollback_publication($directory, $temporary, $name,
+      $destination, $stage_identity, $expected_new, $archive_root);
+    if (!$rolled_back) {
+      abort_operation("rollback-failed",
+        "A file changed during the transaction: $destination. Rollback could not restore $destination",
+        $preserved);
+    }
+    abort_operation("compare-mismatch",
+      "A file changed during the transaction: $destination", $preserved);
+  }
+  my $synced = eval {
+    verify_published($directory, $name, $destination, $stage_identity, $expected_new);
+    sync_handle($directory, "directory containing $destination");
+    1;
+  };
+  if (!$synced) {
+    my $error = $@;
+    close $stage;
+    my ($rolled_back, $preserved) = rollback_publication(
+      $directory, $temporary, $name,
+      $destination, $stage_identity, $expected_new, $archive_root);
+    rethrow_after_rollback($error, $rolled_back, $preserved, $destination);
+  }
+  if (!parent_is_current($parent, $policy, $parent_identity)) {
+    close $stage;
+    my ($rolled_back, $preserved) = rollback_publication($directory, $temporary, $name,
+      $destination, $stage_identity, $expected_new, $archive_root);
+    if (!$rolled_back) {
+      abort_operation("rollback-failed",
+        "The parent directory changed while publishing $destination. Rollback could not restore $destination",
+        $preserved);
+    }
+    abort_operation("parent-changed", "The parent directory changed while publishing $destination", $preserved);
+  }
+  # Publication is committed after the verified file and directory sync above.
+  # Retirement is best-effort: on any cleanup error the old inode remains at
+  # its descriptor-relative transaction name instead of making the outcome
+  # ambiguous to the caller.
+  close $stage;
+  eval {
+    archive_entry($directory, $temporary, $destination, "retired",
+      "$archive_root/retired", $expected);
+    sync_handle($directory, "directory containing $destination");
+  };
+  return $expected_new;
+}
+
+sub atomic_write {
+  my ($destination, $mode_text, $policy, $archive_root, $expected) = @_;
+  local $ACTIVE_SYNC_PATH = $destination;
+  local $SYNC_COUNT = 0;
+  local $FINGERPRINT_COUNT = 0;
+  abort_operation("usage", "Invalid file mode") unless $mode_text =~ /\A[0-7]{3,4}\z/;
+  abort_operation("usage", "Invalid parent policy") unless $policy eq "private" || $policy eq "owned";
+  my ($directory, $name, $parent, $identity) = parent_for_path($destination, 1, $policy);
+  $expected = fingerprint_entry($directory, $name, $destination, $policy eq "private")
+    unless defined $expected;
+  abort_operation("unsafe-entry", "Refusing to replace a non-regular file: $destination")
+    unless $expected eq "missing" || $expected =~ /\Afile:/;
+  my $fingerprint = publish_cas($directory, $name, $parent, $identity,
+    $destination, $policy, $expected, oct($mode_text), $archive_root);
+  return { fingerprint => $fingerprint };
+}
+
+sub cas_remove {
+  my ($destination, $expected, $policy, $archive_root) = @_;
+  local $ACTIVE_SYNC_PATH = $destination;
+  local $SYNC_COUNT = 0;
+  local $FINGERPRINT_COUNT = 0;
+  abort_operation("usage", "Invalid parent policy") unless $policy eq "private" || $policy eq "owned";
+  my ($directory, $name, $parent, $identity) = parent_for_path($destination, 0, $policy);
+  $expected = fingerprint_entry($directory, $name, $destination, $policy eq "private")
+    unless defined $expected;
+  if ($expected eq "missing") {
+    pause_for_test($destination, "before-publish");
+    abort_operation("parent-changed", "The parent directory changed while checking $destination")
+      unless parent_is_current($parent, $policy, $identity);
+    abort_operation("compare-mismatch", "A file appeared during the transaction: $destination")
+      unless fingerprint_entry($directory, $name, $destination, $policy eq "private") eq "missing";
+    abort_operation("parent-changed", "The parent directory changed while checking $destination")
+      unless parent_is_current($parent, $policy, $identity);
+    return {};
+  }
+  abort_operation("unsafe-entry", "Refusing to remove a non-regular file: $destination")
+    unless $expected =~ /\Afile:[0-7]{1,4}:[0-9a-f]{64}\z/;
+  my $current = fingerprint_entry($directory, $name, $destination, $policy eq "private");
+  abort_operation("compare-mismatch", "A file changed during the transaction: $destination")
+    unless $current eq $expected;
+  if (defined($ENV{OMACHORD_FS_TEST_MATCH})
+      && $ENV{OMACHORD_FS_TEST_MATCH} eq $destination
+      && $ENV{OMACHORD_FS_TEST_FAIL_REMOVE}) {
+    abort_operation("io-error", "Forced filesystem test removal failure: $destination");
+  }
+  my ($placeholder, $file) = create_file($directory, ".omachord-remove.", 0600);
+  my ($placeholder_identity, $placeholder_fingerprint);
+  my $staged = eval {
+    sync_handle($file, "removal placeholder for $destination");
+    my @placeholder_stat = stat($file);
+    $placeholder_identity = "$placeholder_stat[0]:$placeholder_stat[1]";
+    $placeholder_fingerprint = stable_fingerprint_handle($file, $destination, 0);
+    1;
+  };
+  if (!$staged) {
+    my $error = $@;
+    close $file;
+    unlink(component_path($directory, $placeholder));
+    eval { sync_handle($directory, "directory containing $destination") };
+    die $error;
+  }
+  pause_for_test($destination, "before-publish");
+  if (!parent_is_current($parent, $policy, $identity)) {
+    unlink_entry($directory, $placeholder, $destination);
+    sync_handle($directory, "directory containing $destination");
+    abort_operation("parent-changed", "The parent directory changed before removing $destination");
+  }
+  pause_for_test($destination, "before-exchange");
+  if (!exchange_entries($directory, $placeholder, $directory, $name, $destination)) {
+    unlink_entry($directory, $placeholder, $destination);
+    abort_operation("io-error", "Could not atomically exchange $destination for removal");
+  }
+  pause_for_test($destination, "after-exchange");
+  my $observed = eval { fingerprint_entry($directory, $placeholder, $destination, 0) };
+  if (!defined $observed) {
+    my $error = $@;
+    close $file;
+    my ($rolled_back, $preserved) = recover_remove(
+      $directory, $name, $placeholder, undef, $destination,
+      $placeholder_identity, $placeholder_fingerprint, $archive_root);
+    rethrow_after_rollback($error, $rolled_back, $preserved, $destination);
+  }
+  if ($observed ne $expected) {
+    close $file;
+    my ($rolled_back, $preserved) = rollback_publication($directory, $placeholder, $name,
+      $destination, $placeholder_identity, $placeholder_fingerprint, $archive_root);
+    if (!$rolled_back) {
+      abort_operation("rollback-failed",
+        "A file changed during the transaction: $destination. Rollback could not restore $destination",
+        $preserved);
+    }
+    abort_operation("compare-mismatch", "A file changed during the transaction: $destination", $preserved);
+  }
+
+  my $quarantine = unused_name($directory, ".omachord-unlink.");
+  if (!move_noreplace($directory, $name, $directory, $quarantine)) {
+    close $file;
+    my ($rolled_back, $preserved) = recover_remove(
+      $directory, $name, $placeholder, undef, $destination,
+      $placeholder_identity, $placeholder_fingerprint, $archive_root);
+    abort_operation($rolled_back ? "compare-mismatch" : "rollback-failed",
+      $rolled_back
+        ? "A file changed while removing $destination"
+        : "A file changed while removing $destination. Rollback could not restore $destination",
+      $preserved);
+  }
+  my $ready_to_commit = eval {
+    my $quarantined = open_regular_entry($directory, $quarantine, $destination, 0);
+    my @quarantined_stat = stat($quarantined);
+    abort_operation("compare-mismatch", "A file changed while removing $destination")
+      unless "$quarantined_stat[0]:$quarantined_stat[1]" eq $placeholder_identity
+        && stable_fingerprint_handle($quarantined, $destination, 0) eq $placeholder_fingerprint;
+    close $quarantined;
+    sync_handle($directory, "directory containing $destination");
+    abort_operation("parent-changed", "The parent directory changed while removing $destination")
+      unless parent_is_current($parent, $policy, $identity);
+    abort_operation("compare-mismatch", "A file appeared while completing removal: $destination")
+      unless fingerprint_entry($directory, $name, $destination, $policy eq "private") eq "missing";
+    1;
+  };
+  if (!$ready_to_commit) {
+    my $error = $@;
+    close $file;
+    my ($rolled_back, $preserved) = recover_remove(
+      $directory, $name, $placeholder, $quarantine, $destination,
+      $placeholder_identity, $placeholder_fingerprint, $archive_root);
+    rethrow_after_rollback($error, $rolled_back, $preserved, $destination);
+  }
+
+  close $file;
+  # The missing destination is durable now. Cleanup cannot turn a committed
+  # removal into a reported failure; uncertain inodes remain preserved.
+  eval {
+    archive_entry($directory, $quarantine, $destination, "retired",
+      "$archive_root/retired", $placeholder_fingerprint);
+  };
+  eval {
+    archive_entry($directory, $placeholder, $destination, "retired",
+      "$archive_root/retired", $expected);
+  };
+  eval { sync_handle($directory, "directory containing $destination") };
+  return {};
+}
+
+sub secure_file {
+  my ($path, $mode_text, $optional, $create) = @_;
+  abort_operation("usage", "Invalid private-file mode") unless $mode_text =~ /\A[0-7]{3,4}\z/;
+  my ($directory, $name, $parent, $identity) = parent_for_path($path, 0, "private");
+  my $relative = component_path($directory, $name);
+  my @entry = lstat($relative);
+  if (!@entry && $create) {
+    if (!sysopen(my $created, $relative,
+        O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_NONBLOCK, oct($mode_text))) {
+      abort_operation("io-error", "Could not create private file: $path: $!") unless $! == EEXIST;
+    } else {
+      chmod oct($mode_text), $created
+        or abort_operation("io-error", "Could not secure private file: $path: $!");
+      sync_handle($created, "new private file $path");
+      sync_handle($directory, "directory containing $path");
+    }
+    @entry = lstat($relative);
+  }
+  return if !@entry && $optional;
+  abort_operation("unsafe-entry", "Private file does not exist: $path") unless @entry;
+  my $file = open_regular_entry($directory, $name, $path, 1);
+  my @stat = stat($file);
+  if (($stat[2] & 07777) != oct($mode_text)) {
+    chmod oct($mode_text), $file
+      or abort_operation("io-error", "Could not secure private file: $path: $!");
+    sync_handle($file, "private file $path");
+  }
+  abort_operation("parent-changed", "The parent directory changed while opening $path")
+    unless parent_is_current($parent, "private", $identity);
+  return $file;
+}
+
+sub unique_write {
+  my ($directory_path, $prefix, $mode_text) = @_;
+  local $ACTIVE_SYNC_PATH = $directory_path;
+  local $SYNC_COUNT = 0;
+  abort_operation("usage", "Invalid unique-file prefix")
+    unless $prefix =~ /\A[A-Za-z0-9._-]+\z/;
+  abort_operation("usage", "Invalid file mode") unless $mode_text =~ /\A[0-7]{3,4}\z/;
+  my $directory = walk_directory($directory_path, 1, "private", 1);
+  my @identity = stat($directory);
+  my ($name, $file) = create_file($directory, $prefix, oct($mode_text));
+  my @file_identity = stat($file);
+  my $ok = eval {
+    write_stdin($file, "$directory_path/$name");
+    sync_handle($directory, "directory $directory_path");
+    abort_operation("parent-changed", "The directory changed while writing $directory_path/$name")
+      unless parent_is_current($directory_path, "private", "$identity[0]:$identity[1]");
+    1;
+  };
+  if (!$ok) {
+    my $error = $@;
+    close $file;
+    eval { retract_published_stage($directory, $name, "$directory_path/$name",
+      "$file_identity[0]:$file_identity[1]", undef, undef) };
+    die $error;
+  }
+  return { path => "$directory_path/$name" };
+}
+
+sub list_toggles {
+  my ($path, $max_entries, $max_bytes) = @_;
+  abort_operation("usage", "Invalid toggle entry limit")
+    unless defined($max_entries) && $max_entries =~ /\A[1-9][0-9]*\z/;
+  abort_operation("usage", "Invalid toggle byte limit")
+    unless defined($max_bytes) && $max_bytes =~ /\A[1-9][0-9]*\z/;
+  my @parts = path_parts($path);
+  my $name = pop @parts;
+  my $parent_path = "/" . join("/", @parts);
+  my $parent;
+  my $opened = eval {
+    $parent = walk_directory($parent_path, 0, "owned", 0);
+    1;
+  };
+  if (!$opened) {
+    my $error = $@;
+    return { names => [] } if ref($error) eq "Omachord::FsError"
+      && $error->{error} =~ /No such file or directory/;
+    die $error;
+  }
+  my $relative = component_path($parent, $name);
+  my @named = lstat($relative);
+  return { names => [] } unless @named;
+  sysopen(my $directory, $relative,
+    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK)
+    or abort_operation("unsafe-path", "Could not open toggle directory without following links: $path: $!");
+  my @opened_stat = inspect_directory($directory, $path, "owned", 0);
+  abort_operation("unsafe-path", "Toggle directory changed while it was being opened: $path")
+    unless $opened_stat[0] == $named[0] && $opened_stat[1] == $named[1];
+  my $directory_identity = "$opened_stat[0]:$opened_stat[1]";
+  pause_for_test($path, "before-scan");
+  abort_operation("parent-changed", "The toggle directory changed before it was scanned: $path")
+    unless parent_is_current($path, "owned", $directory_identity);
+  opendir(my $entries, "/proc/self/fd/" . fileno($directory))
+    or abort_operation("io-error", "Could not scan toggle directory: $path: $!");
+  my @names;
+  my $count = 0;
+  my $bytes = 0;
+  while (defined(my $entry = readdir($entries))) {
+    next if $entry eq "." || $entry eq "..";
+    $count++;
+    $bytes += length($entry) + 2;
+    abort_operation("entry-limit", "The Omarchy toggle directory exceeds the $max_entries entry limit")
+      if $count > $max_entries;
+    abort_operation("byte-limit", "The Omarchy toggle directory exceeds the $max_bytes byte limit")
+      if $bytes > $max_bytes;
+    next unless $entry =~ /\A[A-Za-z0-9][A-Za-z0-9._-]{0,63}\z/ && $entry !~ /\.\./;
+    my @stat = lstat(component_path($directory, $entry));
+    next unless @stat && S_ISREG($stat[2]) && $stat[4] == $>;
+    push @names, $entry;
+  }
+  closedir $entries;
+  abort_operation("parent-changed", "The toggle directory changed while it was scanned: $path")
+    unless parent_is_current($path, "owned", $directory_identity);
+  return { names => [sort @names] };
+}
+
+sub run_json_operation {
+  my ($operation) = @_;
+  my $result;
+  my $ok = eval { $result = $operation->(); 1 };
+  if (!$ok) {
+    my $error = $@;
+    if (ref($error) eq "Omachord::FsError") {
+      print encode_json({ ok => JSON::PP::false, %$error }), "\n";
+    } else {
+      print encode_json({ ok => JSON::PP::false, code => "io-error",
+        error => "Filesystem helper failed unexpectedly" }), "\n";
+    }
+    exit 1;
+  }
+  print encode_json({ ok => JSON::PP::true, %{$result // {}} }), "\n";
+  exit 0;
+}
+
 my $command = shift // "";
+my %json_command = map { $_ => 1 } qw(atomic-write cas-write cas-remove remove-file unique-write list-toggles);
+$SIG{HUP} = $SIG{INT} = $SIG{TERM} = "IGNORE" if $json_command{$command};
+
 if ($command eq "prepare-dir") {
-  my $path = shift // fail("Missing directory path");
-  fail("Unexpected arguments") if @_;
-  walk_directory($path, 1);
+  my $path = shift // abort_operation("usage", "Missing directory path");
+  abort_operation("usage", "Unexpected arguments") if @ARGV;
+  walk_directory($path, 1, "private", 1);
+  exit 0;
+}
+
+if ($command eq "secure-dir") {
+  my $path = shift // abort_operation("usage", "Missing directory path");
+  my $optional = (shift // "") eq "optional";
+  abort_operation("usage", "Unexpected arguments") if @ARGV;
+  if ($optional && !lstat($path)) { exit 0; }
+  walk_directory($path, 0, "private", 1);
+  exit 0;
+}
+
+if ($command eq "secure-file") {
+  my $path = shift // abort_operation("usage", "Missing private-file path");
+  my $mode = shift // abort_operation("usage", "Missing private-file mode");
+  my $optional = (shift // "") eq "optional";
+  abort_operation("usage", "Unexpected arguments") if @ARGV;
+  secure_file($path, $mode, $optional, 0);
   exit 0;
 }
 
 if ($command eq "open-file") {
-  my $path = shift // fail("Missing private-file path");
-  my $mode = shift // fail("Missing private-file mode");
-  fail("Unexpected arguments") if @_;
-  my $file = open_private_file($path, $mode);
+  my $path = shift // abort_operation("usage", "Missing private-file path");
+  my $mode = shift // abort_operation("usage", "Missing private-file mode");
+  my $create = (shift // "") eq "create";
+  abort_operation("usage", "Unexpected arguments") if @ARGV;
+  my $file = secure_file($path, $mode, 0, $create);
   STDOUT->autoflush(1);
   print "$$ ", fileno($file), "\n";
   scalar <STDIN>;
   exit 0;
 }
 
-fail("Unknown filesystem-helper command");
+if ($command eq "fsync-fd") {
+  my $fd = shift // abort_operation("usage", "Missing file descriptor");
+  abort_operation("usage", "Invalid file descriptor") unless $fd =~ /\A[0-9]+\z/ && !@ARGV;
+  my $file = IO::Handle->new_from_fd($fd, "r+")
+    or abort_operation("io-error", "Could not access file descriptor $fd: $!");
+  sync_handle($file, "file descriptor $fd");
+  exit 0;
+}
+
+if ($command eq "atomic-write") {
+  my ($destination, $mode, $policy, $archive_root) = @ARGV;
+  run_json_operation(sub { atomic_write($destination, $mode, $policy, $archive_root, undef) });
+}
+
+if ($command eq "cas-write") {
+  my ($destination, $mode, $expected, $policy, $archive_root) = @ARGV;
+  run_json_operation(sub { atomic_write($destination, $mode, $policy, $archive_root, $expected) });
+}
+
+if ($command eq "cas-remove") {
+  my ($destination, $expected, $policy, $archive_root) = @ARGV;
+  run_json_operation(sub { cas_remove($destination, $expected, $policy, $archive_root) });
+}
+
+if ($command eq "remove-file") {
+  my ($destination, $policy, $archive_root) = @ARGV;
+  run_json_operation(sub { cas_remove($destination, undef, $policy, $archive_root) });
+}
+
+if ($command eq "unique-write") {
+  my ($directory, $prefix, $mode) = @ARGV;
+  run_json_operation(sub { unique_write($directory, $prefix, $mode) });
+}
+
+if ($command eq "list-toggles") {
+  my ($path, $max_entries, $max_bytes) = @ARGV;
+  run_json_operation(sub { list_toggles($path, $max_entries, $max_bytes) });
+}
+
+abort_operation("usage", "Unknown filesystem-helper command");

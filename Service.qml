@@ -23,8 +23,10 @@ Item {
   readonly property string stateDir: Quickshell.env("OMACHORD_STATE_DIR") || (stateHome + "/omarchy/omachord")
   readonly property string configPath: Quickshell.env("OMACHORD_CONFIG_FILE") || (home + "/.config/omarchy/omachord.json")
   readonly property string togglesDir: stateHome + "/omarchy/toggles"
-  readonly property string runnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-    || (manifest && manifest.__sourceDir
+  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
+  readonly property string runnerPath: configuredRunnerPath.indexOf("/") === 0
+    ? configuredRunnerPath
+    : (manifest && manifest.__sourceDir
       ? String(manifest.__sourceDir) + "/bin/omachord"
       : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
 
@@ -48,7 +50,7 @@ Item {
   property bool latchesSeeded: false
   property var pendingLogs: null
   property var seenLogs: ({})
-  property var toggles: ({})
+  property var toggles: Object.create(null)
   property var pending: []
   property var currentJob: null
   property var awaitingDeactivation: ({})
@@ -329,13 +331,10 @@ Item {
     activeLoaded = true
   }
 
-  function applyToggles(text) {
-    var lines = String(text || "").split("\n")
-    var next = ({})
-    for (var i = 0; i < lines.length; i++) {
-      var name = lines[i].trim()
-      if (name) next[name] = true
-    }
+  function applyToggles(names) {
+    var next = Object.create(null)
+    if (Array.isArray(names))
+      for (var i = 0; i < names.length; i++) next[String(names[i])] = true
     toggles = next
   }
 
@@ -723,16 +722,19 @@ Item {
     id: togglesProbe
     property bool refreshQueued: false
     property bool startPending: false
-    command: ["find", root.togglesDir, "-mindepth", "1", "-maxdepth", "1", "-type", "f", "-printf", "%f\n"]
+    command: [root.runnerPath, "toggles"]
     stdout: StdioCollector { id: togglesStdout; waitForEnd: true }
     onExited: function(exitCode) {
       togglesProbe.startPending = false
-      root.applyToggles(exitCode === 0 ? togglesStdout.text : "")
+      root.applyToggles(exitCode === 0 ? root.parseJson(togglesStdout.text, null) : null)
       root.finishRefresh(togglesProbe)
       root.scheduleEvaluate()
     }
     onRunningChanged: if (!running && startPending)
-      Qt.callLater(function() { root.failedRefreshStart(togglesProbe, "toggles") })
+      Qt.callLater(function() {
+        root.applyToggles(null)
+        root.failedRefreshStart(togglesProbe, "toggles")
+      })
   }
 
   Process {

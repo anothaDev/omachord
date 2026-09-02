@@ -48,7 +48,7 @@ ShellRoot {
     id: restoreFlag
     command: ["touch", root.flagPath]
     onExited: function() {
-      root.service.applyToggles("scratch\n")
+      root.service.applyToggles(["scratch"])
       root.service.evaluate()
       releaseDeactivate.running = true
     }
@@ -136,6 +136,17 @@ ShellRoot {
       finish(false, "service createObject returned null")
       return
     }
+    service.applyToggles(["constructor"])
+    if (Object.getPrototypeOf(service.toggles) !== null || service.toggles.constructor !== true) {
+      finish(false, "toggle map is not prototype-safe")
+      return
+    }
+    service.applyToggles(null)
+    if (Object.keys(service.toggles).length !== 0) {
+      finish(false, "a failed toggle probe retained stale state")
+      return
+    }
+    service.applyToggles([])
     var manifestDirOk = service.runnerPath === Quickshell.env("OMACHORD_RUNNER_PATH")
     if (!manifestDirOk) {
       finish(false, "runner path was not taken from the environment: " + service.runnerPath)

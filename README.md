@@ -156,6 +156,7 @@ The status names every active routine and, for each condition routine, one `deta
 | `omachord activate <id> [manual\|shortcut\|test]` | Activate without toggling; already-active routines report `alreadyActive` |
 | `omachord deactivate <id> [manual\|shortcut\|test]` | End a routine from its activation record |
 | `omachord active` | List activation records |
+| `omachord toggles` | List valid top-level Omarchy toggle flags as bounded JSON |
 | `omachord logs [limit]` | Run history; stateful routines log `activated` and `deactivated` entries |
 | `omachord widget ensure\|status\|forget` | Place the bar widget once through the Omarchy shell, inspect or clear that record |
 
@@ -183,14 +184,14 @@ Routines are trusted local configuration and are not sandboxed.
 - `shell` intentionally runs `bash -lc` and can execute arbitrary commands as your user.
 - `exec` and `shell` can invoke `sudo`; cached credentials may allow a routine to elevate without another password prompt.
 - Omarchy command choices exclude commands marked hidden or `requires_sudo`, but command metadata is not a security boundary; a selected command can still open a privilege prompt internally.
-- Child output is bounded, and foreground program-execution stages have a 30-second default timeout. Explicit delays are capped at five minutes.
+- Child output is bounded, and foreground program-execution stages have a 30-second default timeout. A detached supervisor keeps the action process-group identity pinned through final descendant cleanup. Explicit delays are capped at five minutes.
 - The only file the runner edits outside Hyprland's and its own is `~/.config/omarchy/shell.json`, once, to move this plugin's entry onto the bar on an install upgraded from 0.2.0; the previous file is kept under `~/.local/state/omarchy/omachord/backups/`.
 - Setter writes are argv-literal calls to Omarchy tools. Activation records are validated before use; a record that fails validation stops `run`, `activate`, `deactivate`, and `active` with `unsafe-state` instead of being treated as inactive.
 - A theme setter makes Omarchy fire its `theme-set` hook, which re-enters the runner. The per-routine lock reports the originating routine as busy, so a routine cannot recurse into itself.
 - Saves use revision-based compare-and-swap, so a stale panel cannot overwrite a newer configuration.
 - Condition-service jobs carry the revision they evaluated; the runner rejects stale jobs and post-Disconnect activations before any routine action runs.
 - Readers require the canonical configuration to match a post-reload commit record. A candidate cannot execute before its integration transaction commits, and an interrupted candidate fails closed.
-- Integration writes use atomic compare-and-swap operations. Concurrent versions and verified inodes still held open by another process are preserved under the private state directory instead of being overwritten.
+- Managed writes and removals pin verified parent-directory descriptors, use descriptor-relative atomic compare-and-swap operations, and sync both the file and containing directory before reporting success. Concurrent versions and verified inodes still held open by another process are preserved under the private state directory instead of being overwritten.
 
 Review routine JSON added outside the panel before running it, especially `exec` and `shell` actions.
 If an interrupted transaction leaves an uncommitted configuration, the panel refuses to load or run it. Inspect the canonical JSON before explicitly repairing or replacing it.
@@ -236,7 +237,7 @@ test/run.sh
 
 Tests additionally require Node.js, `luac`, `qmllint`, `qmltestrunner`, `desktop-file-validate`, and the Omarchy plugin validator. The local gate verifies the exact Omarchy, Hyprland, and Quickshell release targets above.
 
-It exercises strict and byte-bounded schema validation, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, exact-gap transaction races, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, model and condition logic, runtime QML interaction, an offscreen run of the condition service against a fake runner, plugin validation, and QML linting.
+It exercises strict and byte-bounded schema validation, bounded toggle discovery, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, descriptor-pinned transaction races and durability failures, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, model and condition logic, runtime QML interaction, an offscreen run of the condition service against a fake runner, plugin validation, and QML linting.
 
 `test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup offscreen into `test/render/out/` so a change can be reviewed as images. It reads your real configuration through the runner but never writes.
 

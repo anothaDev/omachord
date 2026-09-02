@@ -1,0 +1,121 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use Errno qw(EACCES EPERM);
+use Fcntl qw(O_CREAT O_EXCL O_WRONLY);
+use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG setpgid setsid);
+use Time::HiRes qw(sleep);
+
+sub marker {
+  my ($path) = @_;
+  sysopen(my $handle, $path, O_WRONLY | O_CREAT | O_EXCL, 0600) or return 0;
+  close $handle or return 0;
+  return 1;
+}
+
+sub process_fields {
+  my ($pid) = @_;
+  open my $handle, "<", "/proc/$pid/stat" or return;
+  my $line = <$handle>;
+  close $handle;
+  return unless defined $line;
+  my $end = rindex($line, ") ");
+  return if $end < 0;
+  my @fields = split /\s+/, substr($line, $end + 2);
+  return @fields;
+}
+
+sub process_is_live {
+  my ($pid, $expected_start) = @_;
+  my @fields = process_fields($pid);
+  return @fields >= 20 && $fields[0] ne "Z" && $fields[19] eq $expected_start;
+}
+
+sub child_is_zombie {
+  my ($pid) = @_;
+  my @fields = process_fields($pid);
+  return @fields && $fields[0] eq "Z";
+}
+
+sub exit_for_wait_status {
+  my ($status) = @_;
+  exit WEXITSTATUS($status) if WIFEXITED($status);
+  exit 128 + WTERMSIG($status) if WIFSIGNALED($status);
+  exit 125;
+}
+
+my $runner_pid = shift // die "Missing runner PID\n";
+my $runner_start = shift // die "Missing runner start time\n";
+my $control_dir = shift // die "Missing control directory\n";
+my $duration = shift // die "Missing timeout duration\n";
+die "Invalid runner identity\n" unless $runner_pid =~ /\A[0-9]+\z/ && $runner_start =~ /\A[0-9]+\z/;
+die "Invalid control directory\n" unless $control_dir =~ m{\A/} && $control_dir !~ /\0/;
+die "Missing command separator\n" unless (shift // "") eq "--";
+die "Missing action command\n" unless @ARGV;
+
+setsid() >= 0 or die "Could not detach action supervisor: $!\n";
+$SIG{CHLD} = "DEFAULT";
+my $stop_requested = 0;
+$SIG{HUP} = $SIG{INT} = $SIG{TERM} = sub { $stop_requested = 1 };
+
+my $child = fork();
+die "Could not fork action timeout: $!\n" unless defined $child;
+if ($child == 0) {
+  $SIG{HUP} = $SIG{INT} = $SIG{TERM} = "DEFAULT";
+  setpgid(0, 0) or POSIX::_exit(126);
+  exec({"/usr/bin/timeout"} "/usr/bin/timeout", "--kill-after=1s", "--", $duration,
+    "/usr/bin/bash", "-c", 'exec 6>&- 7>&- 8>&- 9>&-; exec "$@"', "bash", @ARGV)
+    or POSIX::_exit(126);
+}
+
+# Only the timeout group owns the capture pipe. Keeping another writer in the
+# supervisor would make a completed action look like it leaked stdout.
+open STDOUT, ">", "/dev/null" or die "Could not detach supervisor output: $!\n";
+open STDERR, ">", "/dev/null" or exit 125;
+
+# Establish the group before publishing its identity. The child performs the
+# same operation, so EACCES here only means it already crossed exec safely.
+if (!setpgid($child, $child) && $! != EACCES && $! != EPERM) {
+  kill "KILL", $child;
+  waitpid($child, 0);
+  marker("$control_dir/exited");
+  exit 125;
+}
+if (!marker("$control_dir/timeout.$child")) {
+  kill "KILL", -$child;
+  waitpid($child, 0);
+  exit 125;
+}
+
+my $exited_marked = 0;
+while (1) {
+  $stop_requested = 1 if -e "$control_dir/stop";
+  $stop_requested = 1 unless process_is_live($runner_pid, $runner_start);
+
+  if ($stop_requested) {
+    kill "TERM", -$child;
+    sleep 0.05;
+    kill "KILL", -$child;
+    my $waited = waitpid($child, 0);
+    exit 125 if $waited != $child;
+    exit_for_wait_status($?);
+  }
+
+  if (child_is_zombie($child)) {
+    if (!$exited_marked) {
+      if (!marker("$control_dir/exited")) {
+        kill "KILL", -$child;
+        waitpid($child, 0);
+        exit 125;
+      }
+      $exited_marked = 1;
+    }
+    if (-e "$control_dir/release") {
+      my $waited = waitpid($child, 0);
+      exit 125 if $waited != $child;
+      exit_for_wait_status($?);
+    }
+  }
+  sleep 0.01;
+}

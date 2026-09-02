@@ -4,11 +4,13 @@ set -euo pipefail
 umask 077
 
 PLUGIN_ID="anothadev.omachord"
-SELF_PATH=$(realpath -e -- "${BASH_SOURCE[0]}")
-FS_HELPER="$(dirname -- "$SELF_PATH")/omachord-fs"
+SELF_PATH=$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")
+FS_HELPER="${SELF_PATH%/*}/omachord-fs"
+ACTION_SUPERVISOR="${SELF_PATH%/*}/omachord-action-supervisor"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 OMARCHY_CONFIG_DIR="${OMACHORD_OMARCHY_CONFIG_DIR:-$HOME/.config/omarchy}"
+TOGGLES_DIR="$STATE_HOME/omarchy/toggles"
 
 CONFIG_FILE="${OMACHORD_CONFIG_FILE:-$OMARCHY_CONFIG_DIR/omachord.json}"
 STATE_DIR="${OMACHORD_STATE_DIR:-$STATE_HOME/omarchy/omachord}"
@@ -43,6 +45,8 @@ SETTER_TYPES=(nightlight dnd stay-awake theme brightness)
 ACTIVE_DIR="$STATE_DIR/active"
 MAX_CONFIG_BYTES=1048576
 MAX_CONTROL_BYTES=1048576
+MAX_TOGGLE_SCAN_BYTES=524288
+MAX_TOGGLE_ENTRIES=4096
 LOCK_TIMEOUT=${OMACHORD_LOCK_TIMEOUT:-10}
 CONTROL_TIMEOUT=${OMACHORD_CONTROL_TIMEOUT:-5s}
 CONFIG_SNAPSHOT_FINGERPRINT=""
@@ -51,14 +55,10 @@ CONFIG_LOAD_ERROR_CODE=invalid-config
 LAST_ERROR=""
 ROLLBACK_WARNING=""
 PRESERVED_CONFLICT=""
-ARCHIVED_FILE=""
-RETIRED_FILE=""
-ACTIVE_TIMEOUT_PID=""
+ACTIVE_SUPERVISOR_PID=""
 ACTIVE_COLLECTOR_PID=""
 ACTIVE_CAPTURE_DIR=""
-ACTIVE_ACTION_PGID=""
-ACTIVE_GUARD_PID=""
-ACTIVE_DONE_FILE=""
+ACTIVE_STOP_FILE=""
 
 default_config() {
   printf '%s\n' '{"version":1,"routines":[]}'
@@ -492,33 +492,17 @@ ensure_private_directory_tree() {
 }
 
 secure_optional_private_directory() {
-  local path=$1 label=${2:-state directory} mode
-  [[ -e $path || -L $path ]] || return 0
-  if [[ -L $path || ! -d $path || ! -O $path ]]; then
-    LAST_ERROR="The $label must be a user-owned directory: $path"
-    return 1
-  fi
-  mode=$(stat -c %a -- "$path" 2>/dev/null) || mode=""
-  if { [[ $mode != 700 ]] && ! chmod -h 700 -- "$path"; } \
-    || [[ -L $path || ! -d $path || ! -O $path ]] \
-    || [[ $(stat -c %a -- "$path" 2>/dev/null) != 700 ]]; then
-    LAST_ERROR="Could not secure the $label: $path"
+  local path=$1 label=${2:-state directory} error
+  if ! error=$("$FS_HELPER" secure-dir "$path" optional 2>&1); then
+    LAST_ERROR=${error:-"Could not secure the $label: $path"}
     return 1
   fi
 }
 
 secure_optional_private_file() {
-  local path=$1 mode=${2:-600} label=${3:-state file} current_mode
-  [[ -e $path || -L $path ]] || return 0
-  if [[ -L $path || ! -f $path || ! -O $path ]]; then
-    LAST_ERROR="The $label must be a user-owned regular file: $path"
-    return 1
-  fi
-  current_mode=$(stat -c %a -- "$path" 2>/dev/null) || current_mode=""
-  if { [[ $current_mode != "$mode" ]] && ! chmod -h "$mode" -- "$path"; } \
-    || [[ -L $path || ! -f $path || ! -O $path ]] \
-    || [[ $(stat -c %a -- "$path" 2>/dev/null) != "$mode" ]]; then
-    LAST_ERROR="Could not secure the $label: $path"
+  local path=$1 mode=${2:-600} label=${3:-state file} error
+  if ! error=$("$FS_HELPER" secure-file "$path" "$mode" optional 2>&1); then
+    LAST_ERROR=${error:-"Could not secure the $label: $path"}
     return 1
   fi
 }
@@ -541,31 +525,6 @@ prepare_private_subdirectory() {
   ensure_private_directory_tree "$1" "private state directory"
 }
 
-ensure_private_file() {
-  local path=$1 mode=${2:-600} label=${3:-state file} directory temporary
-  directory=$(dirname -- "$path")
-  if [[ -L $directory || ! -d $directory || ! -O $directory \
-    || $(stat -c %a -- "$directory" 2>/dev/null) != 700 ]]; then
-    LAST_ERROR="The parent of the $label is not a private directory: $directory"
-    return 1
-  fi
-  if [[ ! -e $path && ! -L $path ]]; then
-    temporary=$(mktemp "$directory/.omachord-state.XXXXXXXX") || {
-      LAST_ERROR="Could not create the $label: $path"
-      return 1
-    }
-    if ! chmod "$mode" -- "$temporary"; then
-      rm -f -- "$temporary"
-      LAST_ERROR="Could not secure the $label: $path"
-      return 1
-    fi
-    if ! mv --update=none-fail --no-copy -T -- "$temporary" "$path" >/dev/null 2>&1; then
-      rm -f -- "$temporary"
-    fi
-  fi
-  secure_optional_private_file "$path" "$mode" "$label"
-}
-
 private_fd_matches_file() {
   local fd=$1 path=$2 expected observed
   if [[ -L $path || ! -f $path || ! -O $path ]]; then
@@ -582,6 +541,7 @@ private_fd_matches_file() {
 
 safe_open_private_fd() {
   local destination_fd=$1 path=$2 mode=${3:-600} label=${4:-state file}
+  local create=${5:-false}
   local error_file opener_job opener_out opener_in opener_pid opener_fd open_ok=true
   if [[ ! -x $FS_HELPER ]]; then
     LAST_ERROR="The Omachord filesystem helper is unavailable"
@@ -591,7 +551,11 @@ safe_open_private_fd() {
     LAST_ERROR="Could not prepare to open the $label"
     return 1
   }
-  coproc OMACHORD_OPENER { "$FS_HELPER" open-file "$path" "$mode" 2>"$error_file"; }
+  if [[ $create == true ]]; then
+    coproc OMACHORD_OPENER { "$FS_HELPER" open-file "$path" "$mode" create 2>"$error_file"; }
+  else
+    coproc OMACHORD_OPENER { "$FS_HELPER" open-file "$path" "$mode" 2>"$error_file"; }
+  fi
   opener_job=$OMACHORD_OPENER_PID
   opener_out=${OMACHORD_OPENER[0]}
   opener_in=${OMACHORD_OPENER[1]}
@@ -630,8 +594,7 @@ safe_open_private_fd() {
 
 acquire_config_lock() {
   local mode=${1:-exclusive}
-  ensure_private_file "$LOCK_FILE" 600 "configuration lock" || return 1
-  safe_open_private_fd 9 "$LOCK_FILE" 600 "configuration lock" || return 1
+  safe_open_private_fd 9 "$LOCK_FILE" 600 "configuration lock" true || return 1
   if [[ $mode == shared ]]; then
     flock -s -w "$LOCK_TIMEOUT" 9 || { exec 9>&-; LAST_ERROR="Timed out locking configuration state"; return 1; }
   else
@@ -642,8 +605,7 @@ acquire_config_lock() {
 
 acquire_log_lock() {
   local mode=${1:-exclusive}
-  ensure_private_file "$STATE_DIR/log.lock" 600 "run-history lock" || return 1
-  safe_open_private_fd 8 "$STATE_DIR/log.lock" 600 "run-history lock" || return 1
+  safe_open_private_fd 8 "$STATE_DIR/log.lock" 600 "run-history lock" true || return 1
   if [[ $mode == shared ]]; then
     flock -s -w "$LOCK_TIMEOUT" 8 || { exec 8>&-; LAST_ERROR="Timed out locking run history"; return 1; }
   else
@@ -657,240 +619,88 @@ acquire_log_lock() {
 
 write_atomic() {
   local source=$1 destination=$2 mode=${3:-600}
-  local directory temporary
-  directory=$(dirname -- "$destination")
-  mkdir -p "$directory" || return 1
-  temporary=$(mktemp "$directory/.omachord.XXXXXX") || return 1
-  if ! cp -- "$source" "$temporary" || ! chmod "$mode" "$temporary" || ! mv -fT -- "$temporary" "$destination"; then
-    rm -f -- "$temporary"
+  local policy result error
+  policy=$(mutation_policy "$destination")
+  if ! result=$("$FS_HELPER" atomic-write "$destination" "$mode" "$policy" "$STATE_DIR" <"$source"); then
+    error=$(jq -r '.error // empty' <<<"$result" 2>/dev/null || true)
+    LAST_ERROR=${error:-"Could not write $destination"}
     return 1
   fi
 }
 
-file_identity() {
-  stat -c '%d:%i' -- "$1" 2>/dev/null
-}
-
-archive_inode() {
-  local source=$1 destination=$2 kind=$3 stable_fingerprint=${4:-}
-  local directory target base adjacent current
-  ARCHIVED_FILE=""
-  [[ -f $source && ! -L $source ]] || {
-    ARCHIVED_FILE=$source
+write_unique_private() {
+  local source=$1 directory=$2 prefix=$3 mode=${4:-600}
+  local result error path
+  if ! result=$("$FS_HELPER" unique-write "$directory" "$prefix" "$mode" <"$source"); then
+    error=$(jq -r '.error // empty' <<<"$result" 2>/dev/null || true)
+    LAST_ERROR=${error:-"Could not write a unique file in $directory"}
+    return 1
+  fi
+  path=$(jq -r '.path // empty' <<<"$result" 2>/dev/null || true)
+  [[ -n $path ]] || {
+    LAST_ERROR="The filesystem helper did not return a unique file path"
     return 1
   }
-  base=$(basename -- "$destination" | tr -c 'A-Za-z0-9._-' '_')
-  target=""
-  directory="$STATE_DIR/$kind"
-  if prepare_private_subdirectory "$directory"; then
-    target=$(mktemp "$directory/$base.XXXXXXXX") || target=""
-    if [[ -n $target ]]; then
-      rm -f -- "$target"
-      if ! ln -- "$source" "$target" 2>/dev/null; then
-        rm -f -- "$target"
-        target=""
-      fi
-    fi
-  fi
-
-  if [[ -z $target ]]; then
-    adjacent=$(dirname -- "$source")/.omachord-$kind
-    if prepare_private_subdirectory "$adjacent"; then
-      target=$(mktemp "$adjacent/$base.XXXXXXXX") || target=""
-      if [[ -n $target ]]; then
-        rm -f -- "$target"
-        if ! ln -- "$source" "$target" 2>/dev/null; then
-          rm -f -- "$target"
-          target=""
-        fi
-      fi
-    fi
-  fi
-
-  if [[ -z $target ]]; then
-    # Leaving the private transaction path in place is safer than unlinking an
-    # inode that another process may still be writing.
-    ARCHIVED_FILE=$source
-    return 0
-  fi
-
-  rm -f -- "$source"
-  ARCHIVED_FILE=$target
-  if [[ $kind == retired && -n $stable_fingerprint ]]; then
-    current=$(fingerprint_for_destination "$target" "$destination")
-    if [[ $current == "$stable_fingerprint" ]] \
-      && command -v fuser >/dev/null 2>&1 \
-      && ! fuser -sI "$target" 2>/dev/null \
-      && [[ $(fingerprint_for_destination "$target" "$destination") == "$stable_fingerprint" ]]; then
-      rm -f -- "$target"
-      ARCHIVED_FILE=""
-    fi
-  fi
-}
-
-preserve_concurrent_file() {
-  local source=$1 destination=$2
-  archive_inode "$source" "$destination" conflicts || true
-  PRESERVED_CONFLICT=$ARCHIVED_FILE
-}
-
-retire_file() {
-  local source=$1 destination=$2 stable_fingerprint=${3:-}
-  if ! archive_inode "$source" "$destination" retired "$stable_fingerprint"; then
-    RETIRED_FILE=""
-    return 1
-  fi
-  RETIRED_FILE=$ARCHIVED_FILE
-  return 0
-}
-
-exchange_back_or_preserve() {
-  local swapped=$1 destination=$2 stable_fingerprint=${3:-}
-  if mv --exchange --no-copy -T -- "$swapped" "$destination"; then
-    retire_file "$swapped" "$destination" "$stable_fingerprint" || true
-    return 0
-  fi
-  preserve_concurrent_file "$swapped" "$destination"
-  return 1
+  printf '%s\n' "$path"
 }
 
 atomic_replace_if_fingerprint() {
   local source=$1 destination=$2 expected_current=$3 mode=${4:-600}
-  local directory temporary expected_new observed
+  local policy result error
   PRESERVED_CONFLICT=""
-  RETIRED_FILE=""
-  directory=$(dirname -- "$destination")
-  mkdir -p "$directory" || return 1
-  temporary=$(mktemp "$directory/.omachord.XXXXXXXX") || return 1
-  if ! cp -- "$source" "$temporary" || ! chmod "$mode" "$temporary"; then
-    rm -f -- "$temporary"
-    return 1
-  fi
-  expected_new=$(fingerprint_for_destination "$temporary" "$destination")
-
-  if [[ $expected_current == missing ]]; then
-    transaction_critical_begin
-    if ! mv --update=none-fail --no-copy -T -- "$temporary" "$destination" >/dev/null 2>&1; then
-      transaction_critical_end
-      rm -f -- "$temporary"
-      LAST_ERROR="A file appeared during the transaction: $destination"
-      return 1
-    fi
+  policy=$(mutation_policy "$destination")
+  transaction_critical_begin
+  if result=$("$FS_HELPER" cas-write "$destination" "$mode" "$expected_current" \
+      "$policy" "$STATE_DIR" <"$source"); then
     transaction_critical_end
-  elif [[ $expected_current == file:* ]]; then
-    transaction_critical_begin
-    if ! mv --exchange --no-copy -T -- "$temporary" "$destination" >/dev/null 2>&1; then
-      transaction_critical_end
-      rm -f -- "$temporary"
-      LAST_ERROR="Could not atomically exchange $destination"
-      return 1
-    fi
-    observed=$(fingerprint_for_destination "$temporary" "$destination")
-    if [[ $observed != "$expected_current" ]]; then
-      exchange_back_or_preserve "$temporary" "$destination" "$expected_new" || true
-      transaction_critical_end
-      LAST_ERROR="A file changed during the transaction: $destination"
-      [[ -z $PRESERVED_CONFLICT ]] || LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
-      return 1
-    fi
-    if ! retire_file "$temporary" "$destination" "$expected_current"; then
-      transaction_critical_end
-      LAST_ERROR="Could not preserve the replaced file at $temporary"
-      return 1
-    fi
-    transaction_critical_end
-  else
-    rm -f -- "$temporary"
-    LAST_ERROR="Refusing to replace a non-regular file: $destination"
-    return 1
+    return 0
   fi
+  transaction_critical_end
+  error=$(jq -r '.error // empty' <<<"$result" 2>/dev/null || true)
+  PRESERVED_CONFLICT=$(jq -r '.preserved // empty' <<<"$result" 2>/dev/null || true)
+  LAST_ERROR=${error:-"Could not atomically replace $destination"}
+  if [[ -n $PRESERVED_CONFLICT ]]; then
+    LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
+  fi
+  return 1
+}
 
-  if [[ $(fingerprint_for_destination "$destination" "$destination") != "$expected_new" ]]; then
-    LAST_ERROR="A file changed while completing the transaction: $destination"
+atomic_remove_if_fingerprint() {
+  local destination=$1 expected_current=$2
+  local policy result error
+  PRESERVED_CONFLICT=""
+  policy=$(mutation_policy "$destination")
+  transaction_critical_begin
+  if result=$("$FS_HELPER" cas-remove "$destination" "$expected_current" \
+      "$policy" "$STATE_DIR"); then
+    transaction_critical_end
+    return 0
+  fi
+  transaction_critical_end
+  error=$(jq -r '.error // empty' <<<"$result" 2>/dev/null || true)
+  PRESERVED_CONFLICT=$(jq -r '.preserved // empty' <<<"$result" 2>/dev/null || true)
+  LAST_ERROR=${error:-"Could not atomically remove $destination"}
+  if [[ -n $PRESERVED_CONFLICT ]]; then
+    LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
+  fi
+  return 1
+}
+
+remove_file_atomic() {
+  local destination=$1 policy result error
+  policy=$(mutation_policy "$destination")
+  if ! result=$("$FS_HELPER" remove-file "$destination" "$policy" "$STATE_DIR"); then
+    error=$(jq -r '.error // empty' <<<"$result" 2>/dev/null || true)
+    LAST_ERROR=${error:-"Could not remove $destination"}
     return 1
   fi
 }
 
-atomic_remove_if_fingerprint() {
-  local destination=$1 expected_current=$2 snapshot_slot=${3:-}
-  local directory placeholder quarantine observed placeholder_identity placeholder_fingerprint moved_identity
-  PRESERVED_CONFLICT=""
-  RETIRED_FILE=""
-
-  if [[ $expected_current == missing ]]; then
-    if [[ $(fingerprint_for_destination "$destination" "$destination") != missing ]]; then
-      LAST_ERROR="A file appeared during the transaction: $destination"
-      return 1
-    fi
-    return 0
-  fi
-  if [[ $expected_current != file:* ]]; then
-    LAST_ERROR="Refusing to remove a non-regular file: $destination"
-    return 1
-  fi
-
-  directory=$(dirname -- "$destination")
-  placeholder=$(mktemp "$directory/.omachord-remove.XXXXXXXX") || return 1
-  chmod 600 "$placeholder" || { rm -f -- "$placeholder"; return 1; }
-  placeholder_identity=$(file_identity "$placeholder")
-  placeholder_fingerprint=$(fingerprint_for_destination "$placeholder" "$destination")
-  [[ -z $snapshot_slot ]] || SNAPSHOT_EXPECTED[$snapshot_slot]=$placeholder_fingerprint
-
-  transaction_critical_begin
-  if ! mv --exchange --no-copy -T -- "$placeholder" "$destination" >/dev/null 2>&1; then
-    transaction_critical_end
-    rm -f -- "$placeholder"
-    LAST_ERROR="Could not atomically exchange $destination for removal"
-    return 1
-  fi
-  observed=$(fingerprint_for_destination "$placeholder" "$destination")
-  if [[ $observed != "$expected_current" ]]; then
-    exchange_back_or_preserve "$placeholder" "$destination" "$placeholder_fingerprint" || true
-    transaction_critical_end
-    LAST_ERROR="A file changed during the transaction: $destination"
-    [[ -z $PRESERVED_CONFLICT ]] || LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
-    return 1
-  fi
-
-  if ! retire_file "$placeholder" "$destination" "$expected_current"; then
-    transaction_critical_end
-    LAST_ERROR="Could not preserve $destination before removal"
-    return 1
-  fi
-  quarantine=$(mktemp "$directory/.omachord-unlink.XXXXXXXX") || {
-    transaction_critical_end
-    LAST_ERROR="Could not prepare an atomic removal for $destination"
-    return 1
-  }
-  rm -f -- "$quarantine"
-  if ! mv --update=none-fail --no-copy -T -- "$destination" "$quarantine" >/dev/null 2>&1; then
-    transaction_critical_end
-    LAST_ERROR="A file changed while removing $destination"
-    return 1
-  fi
-  moved_identity=$(file_identity "$quarantine")
-  if [[ $moved_identity != "$placeholder_identity" \
-    || $(fingerprint_for_destination "$quarantine" "$destination") != "$placeholder_fingerprint" ]]; then
-    if ! mv --update=none-fail --no-copy -T -- "$quarantine" "$destination" >/dev/null 2>&1; then
-      preserve_concurrent_file "$quarantine" "$destination"
-    fi
-    transaction_critical_end
-    LAST_ERROR="A file changed while removing $destination"
-    [[ -z $PRESERVED_CONFLICT ]] || LAST_ERROR="$LAST_ERROR. A concurrent version was preserved at $PRESERVED_CONFLICT"
-    return 1
-  fi
-
-  [[ -z $snapshot_slot ]] || SNAPSHOT_EXPECTED[$snapshot_slot]=missing
-  if ! retire_file "$quarantine" "$destination" "$placeholder_fingerprint"; then
-    transaction_critical_end
-    LAST_ERROR="Could not preserve the removed transaction inode at $quarantine"
-    return 1
-  fi
-  transaction_critical_end
-  if [[ $(fingerprint_for_destination "$destination" "$destination") != missing ]]; then
-    LAST_ERROR="A file appeared while completing removal: $destination"
-    return 1
-  fi
+mutation_policy() {
+  case $1 in
+    "$STATE_DIR"|"$STATE_DIR"/*|"$RUN_LOCK_DIR"|"$RUN_LOCK_DIR"/*) printf '%s\n' private ;;
+    *) printf '%s\n' owned ;;
+  esac
 }
 
 lua_quote() {
@@ -1009,8 +819,7 @@ write_connection_disabled() {
 }
 
 remove_connection_disabled() {
-  secure_optional_private_file "$DISABLED_FILE" 600 "connection preference" || return 1
-  rm -f -- "$DISABLED_FILE" || {
+  remove_file_atomic "$DISABLED_FILE" || {
     LAST_ERROR="Could not enable automatic connection"
     return 1
   }
@@ -1105,22 +914,17 @@ prepare_run_lock_dir() {
 }
 
 backup_bindings() {
-  local backup
+  local backup source
   [[ -e $BINDINGS_FILE || -L $BINDINGS_FILE ]] || return 0
   if [[ -L $BINDINGS_FILE || ! -f $BINDINGS_FILE || ! -O $BINDINGS_FILE ]]; then
     LAST_ERROR="Bindings must be a user-owned regular file: $BINDINGS_FILE"
     return 1
   fi
-  prepare_private_subdirectory "$STATE_DIR/backups" || {
-    LAST_ERROR="Could not create the bindings backup directory"
-    return 1
-  }
-  backup=$(mktemp "$STATE_DIR/backups/bindings.lua.XXXXXXXX") || {
-    LAST_ERROR="Could not create a bindings backup"
-    return 1
-  }
-  if ! cp -pT -- "$BINDINGS_FILE" "$backup"; then
-    rm -f -- "$backup"
+  source=$BINDINGS_FILE
+  if [[ -n $SNAPSHOT_DIR && -f $SNAPSHOT_DIR/bindings.exists ]]; then
+    source="$SNAPSHOT_DIR/bindings"
+  fi
+  if ! backup=$(write_unique_private "$source" "$STATE_DIR/backups" "bindings.lua." 600); then
     LAST_ERROR="Could not back up $BINDINGS_FILE"
     return 1
   fi
@@ -1415,15 +1219,13 @@ transaction_remove() {
   if [[ -n $SNAPSHOT_DIR ]]; then
     index=$(snapshot_index "$path") || return 1
     baseline=${SNAPSHOT_BASELINES[$index]}
-    if ! atomic_remove_if_fingerprint "$path" "$baseline" "$index"; then
+    SNAPSHOT_EXPECTED[$index]=missing
+    if ! atomic_remove_if_fingerprint "$path" "$baseline"; then
       return 1
     fi
     return 0
   fi
-  if ! rm -f -- "$path"; then
-    LAST_ERROR="Could not remove $path"
-    return 1
-  fi
+  remove_file_atomic "$path"
 }
 
 snapshot_restore() {
@@ -1671,10 +1473,6 @@ install_desktop_entry() {
 
 append_loader() {
   local allow_existing=${1:-true} source mode
-  mkdir -p "$HYPR_DIR" || {
-    LAST_ERROR="Could not create $HYPR_DIR"
-    return 1
-  }
   if [[ -L $BINDINGS_FILE || (-e $BINDINGS_FILE && ! -f $BINDINGS_FILE) ]]; then
     LAST_ERROR="Refusing to replace a non-regular file: $BINDINGS_FILE"
     return 1
@@ -2179,6 +1977,26 @@ command_commands() {
   ] | unique_by(.route) | sort_by(.route)' <<<"$metadata"
 }
 
+command_toggles() {
+  local capture error
+  [[ $# -eq 0 ]] || fail "Usage: omachord toggles" usage
+  capture=$(mktemp) || fail "Could not prepare the toggle scan" toggles-unavailable
+  if ! PATH=/usr/bin:/bin OMACHORD_ACTION_TIMEOUT="$CONTROL_TIMEOUT" \
+      OMACHORD_CAPTURE_MODE=head OMACHORD_CAPTURE_LIMIT="$MAX_TOGGLE_SCAN_BYTES" \
+      run_capture "$capture" "$FS_HELPER" list-toggles "$TOGGLES_DIR" \
+        "$MAX_TOGGLE_ENTRIES" "$MAX_TOGGLE_SCAN_BYTES"; then
+    error=$(/usr/bin/jq -r '.error // empty' "$capture" 2>/dev/null || true)
+    [[ -n $error ]] || error=$LAST_ERROR
+    rm -f -- "$capture"
+    fail "${error:-Could not list Omarchy toggles}" toggles-unavailable
+  fi
+  if ! /usr/bin/jq -ce '.names | select(type == "array")' "$capture"; then
+    rm -f -- "$capture"
+    fail "The toggle probe returned an invalid response" toggles-unavailable
+  fi
+  rm -f -- "$capture"
+}
+
 rotate_log() {
   local size temporary
   secure_optional_private_file "$LOG_FILE" 600 "run history" || return 1
@@ -2208,17 +2026,18 @@ log_run() {
     --arg error "$error" \
     '{timestamp:$timestamp,routineId:$routineId,trigger:$trigger,status:$status,durationMs:$durationMs,error:$error}')
   acquire_log_lock exclusive || return 1
-  if ! ensure_private_file "$LOG_FILE" 600 "run history" || ! rotate_log; then
+  if ! rotate_log; then
     exec 8>&-
     return 1
   fi
-  if ! safe_open_private_fd 6 "$LOG_FILE" 600 "run history"; then
+  if ! safe_open_private_fd 6 "$LOG_FILE" 600 "run history" true; then
     exec 6>&- 8>&-
     LAST_ERROR=${LAST_ERROR:-"Could not open run history"}
     return 1
   fi
   if ! private_fd_matches_file 6 "$LOG_FILE" \
-    || ! printf '%s\n' "$entry" >>"/proc/self/fd/6"; then
+    || ! printf '%s\n' "$entry" >>"/proc/self/fd/6" \
+    || ! "$FS_HELPER" fsync-fd 6; then
     exec 6>&- 8>&-
     LAST_ERROR="Could not append run history"
     return 1
@@ -2229,25 +2048,19 @@ log_run() {
 
 cleanup_active_action() {
   set +e
-  if [[ -n $ACTIVE_ACTION_PGID ]]; then
-    kill -TERM -- "-$ACTIVE_ACTION_PGID" 2>/dev/null || true
-    sleep 0.05 6>&- 7>&- 8>&- 9>&-
-    kill -KILL -- "-$ACTIVE_ACTION_PGID" 2>/dev/null || true
+  if [[ -n $ACTIVE_STOP_FILE ]] && ! : >"$ACTIVE_STOP_FILE"; then
+    [[ -z $ACTIVE_SUPERVISOR_PID ]] || kill -TERM "$ACTIVE_SUPERVISOR_PID" 2>/dev/null
   fi
-  [[ -z $ACTIVE_TIMEOUT_PID ]] || wait "$ACTIVE_TIMEOUT_PID" 2>/dev/null
+  [[ -z $ACTIVE_SUPERVISOR_PID ]] || wait "$ACTIVE_SUPERVISOR_PID" 2>/dev/null
   if [[ -n $ACTIVE_COLLECTOR_PID ]]; then
     kill "$ACTIVE_COLLECTOR_PID" 2>/dev/null
     wait "$ACTIVE_COLLECTOR_PID" 2>/dev/null
   fi
-  [[ -z $ACTIVE_DONE_FILE ]] || : >"$ACTIVE_DONE_FILE"
-  [[ -z $ACTIVE_GUARD_PID ]] || wait "$ACTIVE_GUARD_PID" 2>/dev/null
   [[ -z $ACTIVE_CAPTURE_DIR ]] || rm -rf -- "$ACTIVE_CAPTURE_DIR"
-  ACTIVE_TIMEOUT_PID=""
+  ACTIVE_SUPERVISOR_PID=""
   ACTIVE_COLLECTOR_PID=""
   ACTIVE_CAPTURE_DIR=""
-  ACTIVE_ACTION_PGID=""
-  ACTIVE_GUARD_PID=""
-  ACTIVE_DONE_FILE=""
+  ACTIVE_STOP_FILE=""
   set -e
 }
 
@@ -2271,19 +2084,6 @@ process_is_live() {
     && [[ ${fields[0]} != Z && ${fields[19]} == "$expected_start" ]]
 }
 
-action_guard() {
-  local parent_pid=$1 parent_start=$2 action_pgid=$3 done_file=$4
-  while [[ ! -e $done_file ]]; do
-    if ! process_is_live "$parent_pid" "$parent_start"; then
-      kill -TERM -- "-$action_pgid" 2>/dev/null || true
-      sleep 0.05
-      kill -KILL -- "-$action_pgid" 2>/dev/null || true
-      return 0
-    fi
-    sleep 0.02
-  done
-}
-
 abort_active_routine() {
   local status=$1
   trap - HUP INT TERM
@@ -2294,7 +2094,7 @@ abort_active_routine() {
 run_capture() {
   local output_file=$1
   shift
-  local status capture_dir fifo collector timeout_pid guard_pid parent_pid parent_start done_file index output_size
+  local status capture_dir fifo collector supervisor_pid supervisor_start parent_pid parent_start exited_file stop_file release_file index output_size should_stop=false
   local capture_mode=${OMACHORD_CAPTURE_MODE:-tail} capture_limit=${OMACHORD_CAPTURE_LIMIT:-4096}
   LAST_ERROR=""
   capture_dir=$(mktemp -d) || {
@@ -2303,7 +2103,9 @@ run_capture() {
   }
   ACTIVE_CAPTURE_DIR=$capture_dir
   fifo="$capture_dir/output"
-  done_file="$capture_dir/done"
+  exited_file="$capture_dir/exited"
+  stop_file="$capture_dir/stop"
+  release_file="$capture_dir/release"
   if ! mkfifo "$fifo"; then
     rm -rf -- "$capture_dir"
     ACTIVE_CAPTURE_DIR=""
@@ -2318,27 +2120,44 @@ run_capture() {
   collector=$!
   ACTIVE_COLLECTOR_PID=$collector
   set +e
-  # The timeout supervisor retains lock descriptors if this runner is killed;
-  # the action itself receives them closed and cannot leak them to descendants.
-  timeout --kill-after=1s -- "${OMACHORD_ACTION_TIMEOUT:-30s}" \
-    bash -c 'exec 6>&- 7>&- 8>&- 9>&-; exec "$@"' bash "$@" \
-    8>&- 9>&- >"$fifo" 2>&1 &
-  timeout_pid=$!
-  ACTIVE_TIMEOUT_PID=$timeout_pid
-  ACTIVE_ACTION_PGID=$timeout_pid
   parent_pid=$BASHPID
   parent_start=$(process_start_time "$parent_pid") || {
-    LAST_ERROR="Could not start the action cleanup guard"
+    LAST_ERROR="Could not identify the action runner"
     cleanup_active_action
     return 1
   }
-  setsid "$SELF_PATH" __action-guard "$parent_pid" "$parent_start" \
-    "$timeout_pid" "$done_file" 8>&- 9>&- </dev/null >/dev/null 2>&1 &
-  guard_pid=$!
-  ACTIVE_GUARD_PID=$guard_pid
-  ACTIVE_DONE_FILE=$done_file
-  wait "$timeout_pid"
-  status=$?
+  if [[ ! -x $ACTION_SUPERVISOR ]]; then
+    LAST_ERROR="The Omachord action supervisor is unavailable"
+    cleanup_active_action
+    return 1
+  fi
+  # The detached supervisor retains lock descriptors and an unreaped process-
+  # group leader until every possible group signal has been sent.
+  "$ACTION_SUPERVISOR" "$parent_pid" "$parent_start" "$capture_dir" \
+    "${OMACHORD_ACTION_TIMEOUT:-30s}" -- "$@" \
+    8>&- 9>&- < /dev/null >"$fifo" 2>&1 &
+  supervisor_pid=$!
+  ACTIVE_SUPERVISOR_PID=$supervisor_pid
+  ACTIVE_STOP_FILE=$stop_file
+  for ((index = 0; index < 20; index++)); do
+    supervisor_start=$(process_start_time "$supervisor_pid" 2>/dev/null) && break
+    sleep 0.001 6>&- 7>&- 8>&- 9>&-
+  done
+  if [[ -z ${supervisor_start:-} ]]; then
+    wait "$supervisor_pid" 2>/dev/null
+    LAST_ERROR="The action supervisor did not start"
+    cleanup_active_action
+    return 1
+  fi
+  while [[ ! -e $exited_file ]]; do
+    if ! process_is_live "$supervisor_pid" "$supervisor_start"; then
+      wait "$supervisor_pid" 2>/dev/null
+      LAST_ERROR="The action supervisor stopped unexpectedly"
+      cleanup_active_action
+      return 1
+    fi
+    sleep 0.01 6>&- 7>&- 8>&- 9>&-
+  done
   output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
 
   # A detached child that closed stdout is intentional and does not block the
@@ -2347,12 +2166,19 @@ run_capture() {
     kill -0 "$collector" 2>/dev/null || break
     sleep 0.01 6>&- 7>&- 8>&- 9>&-
   done
+  output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
   if kill -0 "$collector" 2>/dev/null \
     || { [[ $capture_mode == head ]] && ((output_size > capture_limit)); }; then
-    kill -TERM -- "-$timeout_pid" 2>/dev/null || true
-    sleep 0.05 6>&- 7>&- 8>&- 9>&-
-    kill -KILL -- "-$timeout_pid" 2>/dev/null || true
+    should_stop=true
   fi
+  if [[ $should_stop == true ]]; then
+    : >"$stop_file" || kill -TERM "$supervisor_pid" 2>/dev/null || true
+  elif ! : >"$release_file"; then
+    should_stop=true
+    kill -TERM "$supervisor_pid" 2>/dev/null || true
+  fi
+  wait "$supervisor_pid"
+  status=$?
   for ((index = 0; index < 20; index++)); do
     kill -0 "$collector" 2>/dev/null || break
     sleep 0.01 6>&- 7>&- 8>&- 9>&-
@@ -2363,22 +2189,15 @@ run_capture() {
   wait "$collector" 2>/dev/null || true
   output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
   if [[ $capture_mode == head ]] && ((output_size > capture_limit)); then
-    kill -TERM -- "-$timeout_pid" 2>/dev/null || true
-    sleep 0.05 6>&- 7>&- 8>&- 9>&-
-    kill -KILL -- "-$timeout_pid" 2>/dev/null || true
     status=125
     LAST_ERROR="Command output exceeds the $capture_limit byte limit"
   fi
-  : >"$done_file"
-  wait "$guard_pid" 2>/dev/null || true
   set -e
   rm -rf -- "$capture_dir"
-  ACTIVE_TIMEOUT_PID=""
+  ACTIVE_SUPERVISOR_PID=""
   ACTIVE_COLLECTOR_PID=""
   ACTIVE_CAPTURE_DIR=""
-  ACTIVE_ACTION_PGID=""
-  ACTIVE_GUARD_PID=""
-  ACTIVE_DONE_FILE=""
+  ACTIVE_STOP_FILE=""
   if ((status == 0)); then
     return 0
   fi
@@ -2393,11 +2212,8 @@ run_capture() {
 
 execute_microphone_action() {
   local action=$1 output=$2 muted sound_path
-  if ! ensure_private_file "$RUN_LOCK_DIR/resource-microphone.lock" 600 "microphone resource lock"; then
-    return 1
-  fi
   safe_open_private_fd 6 "$RUN_LOCK_DIR/resource-microphone.lock" 600 \
-    "microphone resource lock" || return 1
+    "microphone resource lock" true || return 1
   if ! private_fd_matches_file 6 "$RUN_LOCK_DIR/resource-microphone.lock" \
     || ! flock -x -w "$LOCK_TIMEOUT" 6 \
     || ! private_fd_matches_file 6 "$RUN_LOCK_DIR/resource-microphone.lock"; then
@@ -2738,7 +2554,7 @@ write_snapshot() {
 remove_snapshot() {
   local path
   path=$(snapshot_path "$1")
-  if ! rm -f -- "$path"; then
+  if ! remove_file_atomic "$path"; then
     LAST_ERROR="Could not remove the completed activation snapshot: $path"
     return 1
   fi
@@ -2749,8 +2565,7 @@ claim_activation_snapshot() {
   local routine_id=$1 claims=$2 snapshot=$3 other state=0 conflict
   ACTIVATION_ERROR_CODE="unsafe-state"
   prepare_run_lock_dir || return 1
-  ensure_private_file "$RUN_LOCK_DIR/resource-setters.lock" 600 "setter claim lock" || return 1
-  safe_open_private_fd 6 "$RUN_LOCK_DIR/resource-setters.lock" 600 "setter claim lock" || return 1
+  safe_open_private_fd 6 "$RUN_LOCK_DIR/resource-setters.lock" 600 "setter claim lock" true || return 1
   if ! flock -x -w "$LOCK_TIMEOUT" 6; then
     exec 6>&-
     LAST_ERROR="Timed out locking setter claims"
@@ -2823,9 +2638,8 @@ lock_routine() {
   local routine_id=$1
   LOCK_ERROR_CODE=lock-error
   prepare_run_lock_dir || return 1
-  ensure_private_file "$RUN_LOCK_DIR/routine-$routine_id.lock" 600 "routine lock" || return 1
   safe_open_private_fd 7 "$RUN_LOCK_DIR/routine-$routine_id.lock" 600 \
-    "routine lock" || return 1
+    "routine lock" true || return 1
   if ! private_fd_matches_file 7 "$RUN_LOCK_DIR/routine-$routine_id.lock"; then
     exec 7>&-
     return 1
@@ -3488,13 +3302,8 @@ migrate_shell_widget_entry() {
   fi
   mode=${baseline#file:}
   mode=${mode%%:*}
-  backup=$(mktemp "$STATE_DIR/backups/shell.json.XXXXXXXX") || {
+  if ! backup=$(write_unique_private "$snapshot" "$STATE_DIR/backups" "shell.json." 600); then
     rm -f -- "$snapshot"
-    LAST_ERROR="Could not prepare the shell config backup"
-    return 1
-  }
-  if ! cp -- "$snapshot" "$backup" || ! chmod 600 "$backup"; then
-    rm -f -- "$snapshot" "$backup"
     LAST_ERROR="Could not back up $SHELL_CONFIG_FILE"
     return 1
   fi
@@ -3616,7 +3425,7 @@ command_widget() {
   fi
   if [[ $subcommand == forget ]]; then
     if ((marker_state == 0)); then
-      rm -f -- "$WIDGET_FILE" || fail "Could not remove the bar widget record" unsafe-state
+      remove_file_atomic "$WIDGET_FILE" || fail "Could not remove the bar widget record" unsafe-state
     fi
     jq -cn '{ok:true,recorded:false}'
     return
@@ -3695,6 +3504,7 @@ Commands:
   disconnect
   bindings
   commands
+  toggles               Valid top-level Omarchy toggle flags
   run <routine-id> [manual|shortcut|test]
                         Stateful routines toggle between active and inactive
   activate <routine-id> [manual|shortcut|test]
@@ -3727,11 +3537,6 @@ require_prepared_state() {
 main() {
   local command=${1:-}
   shift || true
-  if [[ $command == __action-guard ]]; then
-    [[ $# -eq 4 ]] || exit 2
-    action_guard "$@"
-    return
-  fi
   clear_trigger_context
   case $command in
     status) require_prepared_state; command_status "$@" ;;
@@ -3755,6 +3560,7 @@ main() {
       bindings_json || fail "Could not read Omarchy keybindings" bindings-unavailable
       ;;
     commands) command_commands "$@" ;;
+    toggles) command_toggles "$@" ;;
     run) require_prepared_state; command_run "$@" ;;
     activate) require_prepared_state; command_activate "$@" ;;
     deactivate) require_prepared_state; command_deactivate "$@" ;;

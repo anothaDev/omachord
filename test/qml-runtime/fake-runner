@@ -32,6 +32,13 @@ case "${1:-} ${2:-}" in
       printf '%s\n' '[]'
     fi
     ;;
+  "toggles ")
+    if [[ -f $dir/state/omarchy/toggles/scratch ]]; then
+      printf '%s\n' '["scratch"]'
+    else
+      printf '%s\n' '[]'
+    fi
+    ;;
   "activate "*)
     if [[ ! -f $dir/logs-returned ]]; then
       printf '%s\n' 'EARLY activation before logs' >>"$calls"

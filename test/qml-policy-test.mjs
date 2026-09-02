@@ -78,6 +78,24 @@ assert.match(service, /parsed\.committed !== true/,
   "the service must ignore uncommitted configurations")
 assert.doesNotMatch(service, /path: root\.stateDir\s*\n\s*watchChanges: true/,
   "the service must not watch the whole state directory and feed read-only probe metadata back into itself")
+assert.doesNotMatch(service, /command:\s*\["find"/,
+  "the service must not launch an ambient unbounded toggle scan")
+assert.doesNotMatch(panel, /command:\s*\["find"/,
+  "the panel must not launch an ambient unbounded toggle scan")
+assert.match(service, /command:\s*\[root\.runnerPath,\s*"toggles"\]/,
+  "the service must use the bounded runner toggle probe")
+assert.match(panel, /command:\s*\[root\.runnerPath,\s*"toggles"\]/,
+  "the panel must use the bounded runner toggle probe")
+assert.match(panel, /if \(!togglesProc\.running && togglesProc\.startPending\)[\s\S]*?rebuildToggleOptions\(null\)/,
+  "a toggle-probe start failure must clear stale panel options")
+assert.match(service, /property var toggles: Object\.create\(null\)/,
+  "toggle names must be stored in a prototype-safe map")
+assert.match(service, /applyToggles\(exitCode === 0 \?[^:]+: null\)/,
+  "a failed toggle probe must clear stale condition state")
+assert.match(service, /configuredRunnerPath\.indexOf\("\/"\) === 0/,
+  "the service must ignore relative runner overrides")
+assert.match(panel, /configuredRunnerPath\.indexOf\("\/"\) === 0/,
+  "the panel must ignore relative runner overrides")
 const card = fs.readFileSync(path.join(root, "ActionCard.qml"), "utf8")
 assert.doesNotMatch(card, /\broot\./,
   "ActionCard must stay list-agnostic and only speak to the editor through signals")
