@@ -4,15 +4,13 @@
 
 <h1 align="center">Omachord</h1>
 
+![Omachord showcase](https://github.com/user-attachments/assets/da875923-efa2-4466-831d-262dcdd77f3b)
+
 Omachord is an accessibility-oriented shortcut and routine composer for Omarchy. It shows the effective Hyprland shortcut catalogue and lets you compose app-owned routines from ordered actions, one optional keyboard shortcut, Omarchy event hooks, and conditions such as a time period or a Wi-Fi network. Routines can change Omarchy state (night light, do not disturb, stay awake, theme, brightness) and put it back when they end; a routine that does is a *mode* that can be on or off.
 
 The panel, the condition service, and a small bar widget run inside the existing `omarchy-shell` process. A separate Bash/`jq` runner owns validation, persistence, integration, and execution so shortcuts, hooks, and restores keep working when the panel is closed.
 
 Omachord started with an old microphone automation. While revisiting it, something clicked: composable, restorable routines felt like a missing piece in the OS.
-
-## Showcase
-
-https://github.com/user-attachments/assets/2935cbac-b03b-42b8-9f2b-069006ace5c3
 
 ## Requirements
 
