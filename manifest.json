@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "anothadev.omachord",
   "name": "Omachord",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "author": "anothaDev",
   "description": "Compose keyboard shortcuts, Omarchy automations, and condition-driven routines with restore.",
   "kinds": [
