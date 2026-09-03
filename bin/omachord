@@ -2361,12 +2361,12 @@ setter_value_from_action() {
   jq -r 'if (.value | type) == "number" then (.value | floor | tostring) else (.value | tostring) end' <<<"$1"
 }
 
-# Mirrors the normalization in omarchy-theme-set so a current theme name
-# compares equal to the slug a routine stores.
+# Reconstructs the strict slug emitted by omarchy-theme-current so a current
+# theme name compares equal to the slug a routine stores.
 theme_slug_from_name() {
   local value
   value=$(trim "$1")
-  sed -E 's/<[^>]+>//g' <<<"$value" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'
+  printf '%s\n' "$value" | tr '[:upper:]' '[:lower:]' | tr ' ' '-'
 }
 
 # Reads one setter's current value into SETTER_VALUE as a normalized string

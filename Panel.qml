@@ -837,7 +837,8 @@ Item {
     for (var i = 0; i < lines.length; i++) {
       var name = lines[i].trim()
       if (!name) continue
-      rows.push({ value: Model.themeSlug(name), label: name })
+      var value = Model.themeSlug(name)
+      if (value) rows.push({ value: value, label: name })
     }
     themeOptions = rows
   }

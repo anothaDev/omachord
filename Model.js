@@ -482,7 +482,8 @@ function isFlagName(value) {
 }
 
 function themeSlug(name) {
-  return String(name || "").replace(/<[^>]+>/g, "").toLowerCase().replace(/ /g, "-")
+  var slug = String(name || "").toLowerCase().replace(/ /g, "-")
+  return isThemeSlug(slug) ? slug : ""
 }
 
 function isThemeSlug(value) {

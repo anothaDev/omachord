@@ -1738,6 +1738,15 @@ assert_missing "$TEST_ROOT/shell-state/dnd" "interrupted setter was not restored
 rm -f "$failure_result" "$TEST_ROOT/interrupted-result"
 pass "write-ahead setter recovery"
 
+printf '%s\n' 'Gruvbox<script>' >"$TEST_ROOT/theme.name"
+if "$RUNNER" activate focus test >"$activate_result"; then
+  fail "a malformed current theme should refuse activation"
+fi
+jq -e '.code == "action-failed" and (.error | test("theme"))' "$activate_result" >/dev/null
+assert_missing "$TEST_ROOT/shell-state/dnd" "malformed theme output left earlier setters applied"
+assert_missing "$ACTIVE_DIR/focus.json" "malformed theme output left a snapshot"
+printf '%s\n' Gruvbox >"$TEST_ROOT/theme.name"
+
 touch "$TEST_ROOT/brightness-garbage"
 if "$RUNNER" activate focus test >"$activate_result"; then
   fail "an unreadable setter should refuse activation"

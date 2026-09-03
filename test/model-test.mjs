@@ -143,7 +143,10 @@ assert.equal(model.validateRoutineDetails({ ...stateful, keepUntil: { minutes: 0
 assert.equal(model.validateRoutineDetails({ ...stateful, conditions: [{ type: "wifi", ssids: [] }] }), "Condition 1: Add at least one Wi-Fi network")
 assert.equal(model.validateRoutineDetails(stateful), "")
 assert.equal(model.themeSlug("Tokyo Night"), "tokyo-night")
-assert.equal(model.themeSlug("Catppuccin <Latte>"), "catppuccin-")
+assert.equal(model.themeSlug("Catppuccin <Latte>"), "")
+assert.equal(model.themeSlug("<<script>script>"), "")
+assert.equal(model.themeSlug("A  B"), "")
+assert.equal(model.themeSlug("x".repeat(101)), "")
 
 for (const key of model.TEMPLATE_KEYS) {
   const template = model.templateRoutine(key, [])
