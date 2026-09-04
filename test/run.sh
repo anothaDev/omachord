@@ -22,6 +22,7 @@ omarchy plugin validate "$ROOT"
 QT_QPA_PLATFORM=offscreen qmltestrunner -input "$ROOT/test/qml" -o -,txt
 qmllint -I /usr/share/omarchy/shell \
   "$ROOT/Panel.qml" \
+  "$ROOT/PanelScrollBar.qml" \
   "$ROOT/PlainTextButton.qml" \
   "$ROOT/ChoicePicker.qml" \
   "$ROOT/RoutineEditor.qml" \

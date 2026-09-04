@@ -11,6 +11,21 @@ ShellRoot {
   property int viewIndex: 0
   property int width: Number(Quickshell.env("RENDER_W") || 1080)
   property int height: Number(Quickshell.env("RENDER_H") || 720)
+  property bool longShortcutFixture: Quickshell.env("RENDER_LONG_SHORTCUTS") === "1"
+  property bool shortcutFixtureInjected: false
+
+  function shortcutFixture() {
+    var rows = []
+    for (var i = 1; i <= 40; i++) {
+      rows.push({
+        keys: "SUPER + " + String(i),
+        description: "Example shortcut " + String(i),
+        editable: true,
+        managed: i % 7 === 0
+      })
+    }
+    return rows
+  }
 
   function findWindow(item) {
     for (var i = 0; i < item.data.length; i++) {
@@ -32,6 +47,13 @@ ShellRoot {
     interval: Number(Quickshell.env("RENDER_SETTLE") || 2500)
     onTriggered: {
       var view = root.views[root.viewIndex]
+      if (view === "shortcuts" && root.longShortcutFixture && !root.shortcutFixtureInjected) {
+        root.panel.bindings = root.shortcutFixture()
+        root.shortcutFixtureInjected = true
+        interval = 200
+        restart()
+        return
+      }
       var path = root.outDir + "/" + view + ".png"
       console.log("RENDER_STEP grabbing " + view + " visible=" + root.win.visible + " size=" + root.win.width + "x" + root.win.height)
       var content = root.win.contentItem

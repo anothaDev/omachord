@@ -690,6 +690,10 @@ Item {
         clip: true
         contentWidth: availableWidth
         QQC.ScrollBar.horizontal.policy: QQC.ScrollBar.AlwaysOff
+        QQC.ScrollBar.vertical: PanelScrollBar {
+          foreground: root.foreground
+          accent: root.accent
+        }
 
         Column {
           id: form

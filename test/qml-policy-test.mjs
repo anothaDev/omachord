@@ -9,6 +9,29 @@ const editor = fs.readFileSync(path.join(root, "RoutineEditor.qml"), "utf8")
 const picker = fs.readFileSync(path.join(root, "ChoicePicker.qml"), "utf8")
 const recorder = fs.readFileSync(path.join(root, "ShortcutRecorder.qml"), "utf8")
 const popup = fs.readFileSync(path.join(root, "RoutinePopup.qml"), "utf8")
+const scrollBarPath = path.join(root, "PanelScrollBar.qml")
+
+assert.ok(fs.existsSync(scrollBarPath),
+  "panel scrolling must use the shared Omachord scrollbar")
+const scrollBar = fs.readFileSync(scrollBarPath, "utf8")
+assert.match(scrollBar, /radius:\s*Math\.min\(Style\.cornerRadius,\s*Style\.space\(1\)\)/,
+  "the scrollbar handle must stay sharp instead of becoming a rounded Qt pill")
+assert.match(scrollBar, /background:\s*Item\s*\{\s*\}/,
+  "the scrollbar track must stay transparent")
+assert.match(editor, /QQC\.ScrollBar\.vertical:\s*PanelScrollBar\s*\{/,
+  "the routine editor must use the shared Omachord scrollbar")
+assert.match(panel, /id:\s*shortcutList[\s\S]*?QQC\.ScrollBar\.vertical:\s*PanelScrollBar\s*\{/,
+  "the shortcuts list must expose the shared draggable Omachord scrollbar")
+assert.match(panel, /id:\s*activityScroll[\s\S]*?QQC\.ScrollBar\.vertical:\s*PanelScrollBar\s*\{/,
+  "the activity view must use the same Omachord scrollbar style")
+assert.match(panel, /id:\s*shortcutWheel[\s\S]*?acceptedDevices:\s*PointerDevice\.Mouse/,
+  "the shortcuts list must accelerate mouse-wheel scrolling")
+assert.match(panel, /id:\s*shortcutWheel[\s\S]*?event\.pixelDelta\.y\s*!==\s*0[\s\S]*?event\.accepted\s*=\s*false/,
+  "precision touchpad scrolling must remain native")
+assert.match(panel, /SmoothedAnimation\s*\{[\s\S]*?property:\s*"contentY"/,
+  "shortcut wheel movement must ease between scroll positions")
+assert.match(panel, /function clampShortcutContentY\(value\)[\s\S]*?Math\.max\(minimum,\s*Math\.min\(maximum,\s*value\)\)/,
+  "smooth shortcut scrolling must remain inside the list bounds")
 
 assert.match(panel, /write\(root\.pendingPayload \+ "\\n"\)\s*\n\s*stdinEnabled = false/,
   "apply must close stdin after writing its bounded payload")

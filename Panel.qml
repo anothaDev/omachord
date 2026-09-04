@@ -1488,14 +1488,75 @@ Item {
                     currentIndex: -1
                     keyNavigationEnabled: false
                     activeFocusOnTab: true
+                    property real wheelTargetY: contentY
+
+                    function clampShortcutContentY(value) {
+                      var minimum = originY
+                      var maximum = Math.max(minimum, minimum + contentHeight - height)
+                      return Math.max(minimum, Math.min(maximum, value))
+                    }
+
+                    function stopShortcutWheelAnimation() {
+                      shortcutWheelAnimation.stop()
+                      wheelTargetY = clampShortcutContentY(contentY)
+                    }
+
+                    function queueShortcutWheel(angleDelta) {
+                      if (!shortcutWheelAnimation.running)
+                        wheelTargetY = clampShortcutContentY(contentY)
+                      wheelTargetY = clampShortcutContentY(
+                        wheelTargetY - angleDelta / 120 * Style.space(150))
+                      shortcutWheelAnimation.restart()
+                    }
+
                     Accessible.role: Accessible.List
                     Accessible.name: "Shortcuts"
+                    QQC.ScrollBar.vertical: PanelScrollBar {
+                      id: shortcutScrollBar
+                      foreground: root.fg
+                      accent: root.accent
+                      onPressedChanged: if (pressed) shortcutList.stopShortcutWheelAnimation()
+                    }
+                    WheelHandler {
+                      id: shortcutWheel
+                      enabled: shortcutList.contentHeight > shortcutList.height
+                      target: null
+                      orientation: Qt.Vertical
+                      acceptedDevices: PointerDevice.Mouse
+                      blocking: true
+                      onWheel: function(event) {
+                        // High-resolution touchpads already provide pixel-perfect
+                        // movement through ListView; only accelerate wheel notches.
+                        if (event.pixelDelta.y !== 0 || event.angleDelta.y === 0) {
+                          shortcutList.stopShortcutWheelAnimation()
+                          event.accepted = false
+                          return
+                        }
+                        shortcutList.queueShortcutWheel(event.angleDelta.y)
+                        event.accepted = true
+                      }
+                    }
+                    SmoothedAnimation {
+                      id: shortcutWheelAnimation
+                      target: shortcutList
+                      property: "contentY"
+                      to: shortcutList.wheelTargetY
+                      velocity: Style.space(900)
+                      duration: 170
+                      maximumEasingTime: 80
+                    }
+                    onContentYChanged: if (!shortcutWheelAnimation.running)
+                      wheelTargetY = clampShortcutContentY(contentY)
+                    onContentHeightChanged: wheelTargetY = clampShortcutContentY(wheelTargetY)
+                    onHeightChanged: wheelTargetY = clampShortcutContentY(wheelTargetY)
                     onActiveFocusChanged: if (activeFocus && currentIndex < 0 && count > 0) currentIndex = 0
                     Keys.onPressed: function(event) {
                       if (event.key === Qt.Key_Down || event.text === "j") {
+                        stopShortcutWheelAnimation()
                         currentIndex = Math.min(count - 1, currentIndex + 1)
                         event.accepted = true
                       } else if (event.key === Qt.Key_Up || event.text === "k") {
+                        stopShortcutWheelAnimation()
                         currentIndex = Math.max(0, currentIndex - 1)
                         event.accepted = true
                       } else if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
@@ -1510,7 +1571,8 @@ Item {
                       required property int index
                       readonly property bool actionable: !modelData.managed && modelData.editable !== false && root.configLoaded && !root.mutating
                       readonly property bool hot: ListView.isCurrentItem && ListView.view.activeFocus
-                      width: shortcutList.width
+                      width: shortcutList.width - (shortcutScrollBar.size < 1
+                        ? shortcutScrollBar.width + Style.space(2) : 0)
                       implicitHeight: Math.max(Style.space(46), bindingText.implicitHeight + Style.space(16))
                       radius: Style.cornerRadius
                       foreground: root.fg
@@ -1899,6 +1961,10 @@ Item {
                 clip: true
                 contentWidth: availableWidth
                 QQC.ScrollBar.horizontal.policy: QQC.ScrollBar.AlwaysOff
+                QQC.ScrollBar.vertical: PanelScrollBar {
+                  foreground: root.fg
+                  accent: root.accent
+                }
                 Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
 
                 Column {
