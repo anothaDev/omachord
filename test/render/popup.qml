@@ -23,7 +23,9 @@ ShellRoot {
           id: popup
           anchors.fill: parent
           anchors.margins: 16
-          success: "#68c98b"; integrationOn: true
+          success: "#68c98b"
+          integrationOn: Quickshell.env("WIDGET_OFF") !== "1"
+          integrationBusy: Quickshell.env("WIDGET_BUSY") === "1"
           rows: Quickshell.env("WIDGET_EMPTY") === "1" ? [] : root.sampleRows
           cursorIndex: 0
         }

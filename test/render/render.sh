@@ -13,7 +13,8 @@ WORK=$(mktemp -d "$TEST_TMP/omachord-render.XXXXXX")
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -p "$OUT"
 rm -f -- "$OUT/routines.png" "$OUT/shortcuts.png" "$OUT/activity.png" \
-  "$OUT/routines-compact.png" "$OUT/popup.png" "$OUT/popup-empty.png"
+  "$OUT/routines-compact.png" "$OUT/popup.png" "$OUT/popup-empty.png" \
+  "$OUT/popup-busy.png" "$OUT/popup-off.png"
 
 ln -s /usr/share/omarchy/shell/Commons "$WORK/Commons"
 ln -s /usr/share/omarchy/shell/Ui "$WORK/Ui"
@@ -44,8 +45,10 @@ render panel.qml RENDER_DONE RENDER_OUT="$WORK" RENDER_VIEWS=routines RENDER_W=7
 mv -- "$WORK/routines.png" "$OUT/routines-compact.png"
 render popup.qml WIDGET_DONE WIDGET_OUT="$OUT/popup.png"
 render popup.qml WIDGET_DONE WIDGET_OUT="$OUT/popup-empty.png" WIDGET_EMPTY=1
+render popup.qml WIDGET_DONE WIDGET_OUT="$OUT/popup-busy.png" WIDGET_EMPTY=1 WIDGET_BUSY=1
+render popup.qml WIDGET_DONE WIDGET_OUT="$OUT/popup-off.png" WIDGET_EMPTY=1 WIDGET_OFF=1
 
-for image in routines.png shortcuts.png activity.png routines-compact.png popup.png popup-empty.png; do
+for image in routines.png shortcuts.png activity.png routines-compact.png popup.png popup-empty.png popup-busy.png popup-off.png; do
   [[ -s $OUT/$image ]] || { printf 'Missing render: %s\n' "$image" >&2; exit 1; }
   printf '%s\n' "$image"
 done

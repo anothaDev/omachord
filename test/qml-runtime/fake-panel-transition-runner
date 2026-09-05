@@ -1,0 +1,49 @@
+#!/bin/bash
+# Isolated Panel UI fixture. Plans and release gates live only in the test dir.
+set -euo pipefail
+
+test_dir=${OMACHORD_QML_TEST_DIR:?}
+operation=${1:-}
+if [[ $operation = config ]]; then operation="config-${2:-}"; fi
+plan="$test_dir/$operation-plan.json"
+case $operation in
+  status)
+    reply='{"ok":true,"connected":false,"ownedConnection":false,"integrationComplete":false,"connectionEnabled":false,"configValid":true}'
+    ;;
+  config-snapshot)
+    reply='{"ok":true,"committed":true,"revision":"sha256:base","config":{"version":1,"routines":[{"id":"alpha","name":"Alpha","enabled":true,"triggers":[],"actions":[{"type":"dnd","value":true,"restore":true}]},{"id":"beta","name":"Beta","enabled":true,"triggers":[],"actions":[{"type":"dnd","value":true,"restore":true}]}]}}'
+    ;;
+  config-apply)
+    IFS= read -r payload
+    reply=$(jq -cn --argjson config "$payload" '{ok:true,revision:"sha256:applied",config:$config}')
+    ;;
+  connect) reply='{"ok":true,"connected":true,"revision":"sha256:connected"}' ;;
+  disconnect) reply='{"ok":true,"connected":false}' ;;
+  run) reply='{"ok":true,"state":"activated"}' ;;
+  deactivate) reply='{"ok":true,"state":"deactivated","restored":1}' ;;
+  active|bindings|commands|logs|toggles) reply='[]' ;;
+  *) printf 'Unexpected fixture call: %s\n' "$*" >&2; exit 1 ;;
+esac
+
+tag=default
+exit_code=0
+block=false
+if [[ -f $plan ]]; then
+  # Capture the entire plan before blocking, just as a probe captures a snapshot.
+  captured=$(cat -- "$plan")
+  tag=$(jq -r '.tag // "default"' <<<"$captured")
+  exit_code=$(jq -r '.exitCode // 0' <<<"$captured")
+  block=$(jq -r '.block // false' <<<"$captured")
+  reply=$(jq -r --arg fallback "$reply" 'if has("raw") then .raw elif has("reply") then (.reply | tojson) else $fallback end' <<<"$captured")
+fi
+printf '%s START %s %s\n' "$operation" "$tag" "$*" >>"$test_dir/transition-calls.log"
+if [[ $block = true ]]; then
+  for _ in {1..1000}; do
+    [[ -e $test_dir/release-$tag ]] && break
+    sleep 0.01
+  done
+  [[ -e $test_dir/release-$tag ]] || { printf 'Fixture gate timed out: %s\n' "$tag" >&2; exit 1; }
+fi
+printf '%s\n' "$reply"
+printf '%s END %s\n' "$operation" "$tag" >>"$test_dir/transition-calls.log"
+exit "$exit_code"

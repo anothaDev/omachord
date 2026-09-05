@@ -23,6 +23,9 @@ Column {
   property bool serviceAvailable: true
   property bool integrationOn: true
   property bool integrationBusy: false
+  // The bar owns a virtual row/footer cursor. Its key dispatcher must retain
+  // focus even after clicking this popup's integration switch.
+  property Item keyboardFocusTarget: null
   property string summary: ""
   property int cursorIndex: -1
   property bool cursorOnFooter: false
@@ -97,21 +100,27 @@ Column {
       }
     }
     trailingControl: Component {
-      ToggleSwitch {
+      PendingSwitch {
+        objectName: "popupIntegrationSwitch"
+        activeFocusOnTab: !popup.keyboardFocusTarget && interactive
+        onActiveFocusChanged: {
+          if (activeFocus && popup.keyboardFocusTarget) popup.keyboardFocusTarget.forceActiveFocus()
+        }
         checked: popup.integrationOn
         busy: popup.integrationBusy
-        interactive: popup.serviceAvailable && !popup.integrationBusy
+        interactive: popup.serviceAvailable
           && (!popup.integrationOn || popup.rows.length === 0)
         foreground: popup.foreground
         accent: popup.accent
         onToggled: popup.integrationToggled()
         Accessible.role: Accessible.CheckBox
         Accessible.name: popup.integrationOn ? "Turn Omachord off" : "Turn Omachord on"
+        Accessible.description: busy ? "Changing Omachord state" : ""
         Accessible.checkable: true
         Accessible.checked: checked
         PanelToolTip {
           visible: parent.containsMouse
-          text: popup.integrationOn
+          text: popup.integrationBusy ? "Changing Omachord state..." : popup.integrationOn
             ? (popup.rows.length
               ? "End active routines before turning Omachord off"
               : "Turn Omachord off. Saved routines stay.")

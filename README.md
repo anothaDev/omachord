@@ -12,24 +12,61 @@ The panel, the condition service, and a small bar widget run inside the existing
 
 Omachord started with an old microphone automation. While revisiting it, something clicked: composable, restorable routines felt like a missing piece in the OS.
 
+## What's new in 0.4.0
+
+- **More responsive routines:** independent manual routine requests can run concurrently, and busy indicators stay with the affected routine instead of blocking the whole panel.
+- **Stable loading switches:** pending toggles show a spinner without changing size, and ignore repeat activation until the operation settles. The panel and bar share connection progress.
+- **Faster connection changes:** redundant status probes are avoided, and shortcut processing and inode safety checks are batched while retaining locking, rollback, and durability protections.
+- **Faster saves:** enable/disable edits to different routines are batched, and edits that leave generated shortcuts unchanged avoid an unnecessary Hyprland reload when the existing integration is verified.
+- **Faster shortcut browsing:** the catalogue is parsed in batches and has a styled scrollbar.
+- **Non-blocking microphone cues:** mute/unmute sounds no longer hold routine locks while playing.
+- **Omachord branding:** a branded application launcher icon, plus a transparent ring/keycap mark in the bar and popup that follows their theme foreground colors.
+
 ## Requirements
 
 - Omarchy 4.0.2
 - Hyprland 0.56.2
 - Quickshell 0.3.1
-- Bash, Perl, GNU coreutils, `jq`, `flock`, `fuser`, `timeout`, `wpctl`, and `paplay`
+- Bash, Perl, GNU awk (`gawk`), GNU coreutils 9.5+, `jq`, `flock`, `fuser`, `timeout`, `wpctl`, and `paplay`
 
 These are present in a standard Omarchy installation.
 
 ## Install
 
-After publishing the repository, install and enable the plugin from Git:
+### With the plugin manager
+
+Install and enable the plugin from Git:
 
 ```bash
 omarchy plugin add https://github.com/anothaDev/omachord.git --enable
 ```
 
-Open the panel:
+### Manual install (without the plugin manager)
+
+You can manage the checkout yourself without using any `omarchy plugin` commands. This still loads Omachord as an Omarchy Shell plugin; the panel, bar, and automatic condition service are not standalone applications. For command-line use without loading a plugin, see [Runner only](#runner-only-no-shell-plugin).
+
+Clone the complete repository into the shell's user-plugin directory:
+
+```bash
+mkdir -p "$HOME/.config/omarchy/plugins"
+git clone -- https://github.com/anothaDev/omachord.git \
+  "$HOME/.config/omarchy/plugins/anothadev.omachord"
+```
+
+If that destination already exists, do not overwrite it or nest another clone inside it. Use the existing installation or choose the development symlink approach below. Keep the complete checkout: the runner needs its sibling helpers and bundled assets.
+
+Review the checkout before enabling it; plugins run as unsandboxed code in your shell. Then ask the shell to discover it and add its bar entry:
+
+```bash
+omarchy-shell shell rescanPlugins
+omarchy bar put anothadev.omachord --section center --after omarchy.indicators
+```
+
+Wait for the plugin scan to finish before the second command if the shell reports `not ready`. The bar entry enables the panel and condition service too. By default the icon is hidden while no routine is active; [enable `alwaysShow`](#bar-widget) if you want it visible all the time.
+
+### Open Omachord
+
+For either installation method, open the panel with:
 
 ```bash
 omarchy-shell shell summon anothadev.omachord '{}'
@@ -37,7 +74,52 @@ omarchy-shell shell summon anothadev.omachord '{}'
 
 Omachord enables its Hyprland integration on first use, so the panel opens with the **Omachord** switch on and saved routines are live immediately. Turn that switch off to pause shortcuts, hooks, and conditions while keeping every routine; that choice persists across shell restarts until you turn it on again.
 
-Upgrading from 0.2.0: restart the shell once (`omarchy restart shell`) so the shell reads the manifest's new bar-widget kind and the new QML files. The service then places the bar widget once; see [Bar widget](#bar-widget).
+Once connected, you can also open **Omachord** from the application launcher. If the service is not available after installation, restart the shell with `omarchy restart shell` and try again.
+
+### Runner only (no shell plugin)
+
+If you do not want to load a shell plugin at all, keep the repository outside the plugin directory and use the runner directly. This still targets the Omarchy/Hyprland environment listed above; it is not a generic Linux installation. Choose this instead of the plugin installation, not alongside it: both use the same routine configuration and integration files.
+
+```bash
+mkdir -p "$HOME/.local/share"
+git clone -- https://github.com/anothaDev/omachord.git "$HOME/.local/share/omachord"
+
+export OMACHORD_RUNNER_PATH="$HOME/.local/share/omachord/bin/omachord"
+export PATH="$HOME/.local/share/omachord/bin:$PATH"
+omachord connect
+omachord status
+```
+
+Keep both exports in your shell startup file if you want to use `omachord` in future terminals. `OMACHORD_RUNNER_PATH` ensures generated shortcuts and hooks call this checkout rather than the default plugin path. Do not move the checkout while connected; disconnect first.
+
+`connect` creates the same managed shortcuts, hooks, desktop entry, and icon described under [Integration](#integration), but it does **not** load a shell plugin. Manual runs, shortcuts, hooks, and explicit restore work. There is **no panel or bar popup, automatic condition evaluation, or automatic expiry handling** without the resident service. The installed desktop entry also needs the panel plugin, so it cannot open a window in this mode. End active modes yourself with `omachord deactivate <id>`.
+
+To create or edit routines, take a revisioned snapshot and edit a separate draft, not the canonical config:
+
+```bash
+snapshot=$(omachord config snapshot) &&
+  revision=$(printf '%s\n' "$snapshot" | jq -er '.revision') &&
+  draft=$(mktemp --suffix=.json) &&
+  printf '%s\n' "$snapshot" | jq '.config' > "$draft"
+# Edit the JSON in "$draft" with your editor, then:
+omachord config validate < "$draft" &&
+  omachord config apply "$revision" < "$draft"
+```
+
+Stop if any command fails. Keep the original revision while editing; if apply reports `stale-config`, take a fresh snapshot and reconcile your edits rather than forcing an overwrite. Only apply routine JSON you trust: it can execute commands as your user. See [Routines](#routines) and [Runner commands](#runner-commands) for execution and restore behavior.
+
+### Updating a manual checkout
+
+For a manual shell-plugin installation:
+
+```bash
+git -C "$HOME/.config/omarchy/plugins/anothadev.omachord" pull --ff-only
+omarchy restart shell
+```
+
+For a runner-only installation, use `git -C "$HOME/.local/share/omachord" pull --ff-only` instead, then `omachord connect` to repair or refresh owned integration if needed. These commands follow the repository's default branch, which can include unreleased changes. If you want a published version, select an existing tag from [Releases](https://github.com/anothaDev/omachord/releases) instead. Do not discard local edits to force an update.
+
+When upgrading a shell-plugin installation to 0.4.0, restart Omarchy Shell so it discovers the new QML components. Existing routines are retained. If an older installation still has the generic launcher icon, run `~/.config/omarchy/plugins/anothadev.omachord/bin/omachord connect` to migrate the owned launcher integration (or use **Repair** if the panel offers it). Upgrades from 0.2.0 also receive the bar-widget placement described below.
 
 ## Development
 
@@ -62,10 +144,12 @@ On first use, Omachord automatically performs its system-integration transaction
 - Backs up `~/.config/hypr/bindings.lua`.
 - Adds one marked optional-loader line to `bindings.lua`.
 - Generates app-owned shortcut Lua and six guarded hook dispatchers.
-- Installs the Omachord desktop entry.
+- Installs the Omachord desktop entry and its branded SVG under the user's hicolor icon theme.
 - Reloads Hyprland, verifies the generated configuration, and rolls back on failure.
 
 Turning the **Omachord** switch off removes generated integration and persists that preference. Saving while it is off only updates the routine document and never reactivates integration. Turning it on performs the same guarded transaction again, including the required Hyprland reload. The same switch sits in the bar popup.
+
+Switches keep a fixed size and replace their thumb with a spinner while an operation is pending. Repeat activation is ignored until it finishes; other routine rows can join a pending enable/disable batch. The bar and panel share connection progress, and the confirmed on/off state is published before the switch becomes available again. A disabled control that is not waiting for an operation (for example, a live routine switch with unsaved edits) does not spin.
 
 ## Panel
 
@@ -152,6 +236,12 @@ The status names every active routine and, for each condition routine, one `deta
 
 | Command | Purpose |
 | --- | --- |
+| `omachord status` | Inspect configuration and integration health |
+| `omachord connect [revision]` | Connect or repair owned integration |
+| `omachord disconnect` | End active routines and remove owned integration, keeping configuration and history |
+| `omachord config snapshot` | Read configuration with its compare-and-swap revision |
+| `omachord config validate` | Validate candidate JSON from stdin without saving |
+| `omachord config apply <revision>` | Apply candidate JSON from stdin only if the loaded revision still matches |
 | `omachord run <id> [manual\|shortcut\|test]` | Run a routine; toggles a stateful routine |
 | `omachord activate <id> [manual\|shortcut\|test]` | Activate without toggling; already-active routines report `alreadyActive` |
 | `omachord deactivate <id> [manual\|shortcut\|test]` | End a routine from its activation record |
@@ -159,6 +249,8 @@ The status names every active routine and, for each condition routine, one `deta
 | `omachord toggles` | List valid top-level Omarchy toggle flags as bounded JSON |
 | `omachord logs [limit]` | Run history; stateful routines log `activated` and `deactivated` entries |
 | `omachord widget ensure\|status\|forget` | Place the bar widget once through the Omarchy shell, inspect or clear that record |
+
+In a plugin installation, the runner is at `~/.config/omarchy/plugins/anothadev.omachord/bin/omachord`; use that full path if `omachord` is not on your `PATH`.
 
 The microphone template calls `omarchy audio input mute` first, preserving Omarchy's OSD and hardware LED behavior. It then reads the resulting microphone state and starts the configured mute or live cue asynchronously, so playback does not hold routine/configuration locks or delay completion.
 
@@ -185,7 +277,7 @@ Routines are trusted local configuration and are not sandboxed.
 - `exec` and `shell` can invoke `sudo`; cached credentials may allow a routine to elevate without another password prompt.
 - Omarchy command choices exclude commands marked hidden or `requires_sudo`, but command metadata is not a security boundary; a selected command can still open a privilege prompt internally.
 - Child output is bounded, and foreground program-execution stages have a 30-second default timeout. A detached supervisor keeps the action process-group identity pinned through final descendant cleanup. Explicit delays are capped at five minutes.
-- The only file the runner edits outside Hyprland's and its own is `~/.config/omarchy/shell.json`, once, to move this plugin's entry onto the bar on an install upgraded from 0.2.0; the previous file is kept under `~/.local/state/omarchy/omachord/backups/`.
+- Integration manages the files listed below, including hook dispatchers, the desktop entry, and the launcher icon. It also edits `~/.config/omarchy/shell.json` once when moving this plugin's entry onto the bar on an install upgraded from 0.2.0; the previous file is kept under `~/.local/state/omarchy/omachord/backups/`.
 - Setter writes are argv-literal calls to Omarchy tools. Activation records are validated before use; a record that fails validation stops `run`, `activate`, `deactivate`, and `active` with `unsafe-state` instead of being treated as inactive.
 - A theme setter makes Omarchy fire its `theme-set` hook, which re-enters the runner. The per-routine lock reports the originating routine as busy, so a routine cannot recurse into itself.
 - Saves use revision-based compare-and-swap, so a stale panel cannot overwrite a newer configuration.
@@ -220,13 +312,24 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Remove
 
-Turn Omachord off before removing the plugin:
+For a plugin-manager installation, turn Omachord off before removing the plugin:
 
 1. Open Omachord and turn the **Omachord** switch off.
 2. Confirm that the sidebar reports **Off**.
 3. Run `omarchy plugin remove anothadev.omachord`.
 
-Turning Omachord off removes generated integration while preserving routines and run history. If desired, those retained files can then be removed from `~/.config/omarchy/omachord.json` and `~/.local/state/omarchy/omachord/`.
+For a **manual shell-plugin installation**, disconnect first and unload it without the plugin manager:
+
+```bash
+~/.config/omarchy/plugins/anothadev.omachord/bin/omachord disconnect &&
+  omarchy-shell shell setPluginEnabled anothadev.omachord false
+```
+
+Only after disconnect succeeds and the shell replies `ok`, remove the checkout at `~/.config/omarchy/plugins/anothadev.omachord` (or just its symlink if you used a development checkout).
+
+For a **runner-only installation**, run `omachord disconnect` before deleting `~/.local/share/omachord`, then remove the exports you added to your shell startup file. If disconnect fails, keep the checkout and activation records so you can finish restoring active routines before removal.
+
+Turning Omachord off removes owned generated integration, including the launcher entry and icon, while preserving routines and run history. If desired, those retained files can then be removed from `~/.config/omarchy/omachord.json` and `~/.local/state/omarchy/omachord/`.
 
 ## Test
 
@@ -238,11 +341,13 @@ test/run.sh
 
 Tests additionally require Node.js, `luac`, `qmllint`, `qmltestrunner`, `desktop-file-validate`, and the Omarchy plugin validator. The local gate verifies the exact Omarchy, Hyprland, and Quickshell release targets above.
 
-It exercises strict and byte-bounded schema validation, bounded toggle discovery, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, descriptor-pinned transaction races and durability failures, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, model and condition logic, runtime QML interaction, an offscreen run of the condition service against a fake runner, plugin validation, and QML linting.
+It exercises strict and byte-bounded schema validation, bounded toggle discovery, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, descriptor-pinned transaction races and durability failures, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, launcher ownership upgrades, reload-free saves and their repair fallbacks, and detached audio lock release. Desktop checks cover model and condition logic, runtime QML interaction, service concurrency and panel enable batching against fake runners, transparent bar artwork and theme switching at 1×/2× scaling, plugin validation, and QML linting.
 
-GitHub Actions runs the required `portable` check on pushes and pull requests. It includes source and manifest validation, the filesystem transaction tests, the action-supervisor tests, the runner integration tests with mocked desktop commands, and the Node.js model, condition, and QML policy tests. The job uses Debian 13 for GNU coreutils 9.5+ (`mv --exchange` and `--update=none-fail`); the shell test suites run as a non-root user so permission-denial checks remain meaningful. It does not replace the full local gate: run `test/run.sh` before releasing to also check the target desktop versions, plugin validation, runtime QML behavior, and QML linting.
+The toggle regressions cover fixed geometry, animated pending states, mouse/keyboard/accessibility activation, shared panel/bar connection progress, stale status replies, and failure recovery. The runner speed suite checks that shortcut processing uses a constant number of `jq` launches as the shortcut count grows; its reported connect/status timings are diagnostic, not desktop latency guarantees.
 
-`test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup offscreen into `test/render/out/` so a change can be reviewed as images. It reads your real configuration through the runner but never writes.
+GitHub Actions runs the required `portable` check on pushes and pull requests. It includes source and manifest validation, required QML/artwork file checks, the filesystem transaction tests, the action-supervisor tests, runner integration and fast-path/audio regressions with mocked desktop commands, and the Node.js model, condition, and QML policy tests. Tag builds also require the tag to match `v` plus the manifest version. The job uses Debian 13 for GNU coreutils 9.5+ (`mv --exchange` and `--update=none-fail`) and explicitly installs GNU awk for Unicode key normalization; the shell test suites run as a non-root user so permission-denial checks remain meaningful. It does not replace the full local gate: run `test/run.sh` before releasing to also check the target desktop versions, plugin validation, runtime QML behavior, and QML linting. See [Releasing](docs/RELEASING.md) for the clean-archive and review requirements.
+
+`test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup (including off and pending states) offscreen into `test/render/out/` so a change can be reviewed as images. It reads your real configuration through the runner but never writes.
 
 ## License
 

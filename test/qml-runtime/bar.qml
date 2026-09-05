@@ -6,13 +6,16 @@ ShellRoot {
   id: root
   property int step: 0
   property int panelRequests: 0
+  property int disconnectRequests: 0
 
   QtObject {
     id: service
     property var activeList: []
-    property bool manualBusy: false
+    property bool connectionBusy: false
+    property bool manualBusy: connectionBusy
     property bool enabled: true
     function openPanel(view) { root.panelRequests++; return true }
+    function requestDisconnect() { root.disconnectRequests++; connectionBusy = true; return true }
   }
 
   QtObject {
@@ -54,6 +57,9 @@ ShellRoot {
       x: 16
       y: 80
       width: 388
+      integrationOn: service.enabled
+      integrationBusy: service.connectionBusy
+      onIntegrationToggled: widget.toggleIntegration()
     }
   }
 
@@ -119,6 +125,20 @@ ShellRoot {
           root.check(!widget.opened, "right click did not close the popup")
           button.triggerPress(Qt.MiddleButton)
           root.check(root.panelRequests === 1, "middle click did not open Omachord")
+          var toggle = root.find(popup, function(item) { return item.objectName === "popupIntegrationSwitch" })
+          root.check(!!toggle, "popup connection switch is missing")
+          var beforeWidth = toggle.width
+          var beforeHeight = toggle.height
+          toggle.requestToggle()
+          root.check(root.disconnectRequests === 1 && toggle.busy, "popup must show the service's pending transition")
+          toggle.requestToggle()
+          widget.toggleIntegration()
+          root.check(root.disconnectRequests === 1, "pending popup transition accepted a repeat request")
+          root.check(toggle.width === beforeWidth && toggle.height === beforeHeight, "pending popup switch changed size")
+          service.enabled = false
+          service.connectionBusy = false
+          root.check(!toggle.checked && !toggle.busy, "popup did not settle to the confirmed off state")
+          root.check(toggle.width === beforeWidth && toggle.height === beforeHeight, "settled popup switch changed size")
           host.vertical = true
           host.background = "transparent"
           host.barForeground = "#d3bf9e"

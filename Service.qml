@@ -36,6 +36,10 @@ Item {
   readonly property int maxPending: 256
 
   property bool enabled: false
+  // Latest accepted full status, with authoritative connection-command flags
+  // merged in immediately rather than waiting for a follow-up status probe.
+  property var connectionStatus: null
+  property int connectionEpoch: 0
   property string disabledReason: "starting"
   property bool configLoaded: false
   property string configRevision: ""
@@ -69,6 +73,9 @@ Item {
   // from making a decision against the pre-action snapshot.
   property var manualSettling: ({})
   property var manualJob: null
+  // A failed connection retains the global barrier until a post-transaction
+  // status attempt finishes (including a failed probe or FailedToStart).
+  property var connectionCompletion: null
   property var lastManualResult: null
   readonly property int maxManualWorkers: 4
   readonly property var manualPendingIds: buildManualPendingIds(manualQueue, manualInFlight, manualSettling)
@@ -149,11 +156,15 @@ Item {
 
   // ------------------------------------------------------- refreshing
   function refresh(process) {
-    if (process.running) {
+    // Full status audits take shared config locks. Coalesce them across a
+    // connection transaction rather than starting work we would discard.
+    // Failure reconciliation must still be allowed through the held barrier.
+    if (process.running || (process === statusProc && connectionBusy && !connectionCompletion)) {
       process.refreshQueued = true
       return
     }
     process.refreshQueued = false
+    if (process === statusProc) process.epoch = connectionEpoch
     process.startPending = true
     process.running = true
   }
@@ -162,18 +173,14 @@ Item {
     if (!process.refreshQueued) return
     process.refreshQueued = false
     Qt.callLater(function() {
-      if (process.running) process.refreshQueued = true
-      else {
-        process.startPending = true
-        process.running = true
-      }
+      root.refresh(process)
     })
   }
 
   function failedRefreshStart(process, kind) {
     if (!process.startPending || process.running) return
     process.startPending = false
-    if (kind === "status") applyStatus(null)
+    if (kind === "status") applyStatusReply(null, process.epoch)
     else if (kind === "config") applyConfig(null)
     else if (kind === "active") settleManualActive(process.generation + 1)
     finishRefresh(process)
@@ -221,10 +228,52 @@ Item {
   }
 
   function applyStatus(parsed) {
-    var ready = !!parsed && parsed.ok === true && parsed.integrationComplete === true
+    if (!parsed || parsed.ok !== true || typeof parsed.connected !== "boolean"
+        || typeof parsed.integrationComplete !== "boolean") {
+      // Preserve the last confirmed connection for the UI, but fail closed:
+      // conditions must not run without an available, authoritative status.
+      if (enabled) logEvent("disabled", "runner status unavailable")
+      enabled = false
+      disabledReason = "runner status unavailable"
+      return
+    }
+    var ready = parsed.integrationComplete === true
     if (ready !== enabled) logEvent(ready ? "enabled" : "disabled", ready ? "" : "not connected")
     enabled = ready
-    disabledReason = ready ? "" : (parsed && parsed.ok ? "not connected" : "runner status unavailable")
+    disabledReason = ready ? "" : "not connected"
+    connectionStatus = parsed
+  }
+
+  function applyStatusReply(parsed, epoch) {
+    // Both ends of a connection transaction advance the epoch: a probe can
+    // have started before it was queued, or captured half-written files while
+    // it ran and then returned after completion. Neither snapshot is usable.
+    if (epoch !== connectionEpoch || (connectionBusy && !connectionCompletion)) return
+    applyStatus(parsed)
+    if (connectionCompletion) {
+      var completion = connectionCompletion
+      completeManualConnection(completion.result, completion.exitCode)
+      runNextManual()
+    }
+  }
+
+  function applyConnectionResult(result) {
+    if (!result || result.ok !== true || typeof result.connected !== "boolean") return false
+    var status = Object.assign({}, connectionStatus || {}, {
+      ok: true,
+      connected: result.connected,
+      ownedConnection: result.connected,
+      integrationComplete: result.connected,
+      connectionEnabled: result.connected
+    })
+    // Connect validates and commits the configuration before reporting success.
+    // Keep unrelated full-status metadata, but do not retain its old errors.
+    if (result.connected) {
+      status.configValid = true
+      status.configError = ""
+    }
+    applyStatus(status)
+    return true
   }
 
   function applyConfig(parsed) {
@@ -633,14 +682,16 @@ Item {
   // can be tested before their triggers and conditions are enabled.
   function testRoutine(id) { return enqueueManual("run", id, "test") }
   // The bar switch turns the whole integration on or off; the window keeps
-  // its own confirmation for the same call.
-  function requestConnect() { return enqueueManual("connect", "") }
+  // its own confirmation for the same call and can pin the revision it showed.
+  // Omitting the revision preserves the bar's two-element runner command.
+  function requestConnect(expectedRevision) { return enqueueManual("connect", "", undefined, expectedRevision) }
   function requestDisconnect() { return enqueueManual("disconnect", "") }
 
-  function enqueueManual(op, id, requestedSource) {
+  function enqueueManual(op, id, requestedSource, expectedRevision) {
     var routineId = String(id || "")
     var connection = op === "connect" || op === "disconnect"
     var source = !connection && op === "run" && requestedSource === "test" ? "test" : "manual"
+    if (connection && connectionBusy) return false
     if (!connection && !isRoutineId(routineId)) return false
     if (!connection && op !== "deactivate" && op !== "activate" && op !== "run") return false
     // Preserve every accepted request. In particular, `run` is a toggle and
@@ -648,7 +699,10 @@ Item {
     // because an equal operation is already in flight. Per-id scheduling
     // below provides ordering; maxPending provides the bound.
     if (manualQueue.length >= maxPending) return false
-    manualQueue = manualQueue.concat([{ op: op, id: routineId, source: source }])
+    if (connection) connectionEpoch++
+    var job = { op: op, id: routineId, source: source }
+    if (op === "connect" && typeof expectedRevision === "string") job.revision = expectedRevision
+    manualQueue = manualQueue.concat([job])
     runNextManual()
     return true
   }
@@ -669,6 +723,9 @@ Item {
       manualQueue = manualQueue.slice(1)
       logEvent("manual-start", manualJob.op)
       manualProc.command = [root.runnerPath, manualJob.op]
+      if (manualJob.op === "connect" && typeof manualJob.revision === "string")
+        manualProc.command = [root.runnerPath, manualJob.op, manualJob.revision]
+      manualProc.startPending = true
       manualProc.running = true
       return
     }
@@ -726,10 +783,20 @@ Item {
     runNextManual()
   }
 
-  function finishManualConnection(text, exitCode) {
+  function completeManualConnection(result, exitCode) {
     var job = manualJob
+    connectionCompletion = null
     manualJob = null
-    reportManualFinished(job, manualResult(text, exitCode), exitCode)
+    reportManualFinished(job, result, exitCode)
+  }
+
+  function finishManualConnection(text, exitCode) {
+    manualProc.startPending = false
+    if (!manualJob || connectionCompletion) return
+    var result = manualResult(text, exitCode)
+    connectionEpoch++
+    if (applyConnectionResult(result)) completeManualConnection(result, exitCode)
+    else connectionCompletion = { result: result, exitCode: exitCode }
     refresh(activeProc)
     refresh(logsProc)
     refresh(statusProc)
@@ -793,11 +860,12 @@ Item {
     id: statusProc
     property bool refreshQueued: false
     property bool startPending: false
+    property int epoch: 0
     command: [root.runnerPath, "status"]
     stdout: StdioCollector { id: statusStdout; waitForEnd: true }
     onExited: function(exitCode) {
       statusProc.startPending = false
-      root.applyStatus(exitCode === 0 ? root.parseJson(statusStdout.text, null) : null)
+      root.applyStatusReply(exitCode === 0 ? root.parseJson(statusStdout.text, null) : null, statusProc.epoch)
       root.finishRefresh(statusProc)
       root.scheduleEvaluate()
     }
@@ -907,17 +975,16 @@ Item {
 
   Process {
     id: manualProc
+    property bool startPending: false
     stdout: StdioCollector { id: manualStdout; waitForEnd: true }
+    onStarted: startPending = false
     onExited: function(exitCode) {
       root.finishManualConnection(manualStdout.text, exitCode)
     }
-    onRunningChanged: {
-      if (!running && root.manualJob) {
-        Qt.callLater(function() {
-          if (root.manualJob && !manualProc.running) root.finishManualConnection("", -1)
-        })
-      }
-    }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (manualProc.startPending && !manualProc.running) root.finishManualConnection("", -1)
+      })
   }
 
   Process {

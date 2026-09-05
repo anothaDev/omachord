@@ -1182,6 +1182,9 @@ apply_config "$EMPTY" | jq -e '.ok and (.connected | not)' >/dev/null
 rm -f "$connect_result"
 
 printf '%s\n' "$CONCURRENT_CONFIG" >"$TEST_ROOT/concurrent-config.json"
+# No-shortcut documents skip the catalogue. Give the mock a reason to run so
+# it still injects an external edit during shortcut preflight.
+apply_config "$CONFIG" >/dev/null
 touch "$TEST_ROOT/inject-connect-config-race"
 connect_result=$(mktemp)
 if "$RUNNER" connect >"$connect_result"; then
@@ -1200,6 +1203,7 @@ apply_config "$EMPTY" | jq -e '.ok and (.connected | not)' >/dev/null
 rm -f "$connect_result" "$TEST_ROOT/concurrent-config.json"
 pass "Connect configuration compare-and-swap"
 
+apply_config "$CONFIG" >/dev/null
 touch "$TEST_ROOT/inject-connect-large-config-race"
 connect_result=$(mktemp)
 start=$(date +%s%3N)
@@ -1212,9 +1216,10 @@ assert_eq "$(stat -c %s "$CONFIG_PATH")" 1073741824 \
   "failed Connect changed the raced oversized configuration"
 assert_missing "$XDG_STATE_HOME/omarchy/omachord/connection.json" \
   "oversized-race Connect claimed integration ownership"
-printf '%s\n' "$EMPTY" >"$CONFIG_PATH"
+printf '%s\n' "$CONFIG" >"$CONFIG_PATH"
 chmod 600 "$CONFIG_PATH"
-"$RUNNER" config snapshot | jq -e '.committed and .config.routines == []' >/dev/null
+"$RUNNER" config snapshot | jq -e --argjson config "$CONFIG" '.committed and .config == $config' >/dev/null
+apply_config "$EMPTY" >/dev/null
 rm -f "$connect_result"
 pass "bounded transaction config snapshots"
 
