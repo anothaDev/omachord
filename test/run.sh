@@ -7,6 +7,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 "$ROOT/test/version-test.sh"
 "$ROOT/test/fs-helper-test.sh"
 "$ROOT/test/action-supervisor-test.sh"
+python3 "$ROOT/test/action-capture-test.py"
 "$ROOT/test/runner-test.sh"
 "$ROOT/test/runner-speed-test.sh"
 "$ROOT/test/qml-runtime-test.sh"

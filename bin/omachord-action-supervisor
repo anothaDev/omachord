@@ -2,10 +2,10 @@
 
 use strict;
 use warnings;
-use Errno qw(EACCES EPERM);
+use Errno qw(EACCES EPERM EINTR);
 use Fcntl qw(O_CREAT O_EXCL O_WRONLY);
 use POSIX qw(WIFEXITED WEXITSTATUS WIFSIGNALED WTERMSIG setpgid setsid);
-use Time::HiRes qw(sleep);
+use Time::HiRes qw(sleep clock_gettime CLOCK_MONOTONIC);
 
 sub marker {
   my ($path) = @_;
@@ -49,10 +49,25 @@ my $runner_pid = shift // die "Missing runner PID\n";
 my $runner_start = shift // die "Missing runner start time\n";
 my $control_dir = shift // die "Missing control directory\n";
 my $duration = shift // die "Missing timeout duration\n";
+my ($capture_mode, $capture_limit, $output_path, $capture_output, $capture_read, $capture_write);
+if (@ARGV && $ARGV[0] eq "--capture") {
+  shift;
+  $capture_mode = shift // "";
+  $capture_limit = shift // "";
+  $output_path = shift // "";
+  die "Invalid capture mode or limit\n"
+    unless $capture_mode =~ /\A(?:head|tail)\z/
+      && $capture_limit =~ /\A[0-9]+\z/ && $capture_limit > 0 && $capture_limit <= 1048576;
+}
 die "Invalid runner identity\n" unless $runner_pid =~ /\A[0-9]+\z/ && $runner_start =~ /\A[0-9]+\z/;
 die "Invalid control directory\n" unless $control_dir =~ m{\A/} && $control_dir !~ /\0/;
 die "Missing command separator\n" unless (shift // "") eq "--";
 die "Missing action command\n" unless @ARGV;
+if (defined $capture_mode) {
+  open $capture_output, ">", $output_path or die "Could not open capture output: $!\n";
+  binmode $capture_output;
+  pipe($capture_read, $capture_write) or die "Could not create capture pipe: $!\n";
+}
 
 setsid() >= 0 or die "Could not detach action supervisor: $!\n";
 $SIG{CHLD} = "DEFAULT";
@@ -63,17 +78,24 @@ my $child = fork();
 die "Could not fork action timeout: $!\n" unless defined $child;
 if ($child == 0) {
   $SIG{HUP} = $SIG{INT} = $SIG{TERM} = "DEFAULT";
+  if (defined $capture_mode) {
+    close $capture_read;
+    close $capture_output;
+    open STDOUT, ">&", $capture_write or POSIX::_exit(126);
+    open STDERR, ">&", $capture_write or POSIX::_exit(126);
+    close $capture_write;
+    # stdin belongs to the runner's cancellation pipe, never to the action.
+    open STDIN, "<", "/dev/null" or POSIX::_exit(126);
+  }
   setpgid(0, 0) or POSIX::_exit(126);
   exec({"/usr/bin/timeout"} "/usr/bin/timeout", "--kill-after=1s", "--", $duration,
-    "/usr/bin/bash", "-c", 'exec 6>&- 7>&- 8>&- 9>&-; exec "$@"', "bash", @ARGV)
+    "/usr/bin/bash", "-c", 'exec 6>&- 7>&- 8>&- 9>&-; exec -- "$@"', "bash", @ARGV)
     or POSIX::_exit(126);
 }
+close $capture_write if defined $capture_mode;
 
 # Only the timeout group owns the capture pipe. Keeping another writer in the
 # supervisor would make a completed action look like it leaked stdout.
-open STDOUT, ">", "/dev/null" or die "Could not detach supervisor output: $!\n";
-open STDERR, ">", "/dev/null" or exit 125;
-
 # Establish the group before publishing its identity. The child performs the
 # same operation, so EACCES here only means it already crossed exec safely.
 if (!setpgid($child, $child) && $! != EACCES && $! != EPERM) {
@@ -82,10 +104,98 @@ if (!setpgid($child, $child) && $! != EACCES && $! != EPERM) {
   marker("$control_dir/exited");
   exit 125;
 }
+if (!open(STDOUT, ">", "/dev/null") || !open(STDERR, ">", "/dev/null")) {
+  kill "KILL", -$child;
+  waitpid($child, 0);
+  exit 125;
+}
 if (!marker("$control_dir/timeout.$child")) {
   kill "KILL", -$child;
   waitpid($child, 0);
   exit 125;
+}
+
+# Capture and process lifetime have one native owner. In particular there is
+# no Bash-owned head/tail child whose PID could be reaped before a later kill.
+# Keep the timeout leader unreaped until the final possible group signal.
+if (defined $capture_mode) {
+  my $buffer = "";
+  my $output_eof = 0;
+  my $exited_at;
+  my $capture_error = 0;
+  while (1) {
+    $stop_requested = 1 unless process_is_live($runner_pid, $runner_start);
+    $stop_requested = 1 if -e "$control_dir/stop";
+    if ($stop_requested) {
+      kill "TERM", -$child;
+      sleep 0.05;
+      kill "KILL", -$child;
+      last;
+    }
+
+    my $readers = "";
+    vec($readers, fileno(STDIN), 1) = 1;
+    vec($readers, fileno($capture_read), 1) = 1 unless $output_eof;
+    my $ready = select(my $available = $readers, undef, undef, 0.01);
+    if (!defined($ready) || $ready < 0) {
+      next if $! == EINTR;
+      $capture_error = $stop_requested = 1;
+      next;
+    }
+    if (vec($available, fileno(STDIN), 1)) {
+      my $read = sysread(STDIN, my $control, 1);
+      # Closing the runner's pipe cancels even if its filesystem is full or
+      # the control directory has disappeared. No recyclable PID is signaled.
+      $stop_requested = 1 if !defined($read) || $read == 0 || $control ne "";
+    }
+    if (!$output_eof && vec($available, fileno($capture_read), 1)) {
+      my $read = sysread($capture_read, my $chunk, 8192);
+      if (!defined $read) {
+        next if $! == EINTR;
+        $capture_error = $stop_requested = 1;
+      } elsif ($read == 0) {
+        $output_eof = 1;
+      } elsif ($capture_mode eq "head") {
+        $buffer .= substr($chunk, 0, $capture_limit + 1 - length($buffer));
+        $capture_error = $stop_requested = 1 if length($buffer) > $capture_limit;
+      } else {
+        $buffer .= $chunk;
+        substr($buffer, 0, length($buffer) - $capture_limit, "")
+          if length($buffer) > $capture_limit;
+      }
+    }
+    next if $stop_requested;
+    if (child_is_zombie($child)) {
+      if (!defined $exited_at) {
+        $exited_at = clock_gettime(CLOCK_MONOTONIC);
+        if (!marker("$control_dir/exited")) {
+          $capture_error = $stop_requested = 1;
+          next;
+        }
+      }
+      last if $output_eof;
+      # Preserve intentional detached children that close capture, but stop
+      # ordinary descendants that keep the pipe open after the action exits.
+      $stop_requested = 1 if clock_gettime(CLOCK_MONOTONIC) - $exited_at >= 0.1;
+    }
+  }
+  close $capture_read;
+  my $waited = waitpid($child, 0);
+  my $status = $?;
+  $capture_error = 1 if $waited != $child;
+  my $offset = 0;
+  while ($offset < length($buffer)) {
+    my $written = syswrite($capture_output, $buffer, length($buffer) - $offset, $offset);
+    if (!defined($written) || $written == 0) {
+      next if !defined($written) && $! == EINTR;
+      $capture_error = 1;
+      last;
+    }
+    $offset += $written;
+  }
+  $capture_error = 1 unless close $capture_output;
+  exit 125 if $capture_error;
+  exit_for_wait_status($status);
 }
 
 my $exited_marked = 0;

@@ -60,9 +60,8 @@ ROLLBACK_WARNING=""
 PRESERVED_CONFLICT=""
 GENERATED_LUA_FAST_PATH_FINGERPRINT=""
 ACTIVE_SUPERVISOR_PID=""
-ACTIVE_COLLECTOR_PID=""
+ACTIVE_CONTROL_FD=""
 ACTIVE_CAPTURE_DIR=""
-ACTIVE_STOP_FILE=""
 
 default_config() {
   printf '%s\n' '{"version":1,"routines":[]}'
@@ -2254,19 +2253,14 @@ log_run() {
 
 cleanup_active_action() {
   set +e
-  if [[ -n $ACTIVE_STOP_FILE ]] && ! : >"$ACTIVE_STOP_FILE"; then
-    [[ -z $ACTIVE_SUPERVISOR_PID ]] || kill -TERM "$ACTIVE_SUPERVISOR_PID" 2>/dev/null
-  fi
+  # EOF is cancellation, including disk-full and lost-marker failure paths.
+  # Bash may reap a completed job before wait; never signal its numeric PID.
+  [[ -z $ACTIVE_CONTROL_FD ]] || exec {ACTIVE_CONTROL_FD}>&-
   [[ -z $ACTIVE_SUPERVISOR_PID ]] || wait "$ACTIVE_SUPERVISOR_PID" 2>/dev/null
-  if [[ -n $ACTIVE_COLLECTOR_PID ]]; then
-    kill "$ACTIVE_COLLECTOR_PID" 2>/dev/null
-    wait "$ACTIVE_COLLECTOR_PID" 2>/dev/null
-  fi
   [[ -z $ACTIVE_CAPTURE_DIR ]] || rm -rf -- "$ACTIVE_CAPTURE_DIR"
   ACTIVE_SUPERVISOR_PID=""
-  ACTIVE_COLLECTOR_PID=""
+  ACTIVE_CONTROL_FD=""
   ACTIVE_CAPTURE_DIR=""
-  ACTIVE_STOP_FILE=""
   set -e
 }
 
@@ -2280,16 +2274,6 @@ process_start_time() {
   printf '%s\n' "${fields[19]}"
 }
 
-process_is_live() {
-  local pid=$1 expected_start=$2 stat rest
-  stat=$(<"/proc/$pid/stat") || return 1
-  rest=${stat##*) }
-  local -a fields=()
-  read -r -a fields <<<"$rest"
-  ((${#fields[@]} >= 20)) \
-    && [[ ${fields[0]} != Z && ${fields[19]} == "$expected_start" ]]
-}
-
 abort_active_routine() {
   local status=$1
   trap - HUP INT TERM
@@ -2300,7 +2284,7 @@ abort_active_routine() {
 run_capture() {
   local output_file=$1
   shift
-  local status capture_dir fifo collector supervisor_pid supervisor_start parent_pid parent_start exited_file stop_file release_file index output_size should_stop=false
+  local status capture_dir supervisor_pid parent_pid parent_start output_size pipe_in pipe_out
   local capture_mode=${OMACHORD_CAPTURE_MODE:-tail} capture_limit=${OMACHORD_CAPTURE_LIMIT:-4096}
   LAST_ERROR=""
   capture_dir=$(mktemp -d) || {
@@ -2308,23 +2292,6 @@ run_capture() {
     return 1
   }
   ACTIVE_CAPTURE_DIR=$capture_dir
-  fifo="$capture_dir/output"
-  exited_file="$capture_dir/exited"
-  stop_file="$capture_dir/stop"
-  release_file="$capture_dir/release"
-  if ! mkfifo "$fifo"; then
-    rm -rf -- "$capture_dir"
-    ACTIVE_CAPTURE_DIR=""
-    LAST_ERROR="Could not create an action output buffer"
-    return 1
-  fi
-  if [[ $capture_mode == head ]]; then
-    head -c "$((capture_limit + 1))" <"$fifo" >"$output_file" 6>&- 7>&- 8>&- 9>&- &
-  else
-    tail -c "$capture_limit" <"$fifo" >"$output_file" 6>&- 7>&- 8>&- 9>&- &
-  fi
-  collector=$!
-  ACTIVE_COLLECTOR_PID=$collector
   set +e
   parent_pid=$BASHPID
   parent_start=$(process_start_time "$parent_pid") || {
@@ -2337,73 +2304,40 @@ run_capture() {
     cleanup_active_action
     return 1
   fi
-  # The detached supervisor retains lock descriptors and an unreaped process-
-  # group leader until every possible group signal has been sent.
-  "$ACTION_SUPERVISOR" "$parent_pid" "$parent_start" "$capture_dir" \
-    "${OMACHORD_ACTION_TIMEOUT:-30s}" -- "$@" \
-    8>&- 9>&- < /dev/null >"$fifo" 2>&1 &
+  # One native owner captures bounded output and retains the timeout leader
+  # unreaped through the final group signal. The pipe carries cancellation by
+  # EOF, so cleanup needs neither writable markers nor a recyclable job PID.
+  coproc OMACHORD_CAPTURE {
+    exec "$ACTION_SUPERVISOR" "$parent_pid" "$parent_start" "$capture_dir" \
+      "${OMACHORD_ACTION_TIMEOUT:-30s}" --capture "$capture_mode" "$capture_limit" "$output_file" -- "$@" \
+      8>&- 9>&- > /dev/null 2>"$capture_dir/error"
+  }
   supervisor_pid=$!
   ACTIVE_SUPERVISOR_PID=$supervisor_pid
-  ACTIVE_STOP_FILE=$stop_file
-  for ((index = 0; index < 20; index++)); do
-    supervisor_start=$(process_start_time "$supervisor_pid" 2>/dev/null) && break
-    sleep 0.001 6>&- 7>&- 8>&- 9>&-
-  done
-  if [[ -z ${supervisor_start:-} ]]; then
-    wait "$supervisor_pid" 2>/dev/null
-    LAST_ERROR="The action supervisor did not start"
-    cleanup_active_action
-    return 1
+  pipe_in=${OMACHORD_CAPTURE[1]:-}
+  pipe_out=${OMACHORD_CAPTURE[0]:-}
+  if [[ -n $pipe_in ]]; then
+    # Own a duplicate: Bash closes its coproc descriptors asynchronously when
+    # the job exits, independently of our explicit wait.
+    exec {ACTIVE_CONTROL_FD}>&"$pipe_in"
+    exec {pipe_in}>&-
   fi
-  while [[ ! -e $exited_file ]]; do
-    if ! process_is_live "$supervisor_pid" "$supervisor_start"; then
-      wait "$supervisor_pid" 2>/dev/null
-      LAST_ERROR="The action supervisor stopped unexpectedly"
-      cleanup_active_action
-      return 1
-    fi
-    sleep 0.01 6>&- 7>&- 8>&- 9>&-
-  done
-  output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
-
-  # A detached child that closed stdout is intentional and does not block the
-  # routine. Only stop descendants that still hold the capture pipe open.
-  for ((index = 0; index < 10; index++)); do
-    kill -0 "$collector" 2>/dev/null || break
-    sleep 0.01 6>&- 7>&- 8>&- 9>&-
-  done
-  output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
-  if kill -0 "$collector" 2>/dev/null \
-    || { [[ $capture_mode == head ]] && ((output_size > capture_limit)); }; then
-    should_stop=true
-  fi
-  if [[ $should_stop == true ]]; then
-    : >"$stop_file" || kill -TERM "$supervisor_pid" 2>/dev/null || true
-  elif ! : >"$release_file"; then
-    should_stop=true
-    kill -TERM "$supervisor_pid" 2>/dev/null || true
-  fi
+  [[ -z $pipe_out ]] || exec {pipe_out}<&-
   wait "$supervisor_pid"
   status=$?
-  for ((index = 0; index < 20; index++)); do
-    kill -0 "$collector" 2>/dev/null || break
-    sleep 0.01 6>&- 7>&- 8>&- 9>&-
-  done
-  if kill -0 "$collector" 2>/dev/null; then
-    kill "$collector" 2>/dev/null || true
-  fi
-  wait "$collector" 2>/dev/null || true
+  [[ -z $ACTIVE_CONTROL_FD ]] || exec {ACTIVE_CONTROL_FD}>&-
+  ACTIVE_CONTROL_FD=""
+  ACTIVE_SUPERVISOR_PID=""
   output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
   if [[ $capture_mode == head ]] && ((output_size > capture_limit)); then
     status=125
     LAST_ERROR="Command output exceeds the $capture_limit byte limit"
+  elif ((status != 0)) && [[ -s $capture_dir/error ]]; then
+    LAST_ERROR=$(tail -c 2000 "$capture_dir/error" | tr '\n' ' ')
   fi
   set -e
   rm -rf -- "$capture_dir"
-  ACTIVE_SUPERVISOR_PID=""
-  ACTIVE_COLLECTOR_PID=""
   ACTIVE_CAPTURE_DIR=""
-  ACTIVE_STOP_FILE=""
   if ((status == 0)); then
     return 0
   fi
