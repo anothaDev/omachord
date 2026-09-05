@@ -859,6 +859,16 @@ connection_disabled() {
   }
 }
 
+# Every automatic ingress calls this after taking the shared config lock.
+# Removing a dispatcher cannot revoke a process already waiting for that lock.
+# Manual/test calls remain explicit runner-only capabilities while Off.
+automatic_integration_enabled() {
+  if [[ -e $DISABLED_FILE || -L $DISABLED_FILE ]] || ! connected || ! owned_connection; then
+    LAST_ERROR="Omachord is off or disconnected; automatic requests are paused"
+    return 1
+  fi
+}
+
 write_connection_disabled() {
   local source
   source=$(mktemp) || {
@@ -3498,6 +3508,9 @@ command_run() {
     *) fail "Unknown run source: $trigger" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  if [[ $trigger == shortcut ]]; then
+    automatic_integration_enabled || fail "$LAST_ERROR" not-connected
+  fi
   resolve_routine "$routine_id" "$allow_disabled" || return 1
   if routine_is_stateful "$RESOLVED_ROUTINE"; then
     toggle_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
@@ -3522,6 +3535,9 @@ command_activate() {
   elif [[ -n $expected_revision ]]; then
     fail "Only service activations accept an expected revision" usage
   fi
+  case $trigger in
+    shortcut|condition|service) automatic_integration_enabled || fail "$LAST_ERROR" not-connected ;;
+  esac
   activate_routine "$routine_id" "$trigger" "$allow_disabled"
 }
 
@@ -3540,6 +3556,9 @@ command_deactivate() {
   elif [[ -n $expected_revision ]]; then
     fail "Only service deactivations accept an expected revision" usage
   fi
+  case $reason in
+    shortcut|condition|service|timer) automatic_integration_enabled || fail "$LAST_ERROR" not-connected ;;
+  esac
   deactivate_routine "$routine_id" "$reason"
 }
 
@@ -3637,6 +3656,10 @@ command_trigger_hook() {
     rm -f -- "$config_snapshot"
     json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
     return 1
+  fi
+  if ! automatic_integration_enabled; then
+    rm -f -- "$config_snapshot"
+    fail "$LAST_ERROR" not-connected
   fi
 
   local -a routine_ids=()

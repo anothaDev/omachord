@@ -1756,6 +1756,7 @@ pass "deactivate without snapshot"
 "$RUNNER" run focus test | jq -e '.ok and .state == "activated"' >/dev/null
 "$RUNNER" run focus test | jq -e '.ok and .state == "deactivated"' >/dev/null
 "$RUNNER" run legacy test | jq -e '.ok and (has("state") | not)' >/dev/null
+"$RUNNER" connect | jq -e '.ok' >/dev/null
 "$RUNNER" trigger hook post-boot | jq -e '.ok and .matched == 1' >/dev/null
 "$RUNNER" active | jq -e 'length == 1 and .[0].trigger == "hook:post-boot"' >/dev/null
 "$RUNNER" trigger hook post-boot | jq -e '.ok and .matched == 1' >/dev/null
@@ -1763,6 +1764,7 @@ pass "deactivate without snapshot"
 assert_eq "$($RUNNER logs 100 | jq '[.[] | select(.trigger == "hook:post-boot" and .status == "activated")] | length')" 1 \
   "a repeated event re-activated an active routine"
 "$RUNNER" deactivate focus test | jq -e '.ok and .state == "deactivated"' >/dev/null
+"$RUNNER" disconnect | jq -e '.ok and (.connected | not)' >/dev/null
 pass "manual toggle semantics"
 
 failure_result=$(mktemp)

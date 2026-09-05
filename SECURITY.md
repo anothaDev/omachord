@@ -22,6 +22,7 @@ The supported release environment is Omarchy 4.0.2, Hyprland 0.56.2, and Quicksh
 
 - Saving routine JSON is an explicit authorization to publish that executable configuration. Importing or generating a file outside the panel does not establish review. Exactly one JSON document is accepted, and execution requires its committed revision.
 - Automatic startup checks persistent Off under the integration mutation lock. It reuses committed content or bootstraps an initially absent, empty configuration; it does not promote changed or unmarked routine content. Explicit Connect with an inspected revision and revision-bound configuration apply are the admission paths for that content.
+- Hook, shortcut, condition-service and timer requests recheck automatic eligibility after acquiring the shared configuration lock. A dispatcher launched before Disconnect cannot start work after Off has committed. Explicit manual/test commands retain their documented runner-only behavior.
 - A queued UI switch cannot transfer its earlier decision to a changed same-ID routine. Manual CLI Run intentionally selects the latest committed routine; the condition service binds requests to the revision it evaluated.
 - Active end-plan identity is frozen. A numeric checkpoint cannot be reused against today's edited action list. New activation records carry the plan digest; legacy action records require explicit recovery instead of inferring their history. Typed restore data remains available when an end action, restore, or removal fails.
 - `recovery restore ... --skip-end-actions` is an explicit revision-bound choice to restore saved setter values and skip remaining executable end effects. That choice is committed before restoration, so a retry cannot revive skipped commands.
@@ -33,6 +34,7 @@ The native supervisor owns both output capture and the timeout process group. It
 | Surface | Enforced limit or behavior |
 | --- | --- |
 | Configuration | At most 1 MiB before JSON validation; 256 routines and 64 actions per list |
+| Resident service file watchers | Notifications only, with preloading disabled and no body-reading calls; content is obtained through bounded runner requests |
 | Ordinary action capture | Retains the final 4 KiB of combined output; default 30-second stage timeout |
 | Built-in control capture | Rejects more than 1 MiB of combined output; default five-second stage timeout |
 | Panel theme-list and fallback service status | Fixed runner probes apply the control deadline and stdout cap before QML collection; stderr is discarded |

@@ -288,6 +288,7 @@ Routines are trusted local configuration and are not sandboxed.
 - Saves use revision-based compare-and-swap, so a stale panel cannot overwrite a newer configuration.
 - A queued routine switch is bound to the complete definition reviewed when it was requested. A retry cancels that switch if the definition changed or disappeared; independent switches remain available.
 - Condition-service jobs carry the revision they evaluated; the runner rejects stale jobs and post-Disconnect activations before any routine action runs.
+- Events and shortcuts already waiting for the configuration lock are also rejected after a completed Disconnect; removing their on-disk dispatchers is not the only revocation check.
 - Readers require the canonical configuration to match a post-reload commit record. A candidate cannot execute before its integration transaction commits, and an interrupted candidate fails closed.
 - Configuration is exactly one JSON document. Automatic startup checks persistent Off while holding the mutation lock and cannot approve a changed or unmarked configuration. Bare Connect reuses committed content; initially absent configuration and commit records may bootstrap an empty setup.
 - Active routines bind their ending mode and end-action list to an immutable digest. Saves reject changes to a retained active routine's end plan. End the routine before editing that plan; disabling or removing a routine still performs the existing cleanup first.
@@ -352,7 +353,7 @@ The test suite uses temporary HOME and XDG directories and does not touch the li
 test/run.sh
 ```
 
-Tests additionally require Python 3 (standard library only), Node.js, `luac`, `qmllint`, `qmltestrunner`, `desktop-file-validate`, and the Omarchy plugin validator. `strace` enables the additional real write-error injection checks; skipped injections must be reported and do not count as release evidence. The local gate verifies the exact Omarchy, Hyprland, and Quickshell release targets above.
+Tests additionally require Python 3 (standard library only), Node.js, `strace`, `luac`, `qmllint`, `qmltestrunner`, `desktop-file-validate`, and the Omarchy plugin validator. `strace` verifies that notification-only service watchers do not read file bodies and enables the real write-error injection checks. Skipped injections in environments without it must be reported and do not count as local release evidence. The local gate verifies the exact Omarchy, Hyprland, and Quickshell release targets above.
 
 It exercises strict and byte-bounded schema validation, bounded toggle discovery, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, descriptor-pinned transaction races and durability failures, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, launcher ownership upgrades, reload-free saves and their repair fallbacks, and detached audio lock release. Desktop checks cover model and condition logic, runtime QML interaction, service concurrency and panel enable batching against fake runners, transparent bar artwork and theme switching at 1×/2× scaling, plugin validation, and QML linting.
 
