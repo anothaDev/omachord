@@ -207,6 +207,7 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 | `~/.config/hypr/bindings.lua` | Receives one marked optional-loader line |
 | `~/.config/omarchy/hooks/<event>.d/anothadev.omachord` | Guarded event dispatchers |
 | `~/.local/share/applications/anothadev.omachord.desktop` | Application launcher |
+| `~/.local/share/icons/hicolor/scalable/apps/anothadev.omachord.svg` | Application launcher icon |
 | `~/.local/state/omarchy/omachord/runs.jsonl` | Rolling execution history |
 | `~/.local/state/omarchy/omachord/active/<routine-id>.json` | Activation record of a stateful routine, holding the values to restore |
 | `~/.local/state/omarchy/toggles/<flag>` | Omarchy toggle flags read by the toggle condition |
