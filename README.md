@@ -25,7 +25,7 @@ Omachord started with an old microphone automation. While revisiting it, somethi
 - Omarchy 4.0.2
 - Hyprland 0.56.2
 - Quickshell 0.3.1
-- Bash, Perl, GNU coreutils 9.5+, `jq`, `flock`, `fuser`, `timeout`, `wpctl`, and `paplay`
+- Bash, Perl, GNU awk (`gawk`), GNU coreutils 9.5+, `jq`, `flock`, `fuser`, `timeout`, `wpctl`, and `paplay`
 
 These are present in a standard Omarchy installation.
 

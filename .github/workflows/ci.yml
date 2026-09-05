@@ -25,8 +25,9 @@ jobs:
       - name: Install portable test dependencies
         run: |
           apt-get update
+          # Match Omarchy's Unicode shortcut case folding; Debian defaults to mawk.
           apt-get install --yes --no-install-recommends \
-            ca-certificates coreutils desktop-file-utils git jq lua5.4 nodejs \
+            ca-certificates coreutils desktop-file-utils gawk git jq lua5.4 nodejs \
             perl procps psmisc sound-theme-freedesktop util-linux
           # Permission-denial regressions must not run as the container's root user.
           useradd --create-home --shell /bin/bash test-runner
