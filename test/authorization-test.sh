@@ -310,6 +310,8 @@ completed_plan_test() {
   local original changed snapshot="$STATE_DIR/active/lifecycle.json" inspected
   original=$(lifecycle_config | jq -c '.routines[0].onEnd.actions=[{type:"exec",program:"/usr/bin/true",args:[]}]')
   apply "$original"
+  # The shortcut case below must reach end-plan validation while connected.
+  "$RUNNER" connect >/dev/null
   "$RUNNER" activate lifecycle >/dev/null
   if env OMACHORD_FS_TEST_MATCH="$snapshot" OMACHORD_FS_TEST_FAIL_REMOVE=1 \
     "$RUNNER" deactivate lifecycle >"$TEST_ROOT/result"; then fail 'failed completed-record removal was ignored'; fi
