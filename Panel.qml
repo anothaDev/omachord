@@ -29,7 +29,7 @@ Item {
   property var commandOptions: []
   property var themeOptions: []
   property var toggleOptions: []
-  property var activeIds: ({})
+  property var activeIds: Object.create(null)
   property var serviceStatus: null
   readonly property bool wifiAvailable: Networking.backend === NetworkBackendType.NetworkManager
   readonly property var networkDevices: Networking.devices ? Networking.devices.values : []
@@ -91,7 +91,7 @@ Item {
   property string runningRoutineId: ""
   // A direct routine request remains pending until a probe started after its
   // completion settles. Other routines need not wait for that probe.
-  property var actionSettling: ({})
+  property var actionSettling: Object.create(null)
   property date displayNow: new Date()
 
   readonly property string home: Quickshell.env("HOME")
@@ -263,7 +263,7 @@ Item {
 
   function objectValues(map) {
     var rows = []
-    for (var key in map) rows.push(map[key])
+    for (var key in map) if (mapOwns(map, key)) rows.push(map[key])
     return rows
   }
 
@@ -272,7 +272,7 @@ Item {
   function buildWifiOptions() {
     var rows = []
     if (!wifiAvailable) return rows
-    var seen = ({})
+    var seen = Object.create(null)
     var devices = networkDevices || []
     for (var d = 0; d < devices.length; d++) {
       var device = devices[d]
@@ -358,6 +358,7 @@ Item {
   function buildActiveRows(active, currentConfig) {
     var rows = []
     for (var id in active) {
+      if (!mapOwns(active, id)) continue
       var record = active[id] || {}
       rows.push({
         id: id,
@@ -1114,7 +1115,7 @@ Item {
       ? (parsed || { ok: false, error: fallback })
       : (parsed && parsed.ok === false ? parsed : { ok: false, error: fallback })
     if (!serviceLive && actionStarted) {
-      var settling = Object.assign({}, actionSettling)
+      var settling = Object.assign(Object.create(null), actionSettling)
       settling[runningRoutineId] = activeProc.generation + 1
       actionSettling = settling
     }
@@ -1127,9 +1128,9 @@ Item {
   }
 
   function finishActionSettling(generation) {
-    var remaining = ({})
+    var remaining = Object.create(null)
     for (var id in actionSettling)
-      if (actionSettling[id] > generation) remaining[id] = actionSettling[id]
+      if (mapOwns(actionSettling, id) && actionSettling[id] > generation) remaining[id] = actionSettling[id]
     actionSettling = remaining
   }
 
@@ -1144,7 +1145,7 @@ Item {
   }
 
   function rebuildActiveIds(rows) {
-    var next = ({})
+    var next = Object.create(null)
     for (var i = 0; i < rows.length; i++)
       if (rows[i] && rows[i].routineId) next[String(rows[i].routineId)] = rows[i]
     activeIds = next
@@ -2567,7 +2568,7 @@ Item {
                         accent: root.accent
                         hasCursor: conditionHover.hovered
                         Accessible.role: Accessible.Button
-                        Accessible.name: modelData.name + ", " + (isOn ? "on" : reason.label)
+                        Accessible.name: modelData.name + ", " + (isOn ? "on" : reason ? reason.label : "")
 
                         HoverHandler { id: conditionHover }
 

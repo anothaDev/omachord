@@ -21,10 +21,21 @@ cp -- "$ROOT/test/qml-runtime/shell.qml" "$TEST_DIR/shell.qml"
 ln -s /usr/share/omarchy/shell/Commons "$TEST_DIR/Commons"
 ln -s /usr/share/omarchy/shell/Ui "$TEST_DIR/Ui"
 for file in RoutineEditor.qml PanelScrollBar.qml ActionCard.qml ChoicePicker.qml ShortcutRecorder.qml PlainTextButton.qml PendingSwitch.qml PendingToggle.qml KeyCap.qml EmptyState.qml Collapsible.qml Model.js Conditions.js; do
-  ln -s "$ROOT/$file" "$TEST_DIR/$file"
+  cp -- "$ROOT/$file" "$TEST_DIR/$file"
 done
 
-QT_QPA_PLATFORM=offscreen quickshell --no-duplicate --path "$TEST_DIR/shell.qml" --no-color \
+mkdir -p "$TEST_DIR/home" "$TEST_DIR/config" "$TEST_DIR/state" "$TEST_DIR/data" \
+  "$TEST_DIR/cache" "$TEST_DIR/runtime" "$TEST_DIR/tmp"
+chmod 700 "$TEST_DIR/runtime"
+
+env -i PATH=/usr/bin:/bin LANG=C.UTF-8 HOME="$TEST_DIR/home" \
+  XDG_CONFIG_HOME="$TEST_DIR/config" XDG_STATE_HOME="$TEST_DIR/state" \
+  XDG_DATA_HOME="$TEST_DIR/data" XDG_CACHE_HOME="$TEST_DIR/cache" \
+  XDG_RUNTIME_DIR="$TEST_DIR/runtime" TMPDIR="$TEST_DIR/tmp" \
+  DBUS_SESSION_BUS_ADDRESS="unix:path=$TEST_DIR/no-session-bus" \
+  DBUS_SYSTEM_BUS_ADDRESS="unix:path=$TEST_DIR/no-system-bus" \
+  QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+  /usr/bin/quickshell --no-duplicate --path "$TEST_DIR/shell.qml" --no-color \
   >"$LOG_FILE" 2>&1 &
 runtime_pid=$!
 
@@ -35,7 +46,7 @@ for _ in {1..500}; do
 done
 
 if ! grep -q 'OMACHORD_QML_TEST_PASS' "$LOG_FILE" \
-  || grep -q 'OMACHORD_QML_TEST_FAIL' "$LOG_FILE"; then
+  || grep -q 'OMACHORD_QML_TEST_FAIL\|TypeError\|ReferenceError\|Binding loop detected\|Unable to assign' "$LOG_FILE"; then
   cat "$LOG_FILE" >&2
   printf 'FAIL: QML editor staging regression\n' >&2
   exit 1
