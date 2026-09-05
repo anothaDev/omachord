@@ -132,7 +132,7 @@ Item {
   readonly property color subtle: Qt.darker(fg, 1.5)
   readonly property color hairline: Util.alpha(fg, 0.12)
 
-  ThemePalette { id: palette }
+  ThemePalette { id: palette; active: window.visible; runnerPath: root.runnerPath }
 
   onCompactChanged: {
     if (compact && editorRoutine) compactEditorOpen = true
@@ -1421,7 +1421,7 @@ Item {
   Process {
     id: themesProc
     property bool refreshQueued: false
-    command: ["omarchy-theme-list"]
+    command: [root.runnerPath, "themes"]
     stdout: StdioCollector { id: themesStdout; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) root.rebuildThemeOptions(themesStdout.text)
@@ -1454,7 +1454,7 @@ Item {
   Process {
     id: serviceStatusProc
     property bool refreshQueued: false
-    command: ["omarchy-shell", "omachord", "status"]
+    command: [root.runnerPath, "service-status"]
     stdout: StdioCollector { id: serviceStatusStdout; waitForEnd: true }
     onExited: function(exitCode) {
       root.serviceStatus = exitCode === 0 ? root.parseJson(serviceStatusStdout.text, null) : null

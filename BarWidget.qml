@@ -38,7 +38,13 @@ Panel {
   property bool cursorActive: false
   property bool cursorOnFooter: false
 
-  ThemePalette { id: palette }
+  ThemePalette {
+    id: palette
+    active: root.visible
+    runnerPath: configuredRunnerPath.indexOf("/") === 0 ? configuredRunnerPath
+      : root.service && root.service.runnerPath ? root.service.runnerPath
+      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord"
+  }
 
   function endRoutine(id) {
     if (integrationBusy || routineBusy(id) || !service || typeof service.endRoutine !== "function") return

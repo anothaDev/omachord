@@ -16,12 +16,20 @@ cp -- "$ROOT/test/qml-runtime/KeyboardPanel.qml" "$TEST_DIR/Ui/KeyboardPanel.qml
 for file in BarWidget.qml BrandIcon.qml RoutinePopup.qml PendingSwitch.qml ThemePalette.qml Model.js Conditions.js assets; do
   ln -s "$ROOT/$file" "$TEST_DIR/$file"
 done
+mkdir -p "$TEST_DIR/home" "$TEST_DIR/config" "$TEST_DIR/state" "$TEST_DIR/data" \
+  "$TEST_DIR/cache" "$TEST_DIR/runtime" "$TEST_DIR/tmp"
+chmod 700 "$TEST_DIR/runtime"
 
 for fixture in bar.qml bar-keyboard.qml; do
   cp -- "$ROOT/test/qml-runtime/$fixture" "$TEST_DIR/shell.qml"
   for scale in 1 2; do
     log="$TEST_DIR/runtime-$fixture-$scale.log"
-    if ! QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR="$scale" \
+    if ! env -i PATH=/usr/bin:/bin LANG=C HOME="$TEST_DIR/home" \
+      XDG_CONFIG_HOME="$TEST_DIR/config" XDG_STATE_HOME="$TEST_DIR/state" \
+      XDG_DATA_HOME="$TEST_DIR/data" XDG_CACHE_HOME="$TEST_DIR/cache" \
+      XDG_RUNTIME_DIR="$TEST_DIR/runtime" TMPDIR="$TEST_DIR/tmp" \
+      OMACHORD_RUNNER_PATH="$ROOT/bin/omachord" \
+      QT_QPA_PLATFORM=offscreen QT_SCALE_FACTOR="$scale" \
       timeout 15s quickshell --no-duplicate --path "$TEST_DIR/shell.qml" --no-color >"$log" 2>&1 \
       || ! grep -q OMACHORD_BAR_TEST_PASS "$log" \
       || grep -Eq 'OMACHORD_BAR_TEST_FAIL|Error:|Unable to assign|Binding loop' "$log"; then

@@ -2288,6 +2288,34 @@ command_commands() {
   ] | unique_by(.route) | sort_by(.route)' <<<"$metadata"
 }
 
+command_themes() {
+  [[ $# -eq 0 ]] || fail "Usage: omachord themes" usage
+  # Preserve the panel's stdout-only protocol. The fixed shim only redirects
+  # stderr and execs literal argv; neither program nor arguments become code.
+  control_capture /usr/bin/env -u BASH_ENV -u ENV /usr/bin/bash -c \
+    'exec 2>/dev/null; exec -- "$@"' omachord-probe omarchy-theme-list \
+    || fail "Could not list Omarchy themes" themes-unavailable
+}
+
+command_service_status() {
+  [[ $# -eq 0 ]] || fail "Usage: omachord service-status" usage
+  local snapshot
+  snapshot=$(control_capture /usr/bin/env -u BASH_ENV -u ENV /usr/bin/bash -c \
+    'exec 2>/dev/null; exec -- "$@"' omachord-probe omarchy-shell omachord status) \
+    || fail "Could not read the Omachord service status" service-status-unavailable
+  jq -e -s 'length == 1 and (.[0] | type == "object")' <<<"$snapshot" >/dev/null 2>&1 \
+    || fail "The Omachord service returned an invalid status" service-status-unavailable
+  printf '%s\n' "$snapshot"
+}
+
+command_theme_palette() {
+  [[ $# -eq 0 ]] || fail "Usage: omachord theme-palette" usage
+  local theme_dir=${OMACHORD_THEME_DIR:-$STATE_HOME/omarchy/current/theme}
+  local theme_name=${OMACHORD_THEME_NAME_FILE:-$STATE_HOME/omarchy/current/theme.name}
+  control_capture "$FS_HELPER" theme-palette "$theme_dir/colors.toml" "$theme_name" \
+    || fail "Could not read the Omarchy theme palette" theme-palette-unavailable
+}
+
 command_toggles() {
   local capture error
   [[ $# -eq 0 ]] || fail "Usage: omachord toggles" usage
@@ -4007,6 +4035,9 @@ main() {
       bindings_json || fail "Could not read Omarchy keybindings" bindings-unavailable
       ;;
     commands) command_commands "$@" ;;
+    themes) command_themes "$@" ;;
+    service-status) command_service_status "$@" ;;
+    theme-palette) command_theme_palette "$@" ;;
     toggles) command_toggles "$@" ;;
     run) require_prepared_state; command_run "$@" ;;
     activate) require_prepared_state; command_activate "$@" ;;

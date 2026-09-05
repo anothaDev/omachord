@@ -310,6 +310,12 @@ ShellRoot {
         root.panel.requestRefresh()
         root.waitFor(function() { return root.panel.configLoaded && root.panel.status.probe === "initial" },
           "initial fallback configuration/status did not load")
+        root.waitFor(function() { return root.panel.themeOptions.length === 1
+          && root.panel.themeOptions[0].label === "Fixture Theme"
+          && root.panel.serviceStatus && root.panel.serviceStatus.ready === true },
+          "bounded runner theme and service probes did not populate the panel")
+        root.waitFor(function() { return root.started("themes", "default") && root.started("service-status", "default") },
+          "supplemental probes bypassed the runner")
         root.testSuccessfulConnections()
         root.testFailureReconciliation()
         root.testUnavailableProbes()

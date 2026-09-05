@@ -3,6 +3,7 @@
 use strict;
 use warnings;
 use Digest::SHA;
+use Encode qw(decode FB_CROAK);
 use Errno qw(EEXIST ENOENT);
 use Fcntl qw(F_SETFD LOCK_EX O_CREAT O_DIRECTORY O_EXCL O_NOFOLLOW O_NONBLOCK O_RDONLY O_RDWR O_WRONLY S_ISDIR S_ISREG);
 use IO::Handle;
@@ -1100,6 +1101,47 @@ sub list_toggles {
   return { names => [sort @names] };
 }
 
+sub read_theme_text {
+  my ($path, $limit) = @_;
+  path_parts($path);
+  # A pathname check before open cannot exclude a concurrently substituted
+  # FIFO. Inspect the nonblocking opened descriptor before reading any bytes.
+  sysopen(my $file, $path, O_RDONLY | O_NONBLOCK) or do {
+    return "" if $! == ENOENT;
+    abort_operation("theme-unavailable", "Could not open theme file: $path");
+  };
+  my @identity = stat($file);
+  abort_operation("unsafe-entry", "Theme input is not a regular file: $path")
+    unless @identity && S_ISREG($identity[2]);
+  my $text = "";
+  while (1) {
+    my $read = sysread($file, my $chunk, $limit + 1 - length($text));
+    abort_operation("io-error", "Could not read theme file: $path") unless defined $read;
+    last if $read == 0;
+    $text .= $chunk;
+    abort_operation("byte-limit", "Theme file exceeds its $limit byte limit: $path")
+      if length($text) > $limit;
+  }
+  my $decoded = eval { decode("UTF-8", $text, FB_CROAK) };
+  abort_operation("invalid-text", "Theme file is not valid UTF-8: $path") unless defined $decoded;
+  return $decoded;
+}
+
+sub theme_palette {
+  my ($colors_path, $name_path) = @_;
+  my $colors = read_theme_text($colors_path, 65536);
+  my $name = read_theme_text($name_path, 4096);
+  my $green = "";
+  for my $line (split /\n/, $colors) {
+    if ($line =~ /\A\s*green\s*=\s*["']?(\#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?)["']?\s*(?:\#.*)?\z/) {
+      $green = $1;
+      last;
+    }
+  }
+  $name =~ s/\A\s+|\s+\z//g;
+  return { green => $green, name => $name };
+}
+
 sub run_json_operation {
   local @RECOVERY_ENTRIES;
   my ($operation) = @_;
@@ -1211,6 +1253,13 @@ if ($command eq "unique-write") {
 if ($command eq "list-toggles") {
   my ($path, $max_entries, $max_bytes) = @ARGV;
   run_json_operation(sub { list_toggles($path, $max_entries, $max_bytes) });
+}
+
+if ($command eq "theme-palette") {
+  run_json_operation(sub {
+    abort_operation("usage", "Expected two theme paths") unless @ARGV == 2;
+    theme_palette(@ARGV);
+  });
 }
 
 abort_operation("usage", "Unknown filesystem-helper command");
