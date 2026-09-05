@@ -15,7 +15,6 @@ Column {
   property color urgent: Color.urgent
   property color success: Color.accent
   property string fontFamily: Style.font.family
-  property string icon: ""
   property var rows: []
   property bool busy: false
   // Null means an older service only exposes the global busy flag. Newer
@@ -89,13 +88,11 @@ Column {
     foreground: popup.foreground
     fontFamily: popup.fontFamily
     iconComponent: Component {
-      Text {
-        textFormat: Text.PlainText
-        text: popup.icon
-        color: popup.foreground
+      BrandIcon {
+        width: Style.font.display
+        height: width
+        foreground: popup.foreground
         opacity: popup.integrationOn ? 1 : 0.5
-        font.family: popup.fontFamily
-        font.pixelSize: Style.font.display
         Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
       }
     }

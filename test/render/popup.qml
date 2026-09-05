@@ -23,7 +23,7 @@ ShellRoot {
           id: popup
           anchors.fill: parent
           anchors.margins: 16
-          icon: "󰘮"; success: "#68c98b"; integrationOn: true
+          success: "#68c98b"; integrationOn: true
           rows: Quickshell.env("WIDGET_EMPTY") === "1" ? [] : root.sampleRows
           cursorIndex: 0
         }

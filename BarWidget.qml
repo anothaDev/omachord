@@ -28,7 +28,6 @@ Panel {
   readonly property int barSize: bar ? bar.barSize : Style.bar.sizeHorizontal
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color panelForeground: bar ? bar.foreground : Color.foreground
-  readonly property string icon: "󰘮"
   readonly property string leadName: hasActive ? String(activeList[0].name || activeList[0].id) : ""
   readonly property string summary: !service ? "Omachord service is not running"
     : (!hasActive ? (integrationOn ? "Omachord: nothing on" : "Omachord is off")
@@ -109,8 +108,13 @@ Panel {
 
     BarIconButton {
       id: button
+      objectName: "omachordBarButton"
       bar: root.bar
-      text: root.icon
+      iconComponent: Component {
+        BrandIcon {
+          foreground: button.foreground
+        }
+      }
       dimmed: !root.hasActive
       useActiveColor: false
       tooltipText: root.summary
@@ -189,7 +193,6 @@ Panel {
         urgent: root.bar ? root.bar.urgent : Color.urgent
         success: palette.success
         fontFamily: root.fontFamily
-        icon: root.icon
         rows: root.activeList
         busy: root.busy
         pendingIds: root.service && root.service.routinePendingIds !== undefined
