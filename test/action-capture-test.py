@@ -119,9 +119,17 @@ BEGIN {
     assert status == 124, (status, errors)
 
     # Direct argv cannot be interpreted as options to Bash's exec builtin.
-    p, control, output = launch("tail", 256, ["--", "/usr/bin/printf", "WRONG"])
+    for option in ("-c", "-a", "-l", "--"):
+        p, control, output = launch("tail", 256, [option, "/usr/bin/printf", "WRONG"])
+        status, errors = finish(p)
+        assert status != 0 and b"WRONG" not in output.read_bytes(), (option, status, errors)
+    literal = fixture / "-c"
+    literal.write_text('#!/bin/bash\nprintf "%s|%s" "$1" "$CAPTURE_LITERAL_ENV"\n')
+    literal.chmod(0o700)
+    env.update(PATH=str(fixture) + ":/usr/bin:/bin", CAPTURE_LITERAL_ENV="kept")
+    p, control, output = launch("tail", 256, ["-c", "literal"])
     status, errors = finish(p)
-    assert status != 0 and b"WRONG" not in output.read_bytes(), (status, errors)
+    assert status == 0 and output.read_bytes() == b"literal|kept", (status, errors)
 
     reaped = set()
     signals = 0
