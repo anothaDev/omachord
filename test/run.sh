@@ -13,6 +13,8 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 bash "$ROOT/test/qml-bar-test.sh"
 "$ROOT/test/qml-service-test.sh"
 "$ROOT/test/qml-panel-enable-test.sh"
+"$ROOT/test/qml-panel-connection-test.sh"
+"$ROOT/test/qml-toggle-test.sh"
 node "$ROOT/test/model-test.mjs"
 node "$ROOT/test/conditions-test.mjs"
 node "$ROOT/test/qml-plain-text-test.mjs"
@@ -27,6 +29,8 @@ qmllint -I /usr/share/omarchy/shell \
   "$ROOT/Panel.qml" \
   "$ROOT/PanelScrollBar.qml" \
   "$ROOT/PlainTextButton.qml" \
+  "$ROOT/PendingSwitch.qml" \
+  "$ROOT/PendingToggle.qml" \
   "$ROOT/ChoicePicker.qml" \
   "$ROOT/RoutineEditor.qml" \
   "$ROOT/ActionCard.qml" \

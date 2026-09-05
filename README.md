@@ -67,6 +67,8 @@ On first use, Omachord automatically performs its system-integration transaction
 
 Turning the **Omachord** switch off removes generated integration and persists that preference. Saving while it is off only updates the routine document and never reactivates integration. Turning it on performs the same guarded transaction again, including the required Hyprland reload. The same switch sits in the bar popup.
 
+Switches keep a fixed size and replace their thumb with a spinner while an operation is pending. Repeat activation is ignored until it finishes; unrelated routine switches remain available. The bar and panel share connection progress, and the confirmed on/off state is published before the switch becomes available again. A disabled control that is not waiting for an operation (for example, a live routine switch with unsaved edits) does not spin.
+
 ## Panel
 
 The window has three views, chosen from the sidebar or with a payload (`omarchy-shell shell summon anothadev.omachord '{"view":"activity"}'`):
@@ -240,9 +242,11 @@ Tests additionally require Node.js, `luac`, `qmllint`, `qmltestrunner`, `desktop
 
 It exercises strict and byte-bounded schema validation, bounded toggle discovery, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, descriptor-pinned transaction races and durability failures, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, model and condition logic, runtime QML interaction, an offscreen run of the condition service against a fake runner, plugin validation, and QML linting.
 
+The toggle regressions cover fixed geometry, animated pending states, mouse/keyboard/accessibility activation, shared panel/bar connection progress, stale status replies, and failure recovery. The runner speed suite checks that shortcut processing uses a constant number of `jq` launches as the shortcut count grows; its reported connect/status timings are diagnostic, not desktop latency guarantees.
+
 GitHub Actions runs the required `portable` check on pushes and pull requests. It includes source and manifest validation, the filesystem transaction tests, the action-supervisor tests, the runner integration tests with mocked desktop commands, and the Node.js model, condition, and QML policy tests. The job uses Debian 13 for GNU coreutils 9.5+ (`mv --exchange` and `--update=none-fail`); the shell test suites run as a non-root user so permission-denial checks remain meaningful. It does not replace the full local gate: run `test/run.sh` before releasing to also check the target desktop versions, plugin validation, runtime QML behavior, and QML linting.
 
-`test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup offscreen into `test/render/out/` so a change can be reviewed as images. It reads your real configuration through the runner but never writes.
+`test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup (including off and pending states) offscreen into `test/render/out/` so a change can be reviewed as images. It reads your real configuration through the runner but never writes.
 
 ## License
 

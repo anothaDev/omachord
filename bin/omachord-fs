@@ -307,25 +307,43 @@ sub open_adjacent_directory {
 }
 
 sub file_open_state {
-  my ($path) = @_;
-  return -1 if $ENV{OMACHORD_FS_TEST_FAIL_FUSER};
-  open my $saved, ">&", STDERR
-    or return -1;
-  open STDERR, ">", "/dev/null"
-    or return -1;
-  my $status = system("/usr/bin/fuser", "-sI", $path);
-  open STDERR, ">&", $saved or return -1;
+  my (@paths) = @_;
+  return -1 if !@paths || $ENV{OMACHORD_FS_TEST_FAIL_FUSER};
+  my $pid = open(my $inspection, "-|");
+  return -1 unless defined $pid;
+  if ($pid == 0) {
+    open STDERR, ">&", STDOUT or exit 2;
+    exec("/usr/bin/fuser", "-sI", @paths) or exit 2;
+  }
+  # Exit 1 means either no access or an inspection error. Silent mode emits
+  # nothing on a clean scan; any diagnostic makes the result uncertain. Drain
+  # in fixed-size chunks without retaining output or filling a pipe/disk file.
+  my $uncertain = 0;
+  while (1) {
+    my $read = sysread($inspection, my $buffer, 4096);
+    if (!defined $read) {
+      $uncertain = 1;
+      last;
+    }
+    last if $read == 0;
+    $uncertain = 1;
+  }
+  close $inspection;
+  my $status = $?;
+  return -1 if $uncertain;
   return 1 if $status == 0;
   return 0 if $status == 256;
   return -1;
 }
 
 sub archive_entry {
-  my ($source_directory, $source_name, $destination, $kind, $archive_root, $stable) = @_;
+  my ($source_directory, $source_name, $destination, $kind, $archive_root, $stable,
+      $open_state) = @_;
   my $source = component_path($source_directory, $source_name);
   if ($kind eq "retired" && defined($stable)) {
     my $current = eval { fingerprint_entry($source_directory, $source_name, $destination, 0) };
-    if (defined($current) && $current eq $stable && file_open_state($source) == 0) {
+    if (defined($current) && $current eq $stable
+        && (defined($open_state) ? $open_state : file_open_state($source)) == 0) {
       my $again = eval { fingerprint_entry($source_directory, $source_name, $destination, 0) };
       if (defined($again) && $again eq $stable) {
         unlink_entry($source_directory, $source_name, $destination);
@@ -376,6 +394,37 @@ sub archive_entry {
   unlink_entry($source_directory, $source_name, $destination);
   sync_handle($source_directory, "directory containing $destination");
   return "$archive_display/$target_name";
+}
+
+sub retire_remove_entries {
+  my ($directory, $destination, $archive_root, @entries) = @_;
+  # Both names are already quarantined and the removal is durable. fuser's
+  # zero exit means ANY argument is open: preserve both in that case, or if
+  # either fingerprint/inspection is uncertain. Never reuse this scan outside
+  # this pair; archive_entry still rechecks each fingerprint before unlinking.
+  my $closed = eval {
+    my $stable = 1;
+    for my $pass (1 .. 2) {
+      for my $entry (@entries) {
+        $stable = 0
+          if fingerprint_entry($directory, $entry->[0], $destination, 0) ne $entry->[1];
+      }
+      last unless $stable;
+      if ($pass == 1) {
+        $stable = file_open_state(map { component_path($directory, $_->[0]) } @entries) == 0;
+        last unless $stable;
+      }
+    }
+    $stable;
+  };
+  for my $entry (@entries) {
+    # Keep cleanup failures isolated: failure to archive one inode must not
+    # skip preservation of its partner or change the committed result.
+    eval {
+      archive_entry($directory, $entry->[0], $destination, "retired",
+        "$archive_root/retired", $closed ? $entry->[1] : undef, 0);
+    };
+  }
 }
 
 sub pause_for_test {
@@ -876,14 +925,8 @@ sub cas_remove {
   close $file;
   # The missing destination is durable now. Cleanup cannot turn a committed
   # removal into a reported failure; uncertain inodes remain preserved.
-  eval {
-    archive_entry($directory, $quarantine, $destination, "retired",
-      "$archive_root/retired", $placeholder_fingerprint);
-  };
-  eval {
-    archive_entry($directory, $placeholder, $destination, "retired",
-      "$archive_root/retired", $expected);
-  };
+  retire_remove_entries($directory, $destination, $archive_root,
+    [$quarantine, $placeholder_fingerprint], [$placeholder, $expected]);
   eval { sync_handle($directory, "directory containing $destination") };
   return {};
 }

@@ -12,6 +12,7 @@ BorderSurface {
   required property int index
   property int count: 0
   property bool endList: false
+  property bool busy: false
   property var typeOptions: []
   property var appOptions: []
   property var commandOptions: []
@@ -154,7 +155,8 @@ BorderSurface {
       width: parent.width
       spacing: Style.spacing.rowGap
 
-      Toggle {
+      PendingToggle {
+        busy: card.busy
         visible: card.booleanSetter
         width: parent.width
         label: card.setterLabel()
@@ -165,15 +167,11 @@ BorderSurface {
         foreground: card.foreground
         accent: card.accent
         activeFocusOnTab: true
-        Keys.onReturnPressed: clicked()
-        Keys.onEnterPressed: clicked()
-        Keys.onSpacePressed: clicked()
         onClicked: card.fieldChanged("value", !checked)
         Accessible.role: Accessible.CheckBox
         Accessible.name: card.setterLabel()
         Accessible.checkable: true
         Accessible.checked: checked
-        Accessible.onPressAction: clicked()
       }
 
       ChoicePicker {
@@ -203,7 +201,8 @@ BorderSurface {
         Component.onCompleted: field.Accessible.name = label
       }
 
-      Toggle {
+      PendingToggle {
+        busy: card.busy
         visible: !card.endList
         width: parent.width
         label: "Put it back when the routine ends"
@@ -212,15 +211,11 @@ BorderSurface {
         foreground: card.foreground
         accent: card.accent
         activeFocusOnTab: true
-        Keys.onReturnPressed: clicked()
-        Keys.onEnterPressed: clicked()
-        Keys.onSpacePressed: clicked()
         onClicked: card.fieldChanged("restore", !checked)
         Accessible.role: Accessible.CheckBox
         Accessible.name: "Restore the previous value when the routine ends"
         Accessible.checkable: true
         Accessible.checked: checked
-        Accessible.onPressAction: clicked()
       }
     }
 
@@ -229,7 +224,8 @@ BorderSurface {
       width: parent.width
       spacing: Style.spacing.rowGap
 
-      Toggle {
+      PendingToggle {
+        busy: card.busy
         width: parent.width
         label: "State-dependent sound"
         description: "Play one cue when muted and another when live."
@@ -237,15 +233,11 @@ BorderSurface {
         foreground: card.foreground
         accent: card.accent
         activeFocusOnTab: true
-        Keys.onReturnPressed: clicked()
-        Keys.onEnterPressed: clicked()
-        Keys.onSpacePressed: clicked()
         onClicked: card.fieldChanged("sound", !checked)
         Accessible.role: Accessible.CheckBox
         Accessible.name: "State-dependent microphone sound"
         Accessible.checkable: true
         Accessible.checked: checked
-        Accessible.onPressAction: clicked()
       }
       Column {
         visible: card.modelData && card.modelData.sound === true

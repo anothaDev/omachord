@@ -37,7 +37,11 @@ run_runtime_test() {
 
   cp -- "$ROOT/test/qml-runtime/$fixture" "$TEST_DIR/shell.qml"
   : >"$LOG_FILE"
-  export OMACHORD_RUNNER_PATH="$ROOT/test/qml-runtime/$runner"
+  if [[ $runner = /* ]]; then
+    export OMACHORD_RUNNER_PATH="$runner"
+  else
+    export OMACHORD_RUNNER_PATH="$ROOT/test/qml-runtime/$runner"
+  fi
   QT_QPA_PLATFORM=offscreen quickshell --no-duplicate --path "$TEST_DIR/shell.qml" --no-color \
     >"$LOG_FILE" 2>&1 &
   runtime_pid=$!
@@ -62,5 +66,13 @@ run_runtime_test() {
 
 run_runtime_test service.qml fake-runner 'service runtime regression'
 run_runtime_test service-concurrency.qml fake-concurrency-runner 'service concurrency regression'
+
+# A private executable lets the connection fixture test FailedToStart without
+# changing the tracked runner or touching any user configuration.
+cp -- "$ROOT/test/qml-runtime/fake-connection-runner" "$TEST_DIR/connection-runner"
+chmod +x "$TEST_DIR/connection-runner"
+: >"$TEST_DIR/connection-calls.log"
+printf '{}\n' >"$OMACHORD_STATE_DIR/connection.json"
+run_runtime_test service-connection.qml "$TEST_DIR/connection-runner" 'service connection regression'
 
 printf 'Service runtime test passed.\n'

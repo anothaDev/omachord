@@ -17,6 +17,8 @@ Item {
   property var toggleOptions: []
   property var targetWindow: null
   property bool busy: false
+  // A permanently unavailable editor is disabled, but must not spin forever.
+  property bool operationPending: busy
   property bool running: false
   property bool persisted: true
   property bool showBack: false
@@ -651,28 +653,27 @@ Item {
 
         // The live switch: on or off right now. The saved "enabled" flag
         // lives in the form below so the two cannot be confused.
-        ToggleSwitch {
+        PendingSwitch {
           id: liveSwitch
+          objectName: "routineLiveSwitch"
           visible: root.stateful && root.persisted
           anchors.verticalCenter: parent.verticalCenter
           checked: root.isActive
-          busy: root.running
+          busy: root.running || root.operationPending
           interactive: root.canRun && !root.dirty && !root.running
           foreground: root.foreground
           accent: root.accent
           activeFocusOnTab: visible
-          Keys.onReturnPressed: if (interactive) root.runRequested(root.draft.id)
-          Keys.onEnterPressed: if (interactive) root.runRequested(root.draft.id)
-          Keys.onSpacePressed: if (interactive) root.runRequested(root.draft.id)
           onToggled: if (interactive) root.runRequested(root.draft.id)
           Accessible.role: Accessible.CheckBox
           Accessible.name: root.isActive ? "Turn the routine off now" : "Turn the routine on now"
           Accessible.checkable: true
           Accessible.checked: checked
-          Accessible.onPressAction: if (interactive) root.runRequested(root.draft.id)
+          Accessible.description: busy ? "Waiting for the current operation" : ""
           PanelToolTip {
             visible: parent.containsMouse
-            text: root.dirty ? "Save the routine first" : (root.isActive ? "Turn off now and put settings back" : "Turn on now")
+            text: parent.busy ? "Waiting for the current operation..."
+              : root.dirty ? "Save the routine first" : (root.isActive ? "Turn off now and put settings back" : "Turn on now")
           }
         }
       }
@@ -732,7 +733,9 @@ Item {
               }
             }
 
-            Toggle {
+            PendingToggle {
+              objectName: "routineDraftEnabled"
+              busy: root.operationPending
               width: parent.width
               label: "Enabled"
               description: "Shortcuts, events, and conditions may start this routine. Turning it off while it is on ends it on save."
@@ -740,15 +743,11 @@ Item {
               foreground: root.foreground
               accent: root.accent
               activeFocusOnTab: true
-              Keys.onReturnPressed: clicked()
-              Keys.onEnterPressed: clicked()
-              Keys.onSpacePressed: clicked()
               onClicked: root.updateField("enabled", !checked)
               Accessible.role: Accessible.CheckBox
               Accessible.name: "Enabled"
               Accessible.checkable: true
               Accessible.checked: checked
-              Accessible.onPressAction: clicked()
             }
           }
 
@@ -1278,6 +1277,7 @@ Item {
               model: root.draft ? root.draft.actions : []
 
               ActionCard {
+                busy: root.operationPending
                 width: parent.width
                 count: root.draft ? root.draft.actions.length : 0
                 typeOptions: root.actionTypeOptions
@@ -1365,6 +1365,7 @@ Item {
                   model: root.draft ? root.draft.onEnd.actions : []
 
                   ActionCard {
+                    busy: root.operationPending
                     width: parent.width
                     endList: true
                     count: root.draft ? root.draft.onEnd.actions.length : 0
@@ -1485,9 +1486,9 @@ Item {
 
             Button {
               id: saveButton
-              text: root.busy ? "Saving…" : (root.persisted ? "Save" : "Save routine")
-              iconText: root.busy ? "󰦖" : "󰆓"
-              iconSpinning: root.busy
+              text: root.operationPending ? "Saving…" : (root.persisted ? "Save" : "Save routine")
+              iconText: root.operationPending ? "󰦖" : "󰆓"
+              iconSpinning: root.operationPending
               bordered: true
               focusable: true
               active: root.dirty

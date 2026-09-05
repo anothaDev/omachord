@@ -46,6 +46,7 @@ case "${1:-} ${2:-} ${3:-}" in
     if [[ -e $TEST_ROOT/trace-keybindings ]]; then
       printf '%s\n' keybindings >>"$TEST_ROOT/keybindings.calls"
     fi
+    [[ ! -e $TEST_ROOT/catalogue-unavailable ]] || exit 1
     cat "$TEST_ROOT/bindings.txt"
     ;;
   "audio input mute")
@@ -72,6 +73,9 @@ case ${1:-} in
   reload)
     count=$(cat "$TEST_ROOT/reload.count" 2>/dev/null || printf 0)
     printf '%s\n' "$((count + 1))" >"$TEST_ROOT/reload.count"
+    if [[ -e $TEST_ROOT/bindings-after-reload.txt ]]; then
+      cp -- "$TEST_ROOT/bindings-after-reload.txt" "$TEST_ROOT/bindings.txt"
+    fi
     ;;
   *) exit 1 ;;
 esac
@@ -168,8 +172,7 @@ counter_bin="$TEST_ROOT/jq-counter-bin"
 mkdir -p "$counter_bin"
 cat >"$counter_bin/jq" <<'STUB'
 #!/bin/bash
-count=$(/usr/bin/cat "$OMACHORD_JQ_COUNT_FILE" 2>/dev/null || printf 0)
-printf '%s\n' "$((count + 1))" >"$OMACHORD_JQ_COUNT_FILE"
+printf '%s\n' jq >>"$OMACHORD_JQ_COUNT_FILE"
 exec /usr/bin/jq "$@"
 STUB
 chmod +x "$counter_bin/jq"
@@ -185,7 +188,7 @@ OMACHORD_JQ_COUNT_FILE="$TEST_ROOT/jq.count" PATH="$counter_bin:$PATH" \
   "$RUNNER" bindings >"$TEST_ROOT/bindings.json"
 bindings_elapsed=$(($(date +%s%3N) - bindings_started))
 row_overhead=$((bindings_elapsed - single_elapsed))
-jq_count=$(cat "$TEST_ROOT/jq.count")
+jq_count=$(wc -l <"$TEST_ROOT/jq.count")
 /usr/bin/jq -e '
   length == 250
   and any(.[]; .keys == "SUPER + M"
@@ -223,6 +226,194 @@ fi
 : >"$TEST_ROOT/bindings.txt"
 printf 'BENCH bindings rows=250 jq_processes=%s single_ms=%s elapsed_ms=%s row_overhead_ms=%s\n' \
   "$jq_count" "$single_elapsed" "$bindings_elapsed" "$row_overhead"
+
+# Global Connect and its following status refresh must not spawn jq once per
+# shortcut. Count real jq executions around public commands, not test setup;
+# elapsed times are diagnostics only, since filesystem durability is unchanged.
+measure_global() {
+  local label=$1 command=$2 started
+  : >"$TEST_ROOT/global-jq.calls"
+  : >"$TEST_ROOT/keybindings.calls"
+  : >"$TEST_ROOT/hypr.calls"
+  touch "$TEST_ROOT/trace-keybindings" "$TEST_ROOT/trace-hypr"
+  started=$(date +%s%3N)
+  OMACHORD_JQ_COUNT_FILE="$TEST_ROOT/global-jq.calls" PATH="$counter_bin:$PATH" \
+    "$RUNNER" "$command" >"$TEST_ROOT/$label-$command.json"
+  MEASURE_ELAPSED=$(($(date +%s%3N) - started))
+  MEASURE_JQ_COUNT=$(wc -l <"$TEST_ROOT/global-jq.calls")
+  MEASURE_CATALOGUE_COUNT=$(wc -l <"$TEST_ROOT/keybindings.calls")
+  rm -f -- "$TEST_ROOT/trace-keybindings" "$TEST_ROOT/trace-hypr"
+  printf 'BENCH global %s command=%s jq_processes=%s catalogue_queries=%s elapsed_ms=%s\n' \
+    "$label" "$command" "$MEASURE_JQ_COUNT" "$MEASURE_CATALOGUE_COUNT" "$MEASURE_ELAPSED"
+}
+
+for shortcut_count in 1 64; do
+  "$RUNNER" disconnect >/dev/null
+  MANY_CONFIG=$(jq -cn --argjson count "$shortcut_count" '{version:1,routines:[
+    range(1; $count + 1) | tostring as $index | {
+      id:("shortcut-" + $index), name:("Shortcut " + $index), enabled:true,
+      triggers:[{type:"shortcut",keys:("SUPER + KEY" + $index),override:false}],
+      actions:[{type:"delay",milliseconds:0}]
+    }
+  ]}')
+  apply_config "$MANY_CONFIG" >/dev/null
+  measure_global "shortcuts=$shortcut_count" connect
+  connect_jq_count=$MEASURE_JQ_COUNT
+  assert_eq "$MEASURE_CATALOGUE_COUNT" 2 "Connect must check fresh bindings again after reload"
+  assert_eq "$(grep -c '^reload$' "$TEST_ROOT/hypr.calls")" 1 "Connect must reload exactly once"
+  jq -e --argjson count "$shortcut_count" '
+    .ok and .connected and (.repaired | not)
+    and (.revision | test("^sha256:[0-9a-f]{64}$"))
+    and .warnings == [range(1; $count + 1) | tostring as $index
+      | "SUPER + KEY\($index) did not resolve to Omachord: Shortcut \($index) after reload"]
+  ' "$TEST_ROOT/shortcuts=$shortcut_count-connect.json" >/dev/null \
+    || fail "Connect lost ordered shadow warnings or its success contract"
+  assert_eq "$(stat -c %a "$HYPR_DIR/omachord.lua")" 600 "Connect changed generated Lua permissions"
+  config_before=$(sha256sum -- "$CONFIG_PATH")
+  generated_before=$(stat -c '%d:%i:%s:%a' "$HYPR_DIR/omachord.lua")
+  measure_global "shortcuts=$shortcut_count" status
+  jq -e '.ok and .connected and .configValid and .integrationComplete and .hyprlandClean' \
+    "$TEST_ROOT/shortcuts=$shortcut_count-status.json" >/dev/null \
+    || fail "global status lost integration validation"
+  assert_eq "$MEASURE_CATALOGUE_COUNT" 0 "status queried the shortcut catalogue"
+  assert_eq "$(sha256sum -- "$CONFIG_PATH")" "$config_before" "status changed the configuration"
+  assert_eq "$(stat -c '%d:%i:%s:%a' "$HYPR_DIR/omachord.lua")" "$generated_before" \
+    "status replaced generated Lua"
+  if ((shortcut_count == 1)); then
+    single_connect_jq_count=$connect_jq_count
+    single_status_jq_count=$MEASURE_JQ_COUNT
+  else
+    ((connect_jq_count <= single_connect_jq_count)) \
+      || fail "63 extra shortcuts added $((connect_jq_count - single_connect_jq_count)) jq processes to Connect"
+    ((MEASURE_JQ_COUNT <= single_status_jq_count)) \
+      || fail "63 extra shortcuts added $((MEASURE_JQ_COUNT - single_status_jq_count)) jq processes to status"
+  fi
+done
+
+# Literal field transport must retain Bash's exact Lua bytes, including tabs,
+# surrounding whitespace, quotes and backslashes (JSON quoting is not Lua
+# quoting). Disabled and hook-only routines must not produce bindings.
+QUOTED_CONFIG=$(jq -cn --arg name $' \t"Quoted" \\ $(touch should-not-run)  ' '{version:1,routines:[
+  {id:"quoted",name:$name,enabled:true,
+   triggers:[{type:"shortcut",keys:"SUPER + Q",override:true}],actions:[]},
+  {id:"punctuation",name:"Punctuation",enabled:true,
+   triggers:[{type:"shortcut",keys:"SUPER + \"\\",override:false}],actions:[]},
+  {id:"disabled",name:"Disabled",enabled:false,
+   triggers:[{type:"shortcut",keys:"SUPER + D",override:true}],actions:[]},
+  {id:"hook",name:"Hook",enabled:true,
+   triggers:[{type:"hook",event:"post-boot"}],actions:[]}
+]}')
+apply_config "$QUOTED_CONFIG" >/dev/null
+{
+  printf '%s\n' '-- Generated by Omachord. Do not edit.'
+  printf 'local runner = "%s/bin/omachord"\n' "$PLUGIN_DIR"
+  cat <<'LUA'
+if o.cmd_present(runner) then
+  hl.unbind("SUPER + Q")
+  o.bind("SUPER + Q", "Omachord:  	\"Quoted\" \\ $(touch should-not-run)  ", o.shell_quote(runner) .. " run " .. o.shell_quote("quoted") .. " shortcut")
+  o.bind("SUPER + \"\\", "Omachord: Punctuation", o.shell_quote(runner) .. " run " .. o.shell_quote("punctuation") .. " shortcut")
+end
+LUA
+} >"$TEST_ROOT/quoted.expected.lua"
+cmp -s -- "$TEST_ROOT/quoted.expected.lua" "$HYPR_DIR/omachord.lua" \
+  || fail "batched shortcut extraction changed literal Lua bytes"
+
+# Conflict order is routine order first, then the catalogue's sorted order,
+# not input row order. A brand-like prefix alone must never confer ownership.
+MATCH_CONFIG='{"version":1,"routines":[
+  {"id":"first","name":"First","enabled":true,"triggers":[{"type":"shortcut","keys":"SUPER + B","override":false}],"actions":[]},
+  {"id":"second","name":"Second","enabled":true,"triggers":[{"type":"shortcut","keys":"SUPER + A","override":false}],"actions":[]}
+]}'
+cat >"$TEST_ROOT/bindings.txt" <<'ROWS'
+SUPER + B -> Zulu first-key conflict
+SUPER + A -> Aardvark second-key conflict
+SUPER + B -> Alpha first-key conflict
+ROWS
+config_before=$(sha256sum -- "$CONFIG_PATH")
+if apply_config "$MATCH_CONFIG" >"$TEST_ROOT/first-conflict.json"; then
+  fail "Connect preflight accepted conflicting shortcuts"
+fi
+jq -e '. == {ok:false,code:"shortcut-conflict",error:"SUPER + B is already assigned to Alpha first-key conflict"}' \
+  "$TEST_ROOT/first-conflict.json" >/dev/null || fail "first-conflict selection changed"
+assert_eq "$(sha256sum -- "$CONFIG_PATH")" "$config_before" "conflict check changed the configuration"
+OVERRIDE_CONFIG=$(jq -c '.routines[0].triggers[0].override = true' <<<"$MATCH_CONFIG")
+printf '%s\n' 'SUPER + A -> Omachord: Personal binding' >>"$TEST_ROOT/bindings.txt"
+if apply_config "$OVERRIDE_CONFIG" >"$TEST_ROOT/override-conflict.json"; then
+  fail "overriding one shortcut suppressed another shortcut conflict"
+fi
+jq -e '.error == "SUPER + A is already assigned to Aardvark second-key conflict"' \
+  "$TEST_ROOT/override-conflict.json" >/dev/null || fail "override skipped the wrong conflict"
+printf '%s\n' 'SUPER + A -> Omachord: Personal binding' >"$TEST_ROOT/bindings.txt"
+if apply_config "$OVERRIDE_CONFIG" >"$TEST_ROOT/prefix-conflict.json"; then
+  fail "brand-like description was incorrectly attributed to Omachord"
+fi
+jq -e '.error == "SUPER + A is already assigned to Omachord: Personal binding"' \
+  "$TEST_ROOT/prefix-conflict.json" >/dev/null || fail "brand-like prefix conflict changed"
+
+# Preserve the historical empty-first-description behavior. After the reload,
+# replace these external rows with a legacy managed description and a shadow:
+# the warning must be based on this NEW catalogue, never the preflight result.
+printf '%s\n' 'SUPER + B -> ' 'SUPER + B -> Zulu ignored after empty description' \
+  'SUPER + A -> ' >"$TEST_ROOT/bindings.txt"
+cat >"$TEST_ROOT/bindings-after-reload.txt" <<'ROWS'
+SUPER + B -> Oma: First
+SUPER + A -> External shadow
+ROWS
+apply_config "$MATCH_CONFIG" >"$TEST_ROOT/fresh-warnings.json"
+jq -e '.ok and .warnings == ["SUPER + A did not resolve to Omachord: Second after reload"]' \
+  "$TEST_ROOT/fresh-warnings.json" >/dev/null || fail "warnings reused stale bindings or lost legacy attribution"
+"$RUNNER" bindings | jq -e 'any(.[]; .keys == "SUPER + B" and .managed and .description == "Omachord: First")' \
+  >/dev/null || fail "legacy managed binding lost exact attribution"
+rm -f -- "$TEST_ROOT/bindings-after-reload.txt"
+LEGACY_CONFIG=$(jq -c '.routines[1].enabled = false' <<<"$MATCH_CONFIG")
+apply_config "$LEGACY_CONFIG" | jq -e '.ok and .warnings == []' >/dev/null \
+  || fail "legacy managed binding caused a false conflict"
+: >"$TEST_ROOT/bindings.txt"
+
+# Neither an empty document, disabled shortcuts, nor enabled hook-only routines
+# need the shortcut catalogue. Hyprland validation/reload and integration writes
+# must still happen, including when globally disabling the integration again.
+for zero_case in empty disabled hook-only; do
+  "$RUNNER" disconnect >/dev/null
+  case $zero_case in
+    empty) ZERO_CONFIG='{"version":1,"routines":[]}' ;;
+    disabled) ZERO_CONFIG=$(jq -c '.routines[].enabled = false' <<<"$CONFIG") ;;
+    hook-only) ZERO_CONFIG=$(jq -c '.routines[].triggers = [{type:"hook",event:"post-boot"}]' <<<"$CONFIG") ;;
+  esac
+  apply_config "$ZERO_CONFIG" >/dev/null
+  measure_global "$zero_case" connect
+  zero_catalogue_count=$MEASURE_CATALOGUE_COUNT
+  jq -e '.ok and .connected and .warnings == []' "$TEST_ROOT/$zero_case-connect.json" >/dev/null \
+    || fail "Connect without enabled shortcuts failed"
+  assert_eq "$(grep -c '^reload$' "$TEST_ROOT/hypr.calls")" 1 "empty-shortcut Connect skipped reload"
+  measure_global "$zero_case" status
+  jq -e '.ok and .connected and .configValid and .integrationComplete and .hyprlandClean' \
+    "$TEST_ROOT/$zero_case-status.json" >/dev/null \
+    || fail "empty-shortcut status skipped integration validation"
+  assert_eq "$MEASURE_CATALOGUE_COUNT" 0 "empty-shortcut status queried the catalogue"
+  measure_global "$zero_case" disconnect
+  jq -e '. == {ok:true,connected:false,deactivated:[]}' "$TEST_ROOT/$zero_case-disconnect.json" >/dev/null \
+    || fail "Disconnect changed its success contract"
+  assert_eq "$(grep -c '^reload$' "$TEST_ROOT/hypr.calls")" 1 "Disconnect skipped reload"
+  assert_eq "$MEASURE_CATALOGUE_COUNT" 0 "Disconnect queried the catalogue"
+  assert_eq "$zero_catalogue_count" 0 "$zero_case Connect queried the catalogue $zero_catalogue_count times"
+done
+
+# Unavailable catalogue data is irrelevant without enabled shortcuts, but must
+# still fail closed for a nonempty candidate. Do not weaken Hyprland checks.
+touch "$TEST_ROOT/catalogue-unavailable"
+apply_config "$ZERO_CONFIG" >/dev/null
+"$RUNNER" connect | jq -e '.ok and .warnings == []' >/dev/null \
+  || fail "hook-only Connect depended on the unavailable shortcut catalogue"
+if apply_config "$CONFIG" >"$TEST_ROOT/unavailable-catalogue.json"; then
+  fail "nonempty shortcuts ignored an unavailable catalogue"
+fi
+jq -e '.code == "shortcut-conflict" and .error == "Could not read effective Omarchy keybindings"' \
+  "$TEST_ROOT/unavailable-catalogue.json" >/dev/null || fail "catalogue failure changed its error contract"
+rm -f -- "$TEST_ROOT/catalogue-unavailable"
+apply_config "$CONFIG" >/dev/null
+"$RUNNER" connect >/dev/null
+rm -f -- "$TEST_ROOT/keybindings.calls" "$TEST_ROOT/hypr.calls"
 
 # An action-only edit has identical generated Lua. It must not consult the
 # shortcut catalogue or Hyprland, and must not replace the generated file.

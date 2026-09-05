@@ -1,0 +1,64 @@
+#!/bin/bash
+# Isolated connection fixture: status captures its reply before blocking, just
+# like a real probe that observes an integration transaction partway through.
+set -euo pipefail
+
+dir=${OMACHORD_QML_TEST_DIR:?}
+calls="$dir/connection-calls.log"
+
+wait_for_release() {
+  while [[ ! -f $dir/release-$1 ]]; do sleep 0.01; done
+}
+
+case ${1:-} in
+  autostart)
+    printf '%s\n' '{"ok":true,"connected":false,"disabled":true}'
+    ;;
+  status)
+    tag=initial connected=false mode=immediate
+    if [[ -f $dir/status-plan ]]; then read -r tag connected mode <"$dir/status-plan"; fi
+    if [[ -f $dir/forbid-status ]]; then printf 'FORBIDDEN STATUS %s\n' "$tag" >>"$calls"; fi
+    printf 'STATUS START %s\n' "$tag" >>"$calls"
+    if [[ $mode == block* ]]; then wait_for_release "status-$tag"; fi
+    printf 'STATUS END %s\n' "$tag" >>"$calls"
+    if [[ $mode == *fail ]]; then exit 1; fi
+    config_valid=true config_error=""
+    if [[ $tag == initial ]]; then config_valid=false; config_error="mock stale config error"; fi
+    printf '{"ok":true,"connected":%s,"ownedConnection":%s,"integrationComplete":%s,"connectionEnabled":%s,"configValid":%s,"configError":"%s","activeCount":0,"probe":"%s"}\n' \
+      "$connected" "$connected" "$connected" "$connected" "$config_valid" "$config_error" "$tag"
+    ;;
+  config)
+    printf '%s\n' 'CONFIG SNAPSHOT' >>"$calls"
+    printf '%s\n' '{"ok":true,"revision":"sha256:connection","committed":true,"config":{"version":1,"routines":[]}}'
+    ;;
+  active|logs|toggles)
+    printf '%s\n' '[]'
+    ;;
+  connect|disconnect)
+    tag=connect outcome=success connected=true
+    if [[ -f $dir/connection-plan ]]; then read -r tag outcome connected <"$dir/connection-plan"; fi
+    printf 'CONNECTION START %s %s argc=%s revision=%s\n' "$tag" "$1" "$#" "${2:-}" >>"$calls"
+    wait_for_release "connection-$tag"
+    rm -f -- "$dir/forbid-status"
+    printf 'CONNECTION END %s\n' "$tag" >>"$calls"
+    if [[ $outcome == fail ]]; then
+      printf '%s\n' '{"ok":false,"code":"mock-failure","error":"mock connection failed"}'
+      exit 1
+    fi
+    if [[ $outcome == incomplete ]]; then
+      printf '%s\n' '{"ok":true,"warnings":[]}'
+      exit 0
+    fi
+    printf '{"ok":true,"connected":%s,"warnings":[]}\n' "$connected"
+    ;;
+  activate|deactivate|run)
+    printf 'ROUTINE START %s %s\n' "$1" "${2:-}" >>"$calls"
+    wait_for_release "routine-${2:?}"
+    printf 'ROUTINE END %s %s\n' "$1" "$2" >>"$calls"
+    printf '{"ok":true,"routineId":"%s","state":"complete"}\n' "$2"
+    ;;
+  *)
+    printf '%s\n' '{"ok":false,"error":"unexpected fake-runner call"}'
+    exit 1
+    ;;
+esac

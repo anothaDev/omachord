@@ -21,7 +21,8 @@ Panel {
   readonly property bool busy: !!service && service.manualBusy === true
   readonly property bool integrationBusy: !!service && (service.connectionBusy !== undefined
     ? service.connectionBusy === true : service.manualBusy === true)
-  readonly property bool integrationOn: !!service && service.enabled === true
+  readonly property bool integrationOn: !!service && (service.connectionStatus
+    ? service.connectionStatus.integrationComplete === true : service.enabled === true)
   readonly property bool alwaysShow: setting("alwaysShow", false) === true
   readonly property bool showName: setting("showName", false) === true
   readonly property bool vertical: bar ? bar.vertical : false
@@ -64,7 +65,7 @@ Panel {
   }
 
   function toggleIntegration() {
-    if (!service) return
+    if (!service || integrationBusy) return
     if (integrationOn && typeof service.requestDisconnect === "function") service.requestDisconnect()
     else if (!integrationOn && typeof service.requestConnect === "function") service.requestConnect()
   }
@@ -202,6 +203,7 @@ Panel {
         serviceAvailable: !!root.service
         integrationOn: root.integrationOn
         integrationBusy: root.integrationBusy
+        keyboardFocusTarget: keyCatcher
         summary: root.summary
         cursorIndex: root.cursorActive ? root.selectedIndex : -1
         cursorOnFooter: root.cursorActive && root.cursorOnFooter

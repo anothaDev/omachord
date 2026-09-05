@@ -82,7 +82,14 @@ assert.match(panel, /purpose === "enable"[\s\S]*?enableCommittedConfig = Model\.
 assert.match(panel, /function failEnableBatch[\s\S]*?config = Model\.clone\(enableCommittedConfig\)[\s\S]*?enableIntents = \(\{\}\)/,
   "a hard enable-save failure must roll back optimistic values")
 assert.match(panel, /interactive: root\.configLoaded && \(!root\.mutating \|\| root\.mutationOperation === "enable-apply"\)/,
-  "enable switches must remain interactive while their serialized batch is in flight")
+  "unrelated enable switches must remain available while a serialized batch is in flight")
+assert.match(panel, /busy: routineRow\.enablePending/,
+  "a pending enable switch must show progress and block duplicate activation")
+for (const file of ["Panel.qml", "RoutinePopup.qml", "RoutineEditor.qml", "ActionCard.qml"]) {
+  const source = fs.readFileSync(path.join(root, file), "utf8")
+  assert.doesNotMatch(source, /\b(?:ToggleSwitch|Toggle)\s*\{/,
+    `${file} must use the app's pending-aware toggle controls`)
+}
 assert.match(panel, /routineRow\.enablePending \? "SAVING"/,
   "enable persistence must expose pending state on the affected row")
 assert.match(panel, /typeof service\.testRoutine === "function"[\s\S]*?service\.testRoutine\(id\)/,

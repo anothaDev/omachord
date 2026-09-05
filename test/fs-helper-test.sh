@@ -342,32 +342,143 @@ preserved=$(jq -r .preserved "$result")
   || fail "failed rollback did not retain the displaced baseline"
 printf 'PASS: explicit rollback-failure reporting\n'
 
-open_placeholder="$TEST_ROOT/open-placeholder"
-mkdir -p -m 700 "$open_placeholder/archive/retired"
-printf '%s' baseline >"$open_placeholder/value"
-chmod 600 "$open_placeholder/value"
-baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
-ready="$open_placeholder/ready"
-release="$open_placeholder/release"
-result="$open_placeholder/result"
-env OMACHORD_FS_TEST_MATCH="$open_placeholder/value" OMACHORD_FS_TEST_PAUSE=after-exchange \
-  OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-  "$HELPER" cas-remove "$open_placeholder/value" "$baseline" private \
-    "$open_placeholder/archive" >"$result" &
-pid=$!
-for _ in {1..500}; do
-  [[ -e $ready ]] && break
-  sleep 0.01
+for held in original placeholder both; do
+  open_root="$TEST_ROOT/open-$held"
+  mkdir -p -m 700 "$open_root/archive/retired"
+  printf '%s' baseline >"$open_root/value"
+  chmod 600 "$open_root/value"
+  baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
+  original_inode=$(stat -c %i "$open_root/value")
+  if [[ $held != placeholder ]]; then exec 8>>"$open_root/value"; fi
+  ready="$open_root/ready"
+  release="$open_root/release"
+  result="$open_root/result"
+  env OMACHORD_FS_TEST_MATCH="$open_root/value" OMACHORD_FS_TEST_PAUSE=after-exchange \
+    OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
+    "$HELPER" cas-remove "$open_root/value" "$baseline" private \
+      "$open_root/archive" 8>&- 9>&- >"$result" &
+  pid=$!
+  for _ in {1..500}; do
+    [[ -e $ready ]] && break
+    sleep 0.01
+  done
+  [[ -e $ready ]] || fail "CAS removal did not expose its placeholder for $held FD testing"
+  placeholder_inode=$(stat -c %i "$open_root/value")
+  if [[ $held != original ]]; then exec 9>>"$open_root/value"; fi
+  touch "$release"
+  wait "$pid" || fail "open $held prevented a committed removal"
+  [[ ! -e $open_root/value ]] || fail "open $held retained the removed destination"
+  if [[ $held != placeholder ]]; then printf '%s' late-original-write >&8; fi
+  if [[ $held != original ]]; then printf '%s' late-placeholder-write >&9; fi
+  exec 8>&- 9>&-
+  if [[ $held != placeholder ]]; then
+    find "$open_root/archive/retired" -type f -inum "$original_inode" \
+      -exec grep -Fl late-original-write {} + | grep -q . \
+      || fail "post-removal original descriptor write was lost"
+  fi
+  if [[ $held != original ]]; then
+    find "$open_root/archive/retired" -type f -inum "$placeholder_inode" \
+      -exec grep -Fl late-placeholder-write {} + | grep -q . \
+      || fail "post-removal placeholder descriptor write was lost"
+  fi
+  [[ $(find "$open_root/archive/retired" -type f | wc -l) -eq 2 ]] \
+    || fail "open $held did not preserve both removal inodes"
+  assert_no_transaction_files "$open_root"
 done
-[[ -e $ready ]] || fail "CAS removal did not expose its placeholder for open-FD testing"
-exec 8>>"$open_placeholder/value"
-touch "$release"
-wait "$pid" || fail "open placeholder prevented a committed removal"
-printf '%s' late-placeholder-write >&8
-exec 8>&-
-find "$open_placeholder/archive/retired" -type f -exec grep -Fl late-placeholder-write {} + \
-  | grep -q . || fail "post-removal descriptor write was lost"
-printf 'PASS: open placeholder inode preservation\n'
+printf 'PASS: open original/placeholder inode-pair preservation and late FD writes\n'
+
+# Substitute only the absolute external fuser executable in a disposable copy.
+# This exercises reported inspection errors without a production test hook or
+# intercepting the helper's fingerprint/rename/unlink implementation.
+cat >"$TEST_ROOT/fuser-probe" <<'STUB'
+#!/bin/bash
+set -euo pipefail
+printf '%s\n' "$#" >>"$FS_PROBE_CALLS"
+case $FS_PROBE_MODE in
+  diagnostic) printf '%s\n' 'inspection failed' >&2; exit 1 ;;
+  diagnostic-flood) head -c 1048576 /dev/zero >&2; exit 1 ;;
+  error-status) exit 2 ;;
+  signal) kill -KILL "$BASHPID" ;;
+  changed-placeholder|changed-original)
+    for path in "${@:2}"; do
+      if [[ $FS_PROBE_MODE == changed-placeholder && $path == */.omachord-unlink.* ]] \
+        || [[ $FS_PROBE_MODE == changed-original && $path == */.omachord-remove.* ]]; then
+        printf '%s' changed-during-inspection >>"$path"
+      fi
+    done
+    exit 1 ;;
+  closed) exit 1 ;;
+  *) exit 2 ;;
+esac
+STUB
+chmod +x "$TEST_ROOT/fuser-probe"
+sed "s|/usr/bin/fuser|$TEST_ROOT/fuser-probe|g" "$HELPER" >"$TEST_ROOT/probed-helper"
+for inspection in diagnostic diagnostic-flood error-status signal changed-placeholder changed-original closed; do
+  inspection_root="$TEST_ROOT/inspection-$inspection"
+  mkdir -p -m 700 "$inspection_root/archive/retired"
+  printf '%s' baseline >"$inspection_root/value"
+  chmod 600 "$inspection_root/value"
+  baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
+  FS_PROBE_MODE="$inspection" FS_PROBE_CALLS="$inspection_root/calls" \
+    /usr/bin/perl "$TEST_ROOT/probed-helper" cas-remove "$inspection_root/value" "$baseline" \
+      private "$inspection_root/archive" >"$inspection_root/result"
+  jq -e '.ok' "$inspection_root/result" >/dev/null || fail "$inspection changed a committed result"
+  [[ ! -e $inspection_root/value ]] || fail "$inspection retained the removed destination"
+  [[ $(cat "$inspection_root/calls") == 3 ]] \
+    || fail "$inspection did not use one fuser invocation with both paths"
+  expected_retired=2
+  [[ $inspection != closed ]] || expected_retired=0
+  [[ $(find "$inspection_root/archive/retired" -type f | wc -l) -eq $expected_retired ]] \
+    || fail "$inspection retained the wrong number of removal inodes"
+  if [[ $inspection == changed-* ]]; then
+    find "$inspection_root/archive/retired" -type f -exec grep -Fl changed-during-inspection {} + \
+      | grep -q . || fail "$inspection lost content changed during inspection"
+  fi
+  assert_no_transaction_files "$inspection_root"
+done
+printf 'PASS: one batched inspection with fail-closed errors and changed fingerprints\n'
+
+# Explicit CAS removal reaches retirement after seven fingerprints. Inject an
+# unstable read for each member, both before and after the shared fuser scan.
+for ordinal in 8 10 12 14; do
+  retirement="$TEST_ROOT/retirement-fingerprint-$ordinal"
+  mkdir -p -m 700 "$retirement/archive/retired"
+  printf '%s' baseline >"$retirement/value"
+  chmod 600 "$retirement/value"
+  baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
+  env OMACHORD_FS_TEST_MATCH="$retirement/value" OMACHORD_FS_TEST_FAIL_FINGERPRINT="$ordinal" \
+    "$HELPER" cas-remove "$retirement/value" "$baseline" private "$retirement/archive" \
+      >"$retirement/result"
+  jq -e '.ok' "$retirement/result" >/dev/null || fail "retirement fingerprint failure changed the result"
+  [[ ! -e $retirement/value ]] || fail "retirement fingerprint failure retained the destination"
+  [[ $(find "$retirement/archive/retired" -type f | wc -l) -eq 2 ]] \
+    || fail "unstable retirement fingerprint $ordinal did not preserve both inodes"
+  find "$retirement/archive/retired" -type f -exec grep -Flx baseline {} + | grep -q . \
+    || fail "unstable retirement fingerprint $ordinal lost the original content"
+  assert_no_transaction_files "$retirement"
+done
+printf 'PASS: uncertain fingerprints preserve both removal inodes\n'
+
+closed="$TEST_ROOT/closed-retirement"
+mkdir -p -m 700 "$closed/archive/retired"
+for _ in {1..5}; do
+  printf '%s' baseline >"$closed/value"
+  chmod 600 "$closed/value"
+  "$HELPER" remove-file "$closed/value" private "$closed/archive" >/dev/null
+  [[ ! -e $closed/value ]] || fail "closed-inode removal retained the destination"
+  assert_no_transaction_files "$closed"
+done
+[[ $(find "$closed/archive/retired" -type f | wc -l) -eq 0 ]] \
+  || fail "ordinary removals accumulated retired inodes"
+if command -v strace >/dev/null 2>&1; then
+  printf '%s' baseline >"$closed/value"
+  chmod 600 "$closed/value"
+  strace -f -qq -e trace=execve -o "$closed/exec.trace" \
+    "$HELPER" remove-file "$closed/value" private "$closed/archive" >/dev/null
+  [[ $(grep -c 'execve("/usr/bin/fuser"' "$closed/exec.trace") -eq 1 ]] \
+    || fail "real removal did not use exactly one absolute fuser invocation"
+fi
+printf 'PASS: closed-inode removal does not accumulate archives\n'
 
 owned="$TEST_ROOT/owned-links"
 mkdir -m 755 "$owned"

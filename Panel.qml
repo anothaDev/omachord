@@ -70,6 +70,9 @@ Item {
   property bool configHandled: false
   property bool applyStarted: false
   property bool mutationStarted: false
+  property bool connectionViaService: false
+  property bool connectionReconciling: false
+  property int connectionEpoch: 0
   property bool actionStarted: false
   property bool revisionRefreshPending: false
   property bool revisionStarted: false
@@ -85,6 +88,9 @@ Item {
   property var enableWarnings: []
   property var enableDeactivated: []
   property string runningRoutineId: ""
+  // A direct routine request remains pending until a probe started after its
+  // completion settles. Other routines need not wait for that probe.
+  property var actionSettling: ({})
   property date displayNow: new Date()
 
   readonly property string home: Quickshell.env("HOME")
@@ -98,8 +104,14 @@ Item {
   readonly property var filteredBindings: Model.filterBindings(bindings, shortcutQuery, shortcutFilter)
   readonly property bool compact: window.width < Style.space(920)
   readonly property bool uiLocked: loading || mutating || revisionRefreshPending || !configLoaded
-  readonly property bool connectionNeedsRepair: status.ownedConnection === true && status.integrationComplete !== true
-  readonly property bool integrationOn: status.integrationComplete === true
+  readonly property bool serviceHasConnectionState: !!service && service.connectionStatus !== undefined
+  readonly property var integrationStatus: serviceHasConnectionState && service.connectionStatus
+    ? service.connectionStatus : status
+  readonly property bool connectionNeedsRepair: integrationStatus.ownedConnection === true && integrationStatus.integrationComplete !== true
+  readonly property bool integrationOn: integrationStatus.integrationComplete === true
+  readonly property bool integrationRunning: (mutating && (mutationOperation === "connect" || mutationOperation === "disconnect"))
+    || serviceConnectionBusy()
+  readonly property bool integrationBusy: integrationRunning || connectionReconciling
   readonly property bool serviceLive: !!service
   readonly property int activeCount: Object.keys(activeIds).length
 
@@ -178,11 +190,29 @@ Item {
   }
 
   function requestRefreshProcess(process) {
+    // The resident service already audits and watches integration state. Do
+    // not launch a competing full audit from every panel save or refresh.
+    if (process === statusProc && serviceHasConnectionState) {
+      syncFromService()
+      return false
+    }
+    if (process === statusProc && integrationRunning) {
+      process.refreshQueued = true
+      return false
+    }
     if (process.running) {
       process.refreshQueued = true
       return false
     }
     process.refreshQueued = false
+    if (process === statusProc) {
+      process.epoch = connectionEpoch
+      process.startPending = true
+    }
+    if (process === activeProc) {
+      process.generation++
+      process.startPending = true
+    }
     if (process === togglesProc) togglesProc.startPending = true
     process.running = true
     return true
@@ -192,11 +222,7 @@ Item {
     if (!process.refreshQueued) return
     process.refreshQueued = false
     Qt.callLater(function() {
-      if (process.running) process.refreshQueued = true
-      else {
-        if (process === togglesProc) togglesProc.startPending = true
-        process.running = true
-      }
+      root.requestRefreshProcess(process)
     })
   }
 
@@ -212,7 +238,7 @@ Item {
   }
 
   function refreshSupplemental() {
-    requestRefreshProcess(statusProc)
+    if (!serviceHasConnectionState) requestRefreshProcess(statusProc)
     requestRefreshProcess(bindingsProc)
     requestRefreshProcess(commandsProc)
     requestRefreshProcess(logsProc)
@@ -229,6 +255,7 @@ Item {
   // state file; mirroring it keeps the window live without polling.
   function syncFromService() {
     if (!service) return
+    if (serviceHasConnectionState && service.connectionStatus) status = service.connectionStatus
     if (service.active && typeof service.active === "object") rebuildActiveIds(objectValues(service.active))
     if (typeof service.statusJson === "function") serviceStatus = parseJson(service.statusJson(), null)
   }
@@ -592,7 +619,7 @@ Item {
   }
 
   function applyConfig(next, selectId, afterApply) {
-    if (mutating || loading || !configLoaded) return
+    if (mutating || loading || !configLoaded || serviceConnectionBusy()) return
     pendingConfig = Model.clone(next)
     pendingSelectId = selectId || ""
     pendingAfterApply = afterApply || ""
@@ -677,6 +704,8 @@ Item {
 
   function requestSetRoutineEnabled(id, enabled) {
     if (!configLoaded || (mutating && mutationOperation !== "enable-apply")) return
+    if (loading || revisionRefreshPending || routineEnablePending(id)
+        || serviceConnectionBusy() || routineActionBusy(id)) return
     if (routineEditor.dirty) {
       pendingUiAction = "enabled"
       pendingUiValue = ({ id: id, enabled: enabled === true })
@@ -898,13 +927,15 @@ Item {
   }
 
   function routineActionBusy(id) {
+    var routineId = String(id || "")
     return serviceRoutineBusy(id)
-      || (actionProc.running && runningRoutineId === String(id || ""))
+      || (routineId !== "" && runningRoutineId === routineId)
+      || mapOwns(actionSettling, routineId)
   }
 
   function routineActionBlocked(id) {
-    if (actionProc.running && runningRoutineId === String(id || "")) return true
-    if (service) return serviceConnectionBusy() || serviceRoutineBusy(id)
+    if (routineActionBusy(id)) return true
+    if (service) return serviceConnectionBusy()
     return actionProc.running
   }
 
@@ -925,11 +956,20 @@ Item {
   }
 
   function mutateConnection(operation) {
-    if (mutating || loading || !(configLoaded || configUncommitted)) return
+    if (mutating || loading || integrationBusy || !(configLoaded || configUncommitted)) return
+    connectionEpoch++
     mutationOperation = operation
     mutating = true
     mutationStarted = false
     showNotice(operation === "connect" ? "Turning Omachord on..." : "Turning Omachord off...", false, true)
+    if (serviceHasConnectionState && typeof service.requestConnect === "function"
+        && typeof service.requestDisconnect === "function") {
+      connectionViaService = true
+      var queued = operation === "connect" ? service.requestConnect(configRevision) : service.requestDisconnect()
+      if (!queued) handleMutationResult("", "The connection queue is busy", -1)
+      return
+    }
+    connectionViaService = false
     mutationProc.command = operation === "connect"
       ? [runnerPath, operation, configRevision]
       : [runnerPath, operation]
@@ -937,6 +977,7 @@ Item {
   }
 
   function requestIntegrationToggle() {
+    if (mutating || loading || integrationBusy || !(configLoaded || configUncommitted)) return
     if (connectionNeedsRepair) mutateConnection("connect")
     else if (integrationOn) {
       showConfirmation(
@@ -981,6 +1022,16 @@ Item {
     var result = exitCode === 0
       ? (parsed || { ok: false, error: fallback })
       : (parsed && parsed.ok === false ? parsed : { ok: false, error: fallback })
+    if (result.ok && typeof result.connected !== "boolean")
+      result = { ok: false, error: "The runner returned an invalid connection state" }
+    // The successful transaction already verified its reload and committed
+    // state. Publish it before unlocking, rather than waiting on another audit.
+    if (result.ok) status = Object.assign({}, status, {
+      ok: true, connected: result.connected, ownedConnection: result.connected,
+      integrationComplete: result.connected, connectionEnabled: result.connected
+    })
+    connectionReconciling = !result.ok && !connectionViaService
+    connectionViaService = false
     mutating = false
     mutationStarted = false
     mutationOperation = ""
@@ -994,13 +1045,14 @@ Item {
       refreshAll()
       return
     }
-    requestRefreshProcess(statusProc)
+    if (!serviceHasConnectionState) requestRefreshProcess(statusProc)
     requestRefreshProcess(bindingsProc)
     requestRefreshProcess(logsProc)
     if (!serviceLive) requestRefreshProcess(activeProc)
   }
 
   function handleActionResult(text, errorText, exitCode) {
+    if (!runningRoutineId) return
     var fallback = errorText || (exitCode === 0
       ? "The routine returned invalid JSON"
       : "The routine runner could not start or complete")
@@ -1008,12 +1060,24 @@ Item {
     var result = exitCode === 0
       ? (parsed || { ok: false, error: fallback })
       : (parsed && parsed.ok === false ? parsed : { ok: false, error: fallback })
+    if (!serviceLive && actionStarted) {
+      var settling = Object.assign({}, actionSettling)
+      settling[runningRoutineId] = activeProc.generation + 1
+      actionSettling = settling
+    }
     actionStarted = false
     var name = Model.nameFor(config, runningRoutineId)
     runningRoutineId = ""
     showNotice(result.ok ? actionNotice(result, name) : (result.error || "Routine failed"), !result.ok)
     requestRefreshProcess(logsProc)
     if (!serviceLive) requestRefreshProcess(activeProc)
+  }
+
+  function finishActionSettling(generation) {
+    var remaining = ({})
+    for (var id in actionSettling)
+      if (actionSettling[id] > generation) remaining[id] = actionSettling[id]
+    actionSettling = remaining
   }
 
   function actionNotice(result, name) {
@@ -1140,9 +1204,33 @@ Item {
     function onLastEventChanged() { root.syncFromService() }
     function onEnabledChanged() {
       root.syncFromService()
-      root.requestRefreshProcess(statusProc)
+      if (!root.serviceHasConnectionState) root.requestRefreshProcess(statusProc)
+    }
+    function onConnectionStatusChanged() { root.syncFromService() }
+    function onConnectionBusyChanged() {
+      if (root.serviceConnectionBusy()) root.connectionEpoch++
+      else if (!root.serviceHasConnectionState) root.requestRefreshProcess(statusProc)
+    }
+    function onManualBusyChanged() {
+      // Older services expose only the global barrier. Its completion must
+      // drain status work deferred by enabledChanged just like connectionBusy.
+      if (!root.service || root.service.connectionBusy !== undefined) return
+      if (root.serviceConnectionBusy()) root.connectionEpoch++
+      else if (!root.serviceHasConnectionState) root.requestRefreshProcess(statusProc)
     }
     function onManualFinished(job, result) {
+      if (job && job.id === "") {
+        if (root.connectionViaService && root.mutationOperation === job.op) {
+          root.handleMutationResult(JSON.stringify(result), "", result && result.ok ? 0 : 1)
+        } else {
+          root.showNotice(result && result.ok
+            ? (job.op === "connect" ? "Omachord is on" : "Omachord is off")
+            : ((result && result.error) || "Connection change failed"), !result || !result.ok)
+          root.requestRefreshProcess(bindingsProc)
+          root.requestRefreshProcess(logsProc)
+        }
+        return
+      }
       var name = Model.nameFor(root.config, job.id)
       if (result && result.ok) root.showNotice(root.actionNotice(result, name), false)
       else root.showNotice((result && result.error) || (name + " could not be ended"), true)
@@ -1159,15 +1247,30 @@ Item {
   Process {
     id: statusProc
     property bool refreshQueued: false
+    property bool startPending: false
+    property int epoch: 0
     command: [root.runnerPath, "status"]
     stdout: StdioCollector { id: statusStdout; waitForEnd: true }
+    onStarted: startPending = false
     onExited: function(exitCode) {
-      if (exitCode === 0) {
-        var parsed = root.parseJson(statusStdout.text, null)
-        if (parsed && parsed.ok) root.status = parsed
+      statusProc.startPending = false
+      if (statusProc.epoch === root.connectionEpoch && !root.integrationRunning) {
+        if (exitCode === 0) {
+          var parsed = root.parseJson(statusStdout.text, null)
+          if (parsed && parsed.ok === true && typeof parsed.connected === "boolean"
+              && typeof parsed.integrationComplete === "boolean") root.status = parsed
+        }
+        root.connectionReconciling = false
       }
       root.finishRefreshProcess(statusProc)
     }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (statusProc.running || !statusProc.startPending) return
+        statusProc.startPending = false
+        if (statusProc.epoch === root.connectionEpoch) root.connectionReconciling = false
+        root.finishRefreshProcess(statusProc)
+      })
   }
 
   Process {
@@ -1244,15 +1347,27 @@ Item {
   Process {
     id: activeProc
     property bool refreshQueued: false
+    property bool startPending: false
+    property int generation: 0
     command: [root.runnerPath, "active"]
     stdout: StdioCollector { id: activeStdout; waitForEnd: true }
+    onStarted: startPending = false
     onExited: function(exitCode) {
+      startPending = false
       if (exitCode === 0) {
         var parsed = root.parseJson(activeStdout.text, null)
         if (Array.isArray(parsed)) root.rebuildActiveIds(parsed)
       }
+      root.finishActionSettling(generation)
       root.finishRefreshProcess(activeProc)
     }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (activeProc.running || !activeProc.startPending) return
+        activeProc.startPending = false
+        root.finishActionSettling(activeProc.generation)
+        root.finishRefreshProcess(activeProc)
+      })
   }
 
   Process {
@@ -1408,7 +1523,8 @@ Item {
         }
         var control = event.modifiers & Qt.ControlModifier
         if (control && event.key === Qt.Key_S) {
-          if (root.activeView === "routines" && routineEditor.draft && !root.uiLocked) routineEditor.save()
+          if (root.activeView === "routines" && routineEditor.draft
+              && !root.uiLocked && !root.serviceConnectionBusy()) routineEditor.save()
           event.accepted = true
         } else if (control && event.key === Qt.Key_R) {
           root.requestRefresh()
@@ -1455,7 +1571,7 @@ Item {
               title: root.compact ? "" : "Omachord"
               meta: root.compact ? "" : root.connectionNeedsRepair ? "Repair needed"
                 : (root.integrationOn ? (root.activeCount ? root.activeCount + " on" : "On")
-                  : (root.status.connectionEnabled === false ? "Off" : "Starting"))
+                  : (root.integrationStatus.connectionEnabled === false ? "Off" : "Starting"))
               foreground: root.fg
               iconComponent: Component {
                 Text {
@@ -1469,25 +1585,24 @@ Item {
                 }
               }
               trailingControl: Component {
-                ToggleSwitch {
+                PendingSwitch {
+                  objectName: "panelIntegrationSwitch"
                   checked: root.integrationOn
-                  busy: root.mutating && (root.mutationOperation === "connect" || root.mutationOperation === "disconnect")
-                  interactive: (root.configLoaded || root.configUncommitted) && !root.loading && !root.mutating
+                  busy: root.integrationBusy || root.loading || root.mutating || root.revisionRefreshPending
+                  interactive: root.configLoaded || root.configUncommitted
                   foreground: root.fg
                   accent: root.accent
                   activeFocusOnTab: true
-                  Keys.onReturnPressed: root.requestIntegrationToggle()
-                  Keys.onEnterPressed: root.requestIntegrationToggle()
-                  Keys.onSpacePressed: root.requestIntegrationToggle()
                   onToggled: root.requestIntegrationToggle()
                   Accessible.role: Accessible.CheckBox
                   Accessible.name: root.integrationOn ? "Turn Omachord off" : "Turn Omachord on"
+                  Accessible.description: busy ? "Waiting for the current operation" : ""
                   Accessible.checkable: true
                   Accessible.checked: checked
-                  Accessible.onPressAction: root.requestIntegrationToggle()
                   PanelToolTip {
                     visible: parent.containsMouse
-                    text: root.connectionNeedsRepair ? "Repair the Omarchy integration"
+                    text: parent.busy ? "Waiting for the current operation..."
+                      : root.connectionNeedsRepair ? "Repair the Omarchy integration"
                       : (root.integrationOn ? "Turn Omachord off. Active routines end and restore; saved routines stay."
                         : "Turn Omachord on")
                   }
@@ -2109,7 +2224,9 @@ Item {
                               Text {
                                 textFormat: Text.PlainText
                                 width: parent.width
-                                visible: text !== ""
+                                // Reserve the status line so SAVING never shifts
+                                // a switch vertically while a batch is pending.
+                                height: Math.ceil(Style.font.caption * 1.4)
                                 text: routineRow.enablePending ? "SAVING"
                                   : (routineRow.isDirty ? "UNSAVED"
                                   : (routineRow.isOn ? "ON" + (root.activeIds[routineRow.modelData.id].expiresAt
@@ -2131,13 +2248,16 @@ Item {
                               }
                             }
 
-                            ToggleSwitch {
+                            PendingSwitch {
                               id: enabledSwitch
+                              objectName: "routineEnable-" + routineRow.modelData.id
                               anchors.verticalCenter: parent.verticalCenter
                               checked: routineRow.modelData.enabled
-                              // `busy` would swallow a second click. Keep the switch
-                              // live so the same row can supersede its in-flight value;
-                              // the row's SAVING label carries the pending state.
+                              // Only affected rows wait; other rows can still join
+                              // the serialized batch without queuing repeat toggles.
+                              busy: routineRow.enablePending || root.loading || root.revisionRefreshPending
+                                || (root.mutating && root.mutationOperation !== "enable-apply")
+                                || root.serviceConnectionBusy() || root.routineActionBusy(routineRow.modelData.id)
                               interactive: root.configLoaded && (!root.mutating || root.mutationOperation === "enable-apply")
                               foreground: root.fg
                               accent: root.accent
@@ -2145,10 +2265,9 @@ Item {
                               onToggled: root.requestSetRoutineEnabled(routineRow.modelData.id, !checked)
                               Accessible.role: Accessible.CheckBox
                               Accessible.name: (checked ? "Turn off " : "Turn on ") + routineRow.modelData.name
-                              Accessible.description: routineRow.enablePending ? "Saving latest choice" : ""
+                              Accessible.description: busy ? "Waiting for the current operation" : ""
                               Accessible.checkable: true
                               Accessible.checked: checked
-                              Accessible.onPressAction: root.requestSetRoutineEnabled(routineRow.modelData.id, !checked)
                               PanelToolTip {
                                 visible: parent.containsMouse
                                 text: (routineRow.enablePending ? "Saving latest choice. " : "")
@@ -2197,6 +2316,7 @@ Item {
                       serviceState: root.editorRoutine ? root.serviceRoutineState(root.editorRoutine.id) : null
                       targetWindow: window
                       busy: root.uiLocked || root.serviceConnectionBusy()
+                      operationPending: root.loading || root.mutating || root.revisionRefreshPending || root.serviceConnectionBusy()
                       running: root.editorRoutine ? root.routineActionBusy(root.editorRoutine.id) : false
                       persisted: root.editorPersisted
                       showBack: root.compact
