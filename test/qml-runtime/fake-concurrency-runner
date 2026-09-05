@@ -1,0 +1,62 @@
+#!/bin/bash
+# Runner fixture for service-concurrency.qml. Manual operations remain blocked
+# until the harness creates their release file, making overlap and ordering
+# observable without relying on wall-clock command durations.
+set -euo pipefail
+
+dir=${OMACHORD_QML_TEST_DIR:?}
+calls="$dir/manual-calls.log"
+
+wait_for_release() {
+  local operation=$1
+  local routine_id=${2:-connection}
+  local release="$dir/release-$operation-$routine_id"
+  while [[ ! -f $release ]]; do sleep 0.01; done
+  rm -f -- "$release"
+}
+
+case "${1:-} ${2:-}" in
+  "autostart ")
+    printf '%s\n' '{"ok":true,"connected":true}'
+    ;;
+  "status ")
+    printf '%s\n' '{"ok":true,"connected":true,"ownedConnection":true,"integrationComplete":true,"connectionEnabled":true,"configValid":true,"activeCount":0}'
+    ;;
+  "config snapshot")
+    printf '%s\n' '{"ok":true,"revision":"sha256:concurrency","committed":true,"config":{"version":1,"routines":[]}}'
+    ;;
+  "logs "*)
+    printf '%s\n' '[]'
+    ;;
+  "active ")
+    if [[ -e $dir/block-active ]]; then
+      printf '%s\n' 'ACTIVE BLOCKED' >>"$calls"
+      wait_for_release active probe
+      rm -f -- "$dir/block-active"
+    fi
+    printf '%s\n' '[]'
+    ;;
+  "toggles ")
+    printf '%s\n' '[]'
+    ;;
+  "activate "*|"deactivate "*|"run "*)
+    operation=$1
+    routine_id=${2:?}
+    printf 'START %s %s\n' "$operation" "$routine_id" >>"$calls"
+    wait_for_release "$operation" "$routine_id"
+    printf 'END %s %s\n' "$operation" "$routine_id" >>"$calls"
+    printf '{"ok":true,"routineId":"%s","state":"complete"}\n' "$routine_id"
+    ;;
+  "connect "|"disconnect ")
+    operation=$1
+    printf 'START %s\n' "$operation" >>"$calls"
+    wait_for_release "$operation"
+    printf 'END %s\n' "$operation" >>"$calls"
+    printf '%s\n' '{"ok":true,"connected":true}'
+    ;;
+  *)
+    printf 'UNEXPECTED %s\n' "$*" >>"$calls"
+    printf '%s\n' '{"ok":false,"code":"usage","error":"unexpected call"}'
+    exit 1
+    ;;
+esac

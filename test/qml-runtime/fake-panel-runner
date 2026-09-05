@@ -1,0 +1,88 @@
+#!/bin/bash
+# Deterministic runner for panel-enable-batching.qml. The first two applies
+# succeed slowly enough for newer UI intents to arrive while they are active;
+# the third reports a stale CAS revision, the fourth accepts the rebased
+# payload, and the fifth is a hard failure used to verify optimistic rollback.
+set -euo pipefail
+
+test_dir=${OMACHORD_QML_TEST_DIR:?}
+calls_file="$test_dir/panel-calls.log"
+counter_file="$test_dir/apply-count"
+counter_lock="$test_dir/apply-count.lock"
+
+record() {
+  printf '%s\n' "$*" >>"$calls_file"
+}
+
+next_apply_number() {
+  local count=0
+  exec 9>>"$counter_lock"
+  flock 9
+  if [[ -s $counter_file ]]; then read -r count <"$counter_file"; fi
+  count=$((count + 1))
+  printf '%s\n' "$count" >"$counter_file"
+  flock -u 9
+  printf '%s\n' "$count"
+}
+
+apply_config() {
+  local payload number revision
+  IFS= read -r payload || true
+  jq -e '.version == 1 and (.routines | type == "array")' <<<"$payload" >/dev/null
+  number=$(next_apply_number)
+  record "START $number $payload"
+
+  case $number in
+    1|2)
+      sleep 0.35
+      revision="sha256:apply-$number"
+      jq -cn --arg revision "$revision" --argjson config "$payload" \
+        '{ok:true,revision:$revision,config:$config,warnings:[],deactivated:[]}'
+      ;;
+    3)
+      printf '%s\n' '{"ok":false,"code":"stale-config","error":"fixture stale revision"}'
+      exit 1
+      ;;
+    4)
+      sleep 0.2
+      jq -cn --argjson config "$payload" \
+        '{ok:true,revision:"sha256:rebased",config:$config,warnings:[],deactivated:[]}'
+      ;;
+    5)
+      sleep 0.15
+      printf '%s\n' '{"ok":false,"code":"write-failed","error":"fixture hard failure"}'
+      exit 1
+      ;;
+    *)
+      printf '%s\n' '{"ok":false,"code":"fixture","error":"unexpected extra apply"}'
+      exit 1
+      ;;
+  esac
+}
+
+case "${1:-} ${2:-}" in
+  "config apply")
+    apply_config
+    ;;
+  "config snapshot")
+    record "SNAPSHOT"
+    printf '%s\n' '{"ok":true,"revision":"sha256:external","committed":true,"config":{"version":1,"routines":[{"id":"alpha","name":"Alpha","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]},{"id":"beta","name":"Beta","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]},{"id":"gamma","name":"Gamma from elsewhere","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]}]}}'
+    ;;
+  "status ")
+    printf '%s\n' '{"ok":true,"connected":true,"ownedConnection":true,"integrationComplete":true,"connectionEnabled":true,"configValid":true,"activeCount":0}'
+    ;;
+  "bindings ")
+    printf '%s\n' '[]'
+    ;;
+  "logs "*)
+    printf '%s\n' '[]'
+    ;;
+  "active ")
+    printf '%s\n' '[]'
+    ;;
+  *)
+    record "UNEXPECTED $*"
+    printf '%s\n' '{"ok":false,"code":"usage","error":"unexpected fixture call"}'
+    exit 1
+    ;;
+esac

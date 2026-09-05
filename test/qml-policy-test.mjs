@@ -63,6 +63,32 @@ assert.match(panel, /id: navigationCopy[\s\S]*?x: root\.compact[\s\S]*?navigatio
   "sidebar copy must use explicit compact positioning instead of swapping anchors after launch")
 assert.match(panel, /function requestSetRoutineEnabled[\s\S]*?routineEditor\.dirty[\s\S]*?showConfirmation/,
   "list switches must confirm before replacing an unsaved routine draft")
+assert.match(panel, /property var enableIntents: \(\{\}\)[\s\S]*?property var enableSubmitted: \(\{\}\)/,
+  "saved-routine switches must retain latest intents separately from the in-flight batch")
+assert.match(panel, /id: enableApplyDebounce\s*\n\s*interval: 75[\s\S]*?onTriggered: root\.submitEnableBatch\(\)/,
+  "saved-routine switches must use a short deterministic batching window")
+assert.match(panel, /function setRoutineEnabled[\s\S]*?enableIntents = intents[\s\S]*?config = configWithEnableIntents\(config, intents\)[\s\S]*?enableApplyDebounce\.restart\(\)/,
+  "a saved-routine switch must update optimistically before scheduling persistence")
+assert.match(panel, /function submitEnableBatch[\s\S]*?applyProc\.running \|\| enableSubmittedConfig !== null[\s\S]*?enableSubmitted = Object\.assign\(\{\}, enableIntents\)[\s\S]*?startProcess\(applyProc\)/,
+  "enable batching must snapshot latest intents and keep exactly one config apply in flight")
+assert.match(panel, /mapOwns\(submitted, id\) && current\[id\] === submitted\[id\]\) continue/,
+  "an enable apply must acknowledge only submitted values that are still current")
+assert.match(panel, /enableCommittedConfig = Model\.clone\(committed\)[\s\S]*?clearSubmittedEnableIntents\(committed\)[\s\S]*?config = configWithEnableIntents\(committed, enableIntents\)/,
+  "newer switch intents must rebase on each successfully committed batch")
+assert.match(panel, /result\.code === "stale-config"[\s\S]*?revisionRefreshPurpose = "enable"[\s\S]*?requestRefreshProcess\(revisionProc\)/,
+  "stale enable batches must refresh their base before retrying")
+assert.match(panel, /purpose === "enable"[\s\S]*?enableCommittedConfig = Model\.clone\(parsed\.config\)[\s\S]*?configWithEnableIntents\(parsed\.config, enableIntents\)[\s\S]*?enableApplyDebounce\.restart\(\)/,
+  "stale enable intents must be rebased on the refreshed config and revision")
+assert.match(panel, /function failEnableBatch[\s\S]*?config = Model\.clone\(enableCommittedConfig\)[\s\S]*?enableIntents = \(\{\}\)/,
+  "a hard enable-save failure must roll back optimistic values")
+assert.match(panel, /interactive: root\.configLoaded && \(!root\.mutating \|\| root\.mutationOperation === "enable-apply"\)/,
+  "enable switches must remain interactive while their serialized batch is in flight")
+assert.match(panel, /routineRow\.enablePending \? "SAVING"/,
+  "enable persistence must expose pending state on the affected row")
+assert.match(panel, /typeof service\.testRoutine === "function"[\s\S]*?service\.testRoutine\(id\)/,
+  "live panel actions must use the service's concurrent manual workers when available")
+assert.match(panel, /running: root\.editorRoutine \? root\.routineActionBusy\(root\.editorRoutine\.id\) : false/,
+  "routine action progress must be tracked per routine instead of globally")
 
 assert.doesNotMatch(editor, /onEditingFinished\s*:/,
   "staged action text must not rebuild delegates when focus changes")
@@ -86,9 +112,19 @@ assert.match(panel, /property date displayNow:[\s\S]*?Conditions\.relativeTime\(
   "panel relative timestamps must depend on a live display clock")
 assert.match(popup, /property date displayNow:[\s\S]*?Conditions\.minutesLeft\([^)]*displayNow\)/,
   "popup countdowns must depend on a live display clock")
+assert.match(popup, /function rowBusy\(id\)[\s\S]*?pendingIds\[String\(id\)\] === true/,
+  "the popup must disable only the routine row that is already pending")
 const service = fs.readFileSync(path.join(root, "Service.qml"), "utf8")
+assert.match(service, /function testRoutine\(id\)[\s\S]*?enqueueManual\("run", id, "test"\)/,
+  "the concurrent service path must preserve editor testing of disabled routines")
 assert.match(service, /runnerProc\.command = \[root\.runnerPath, job\.op, job\.id, job\.reason, job\.revision\]/,
   "the service must only ever execute the runner with a literal argv")
+assert.match(service, /readonly property int maxManualWorkers: 4/,
+  "manual routine work must use a bounded worker pool")
+assert.match(service, /if \(manualPendingIds\[job\.id\]\) return/,
+  "condition work must not race a manual operation for the same routine")
+assert.match(service, /if \(Object\.keys\(manualInFlight\)\.length \|\| runnerProc\.running \|\| currentJob\) return/,
+  "connection changes must wait for all routine work to drain")
 assert.match(service, /Conditions\.reconcileJobs\(desired, currentJob, configRevision, failures/,
   "the service queue must be reconciled against current desired state and revision")
 assert.doesNotMatch(service, /"bash"|"sh"|"-lc"|"-c"/,
