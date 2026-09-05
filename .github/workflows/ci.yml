@@ -25,8 +25,9 @@ jobs:
       - name: Install portable test dependencies
         run: |
           apt-get update
+          # Match Omarchy's Unicode shortcut case folding; Debian defaults to mawk.
           apt-get install --yes --no-install-recommends \
-            ca-certificates coreutils desktop-file-utils git jq lua5.4 nodejs \
+            ca-certificates coreutils desktop-file-utils gawk git jq lua5.4 nodejs \
             perl procps psmisc sound-theme-freedesktop util-linux
           # Permission-denial regressions must not run as the container's root user.
           useradd --create-home --shell /bin/bash test-runner
@@ -38,15 +39,25 @@ jobs:
 
       - name: Validate portable source
         run: |
-          bash -n bin/omachord test/*.sh
+          for file in bin/omachord test/*.sh test/render/render.sh test/qml-runtime/fake-*; do
+            bash -n "$file"
+          done
           perl -c bin/omachord-fs
           perl -c bin/omachord-action-supervisor
-          jq -e '.schemaVersion == 1 and .id == "anothadev.omachord" and .version == "0.4.0"' manifest.json >/dev/null
+          jq -e '
+            .schemaVersion == 1 and .id == "anothadev.omachord"
+            and (.version | test("^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"))
+            and (.kinds | sort) == ["bar-widget", "panel", "service"]
+            and .entryPoints == {panel: "Panel.qml", service: "Service.qml", barWidget: "BarWidget.qml"}
+          ' manifest.json >/dev/null
           if [[ ${GITHUB_REF_TYPE:-} == tag ]]; then
             test "$GITHUB_REF_NAME" = "v$(jq -r .version manifest.json)"
           fi
-          for file in BarWidget.qml Collapsible.qml EmptyState.qml KeyCap.qml RoutinePopup.qml ThemePalette.qml; do
-            test -f "$file"
+          for file in Panel.qml Service.qml BarWidget.qml BrandIcon.qml \
+            Collapsible.qml EmptyState.qml KeyCap.qml PanelScrollBar.qml \
+            RoutinePopup.qml ThemePalette.qml \
+            assets/omachord-icon.svg assets/omachord-white.svg assets/omachord-black.svg; do
+            test -s "$file"
           done
           desktop-file-validate desktop/anothadev.omachord.desktop
           node test/model-test.mjs
@@ -62,6 +73,9 @@ jobs:
 
       - name: Test runner integration with mocked desktop commands
         run: runuser -u test-runner -- test/runner-test.sh
+
+      - name: Test runner fast paths and detached audio
+        run: runuser -u test-runner -- test/runner-speed-test.sh
 
       - name: Record integration-test boundary
         run: |
