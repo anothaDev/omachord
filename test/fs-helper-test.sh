@@ -392,6 +392,74 @@ find "$uncertain/archive/retired" -type f -exec grep -Flx baseline {} + | grep -
   || fail "an uncertain open-inode check discarded the replaced inode"
 printf 'PASS: owned links and fail-closed inode preservation\n'
 
+prepared_state="$TEST_ROOT/prepared-state"
+"$HELPER" prepare-state "$prepared_state" fallback-runtime
+[[ $(stat -c %a "$prepared_state") == 700 ]] \
+  || fail "prepare-state did not create a private state directory"
+for name in config.lock log.lock runs.jsonl connection.json connection.disabled.json \
+    config.commit.json bar-widget.json backups conflicts retired active runtime; do
+  [[ ! -e $prepared_state/$name ]] \
+    || fail "prepare-state created optional state entry $name"
+done
+
+state_files=(config.lock log.lock runs.jsonl connection.json connection.disabled.json \
+  config.commit.json bar-widget.json)
+state_directories=(backups conflicts retired active)
+touch "${state_files[@]/#/$prepared_state/}"
+mkdir "${state_directories[@]/#/$prepared_state/}" "$prepared_state/runtime"
+chmod 755 "$prepared_state"
+chmod 644 "${state_files[@]/#/$prepared_state/}"
+chmod 755 "${state_directories[@]/#/$prepared_state/}" "$prepared_state/runtime"
+"$HELPER" prepare-state "$prepared_state"
+[[ $(stat -c %a "$prepared_state") == 700 ]] \
+  || fail "prepare-state did not repair the state-directory mode"
+for name in "${state_files[@]}"; do
+  [[ $(stat -c %a "$prepared_state/$name") == 600 ]] \
+    || fail "prepare-state did not repair private-file mode for $name"
+done
+for name in "${state_directories[@]}"; do
+  [[ $(stat -c %a "$prepared_state/$name") == 700 ]] \
+    || fail "prepare-state did not repair private-directory mode for $name"
+done
+[[ $(stat -c %a "$prepared_state/runtime") == 755 ]] \
+  || fail "prepare-state secured a non-fallback runtime directory"
+"$HELPER" prepare-state "$prepared_state" fallback-runtime
+[[ $(stat -c %a "$prepared_state/runtime") == 700 ]] \
+  || fail "prepare-state did not secure the fallback runtime directory"
+
+state_sentinel="$TEST_ROOT/prepare-state-sentinel"
+printf '%s' sentinel >"$state_sentinel"
+chmod 640 "$state_sentinel"
+rm -f "$prepared_state/config.lock"
+ln -s "$state_sentinel" "$prepared_state/config.lock"
+if "$HELPER" prepare-state "$prepared_state" >/dev/null 2>&1; then
+  fail "prepare-state accepted a symlinked optional file"
+fi
+[[ $(stat -c %a "$state_sentinel") == 640 && $(cat "$state_sentinel") == sentinel ]] \
+  || fail "prepare-state changed a symlink target"
+rm -f "$prepared_state/config.lock"
+
+rm -rf "$prepared_state/backups"
+ln -s "$state_sentinel" "$prepared_state/backups"
+if "$HELPER" prepare-state "$prepared_state" >/dev/null 2>&1; then
+  fail "prepare-state accepted a symlinked optional directory"
+fi
+[[ $(stat -c %a "$state_sentinel") == 640 ]] \
+  || fail "prepare-state changed an optional-directory symlink target"
+rm -f "$prepared_state/backups"
+
+rm -f "$prepared_state/runs.jsonl"
+mkfifo "$prepared_state/runs.jsonl"
+chmod 600 "$prepared_state/runs.jsonl"
+start=$(date +%s%3N)
+if "$HELPER" prepare-state "$prepared_state" >/dev/null 2>&1; then
+  fail "prepare-state accepted a FIFO optional file"
+fi
+elapsed=$(($(date +%s%3N) - start))
+((elapsed < 1000)) || fail "prepare-state blocked on a FIFO for ${elapsed}ms"
+rm -f "$prepared_state/runs.jsonl"
+printf 'PASS: batched private-state preparation\n'
+
 unique="$TEST_ROOT/unique"
 mkdir -m 700 "$unique"
 result="$unique/result"

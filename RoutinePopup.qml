@@ -18,6 +18,9 @@ Column {
   property string icon: ""
   property var rows: []
   property bool busy: false
+  // Null means an older service only exposes the global busy flag. Newer
+  // services publish a per-routine map so unrelated rows remain actionable.
+  property var pendingIds: null
   property bool serviceAvailable: true
   property bool integrationOn: true
   property bool integrationBusy: false
@@ -60,6 +63,12 @@ Column {
   function rowCaption(row) {
     var parts = [rowMeta(row), endingLabel(row)]
     return parts.filter(function(part) { return part !== "" }).join(" · ")
+  }
+
+  function rowBusy(id) {
+    if (pendingIds !== null && pendingIds !== undefined)
+      return pendingIds[String(id)] === true
+    return busy
   }
 
   spacing: Style.space(14)
@@ -218,15 +227,16 @@ Column {
 
           PanelActionButton {
             id: endButton
+            readonly property bool ending: popup.rowBusy(row.modelData.id)
             anchors.verticalCenter: parent.verticalCenter
-            iconText: popup.busy ? "󰦖" : "󰅙"
+            iconText: ending ? "󰦖" : "󰅙"
             tooltipText: "End " + String(row.modelData.name || row.modelData.id)
             foreground: popup.foreground
             hoverColor: popup.urgent
             hasCursor: row.cursor
             size: Style.spacing.controlHeight
-            enabled: !popup.busy
-            opacity: row.hasCursor || popup.busy ? 1 : 0.45
+            enabled: !ending && !popup.integrationBusy
+            opacity: row.hasCursor || ending ? 1 : 0.45
             onClicked: popup.endRequested(String(row.modelData.id))
             Accessible.role: Accessible.Button
             Accessible.name: "End " + String(row.modelData.name || row.modelData.id)

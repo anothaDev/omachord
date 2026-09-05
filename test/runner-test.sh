@@ -31,6 +31,15 @@ assert_file_contains() {
   grep -Fq -- "$2" "$1" || fail "${3:-$1 does not contain $2}"
 }
 
+wait_for_file_contains() {
+  local file=$1 needle=$2
+  for _ in {1..500}; do
+    if [[ -f $file ]] && grep -Fq -- "$needle" "$file"; then return 0; fi
+    sleep 0.01
+  done
+  fail "${file} did not contain ${needle} before the timeout"
+}
+
 assert_missing() {
   [[ ! -e $1 ]] || fail "${2:-$1 should not exist}"
 }
@@ -745,7 +754,7 @@ UNCOMMITTED_CONFIG=$(jq -c '.routines += [{
   id:"uncommitted",
   name:"Uncommitted",
   enabled:true,
-  triggers:[],
+  triggers:[{type:"shortcut",keys:"SUPER + U",override:false}],
   actions:[{type:"exec",program:"should-not-run",args:[]}]
 }]' <<<"$CONFIG")
 uncommitted_revision=$(config_revision)
@@ -839,9 +848,9 @@ assert_eq "${hook_env[3]}" '' "manual run inherited hook argument 2"
 pass "isolated hook context and dispatch"
 
 "$RUNNER" run microphone test | jq -e '.ok' >/dev/null
-assert_file_contains "$TEST_ROOT/sounds.log" 'service-logout.oga'
+wait_for_file_contains "$TEST_ROOT/sounds.log" 'service-logout.oga'
 "$RUNNER" run microphone test | jq -e '.ok' >/dev/null
-assert_file_contains "$TEST_ROOT/sounds.log" 'service-login.oga'
+wait_for_file_contains "$TEST_ROOT/sounds.log" 'service-login.oga'
 pass "microphone state sounds"
 
 "$RUNNER" run safe-command test | jq -e '.ok' >/dev/null

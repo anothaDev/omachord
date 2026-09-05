@@ -160,7 +160,7 @@ The status names every active routine and, for each condition routine, one `deta
 | `omachord logs [limit]` | Run history; stateful routines log `activated` and `deactivated` entries |
 | `omachord widget ensure\|status\|forget` | Place the bar widget once through the Omarchy shell, inspect or clear that record |
 
-The microphone template calls `omarchy audio input mute` first, preserving Omarchy's OSD and hardware LED behavior. It then reads the resulting microphone state and plays the configured mute or live sound.
+The microphone template calls `omarchy audio input mute` first, preserving Omarchy's OSD and hardware LED behavior. It then reads the resulting microphone state and starts the configured mute or live cue asynchronously, so playback does not hold routine/configuration locks or delay completion.
 
 ## Hook Context
 

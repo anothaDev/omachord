@@ -19,6 +19,8 @@ Panel {
   readonly property int activeCount: activeList.length
   readonly property bool hasActive: activeCount > 0
   readonly property bool busy: !!service && service.manualBusy === true
+  readonly property bool integrationBusy: !!service && (service.connectionBusy !== undefined
+    ? service.connectionBusy === true : service.manualBusy === true)
   readonly property bool integrationOn: !!service && service.enabled === true
   readonly property bool alwaysShow: setting("alwaysShow", false) === true
   readonly property bool showName: setting("showName", false) === true
@@ -39,12 +41,18 @@ Panel {
   ThemePalette { id: palette }
 
   function endRoutine(id) {
-    if (busy || !service || typeof service.endRoutine !== "function") return
+    if (integrationBusy || routineBusy(id) || !service || typeof service.endRoutine !== "function") return
     service.endRoutine(id)
   }
 
+  function routineBusy(id) {
+    if (!service) return false
+    if (typeof service.routineBusy === "function") return service.routineBusy(id)
+    return service.manualBusy === true
+  }
+
   function endSelected() {
-    if (busy || !cursorActive) return
+    if (!cursorActive) return
     if (cursorOnFooter) { openOmachord(); return }
     if (selectedIndex < 0 || selectedIndex >= activeList.length) return
     endRoutine(activeList[selectedIndex].id)
@@ -184,9 +192,13 @@ Panel {
         icon: root.icon
         rows: root.activeList
         busy: root.busy
+        pendingIds: root.service && root.service.routinePendingIds !== undefined
+          ? root.service.routinePendingIds
+          : (root.service && root.service.manualPendingIds !== undefined
+            ? root.service.manualPendingIds : null)
         serviceAvailable: !!root.service
         integrationOn: root.integrationOn
-        integrationBusy: root.busy
+        integrationBusy: root.integrationBusy
         summary: root.summary
         cursorIndex: root.cursorActive ? root.selectedIndex : -1
         cursorOnFooter: root.cursorActive && root.cursorOnFooter
