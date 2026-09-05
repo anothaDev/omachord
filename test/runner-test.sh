@@ -1692,7 +1692,7 @@ activate_result=$(mktemp)
 jq -e '.ok and .state == "activated" and .expiresAt == null' "$activate_result" >/dev/null
 assert_eq "$(stat -c %a "$ACTIVE_DIR")" 700 "activation directory is not private"
 assert_eq "$(stat -c %a "$ACTIVE_DIR/focus.json")" 600 "activation snapshot is not private"
-jq -e '.version == 1 and .routineId == "focus" and .trigger == "test" and .onEndMode == "restore"
+jq -e '.version == 2 and (.endPlanDigest | test("^sha256:[0-9a-f]{64}$")) and .routineId == "focus" and .trigger == "test" and .onEndMode == "restore"
   and (.claims == ["brightness","dnd","nightlight","stay-awake","theme"])
   and (.setters | length == 5)
   and (.setters[0] | .type == "dnd" and .before == false and .applied == true)

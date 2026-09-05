@@ -1872,6 +1872,11 @@ command_config_apply() {
     fi
   fi
 
+  if ! active_end_plans_match "$candidate" 1; then
+    rm -f -- "$candidate" "$candidate_lua"
+    fail "$LAST_ERROR" active-plan-conflict
+  fi
+
   export OMACHORD_BULK_CLEANUP=1
   if ! deactivate_orphans config "$candidate"; then
     unset OMACHORD_BULK_CLEANUP
@@ -1959,11 +1964,18 @@ command_config_apply() {
 }
 
 command_connect() {
-  local expected_revision=${1:-} candidate candidate_baseline candidate_revision config_index
-  local warnings mutation_error code repairing=false already_connected=false
+  local expected_revision=${1:-}
   [[ $# -le 1 && (-z $expected_revision || $expected_revision =~ ^(missing|sha256:[0-9a-f]{64})$) ]] \
     || fail "Usage: omachord connect [expected-revision]" usage
   acquire_config_lock || fail "$LAST_ERROR" unsafe-state
+  connect_locked "$expected_revision"
+}
+
+# Caller holds the exclusive config lock, including any automatic eligibility
+# decision. Do not reacquire flock through a separate descriptor here.
+connect_locked() {
+  local expected_revision=${1:-} candidate candidate_baseline candidate_revision config_index
+  local warnings mutation_error code repairing=false already_connected=false previously_owned_icon=false
   require_secure_config_file || fail "$LAST_ERROR" unsafe-config
 
   if connected; then
@@ -1981,7 +1993,8 @@ command_connect() {
   if ! owned_connection && connection_collision; then
     fail "$LAST_ERROR" ownership-conflict
   fi
-  if [[ $repairing == true ]] && ! icon_owned && [[ -e $ICON_FILE || -L $ICON_FILE ]]; then
+  if icon_owned; then previously_owned_icon=true; fi
+  if [[ $repairing == true && $previously_owned_icon != true && (-e $ICON_FILE || -L $ICON_FILE) ]]; then
     fail "Refusing to replace an unowned file: $ICON_FILE" ownership-conflict
   fi
   if [[ $already_connected != true && $repairing != true ]]; then
@@ -2001,6 +2014,18 @@ command_connect() {
   if [[ -n $expected_revision && $candidate_revision != "$expected_revision" ]]; then
     rm -f -- "$candidate"
     fail "Configuration changed since it was loaded" stale-config
+  fi
+  # Automatic startup and an unrevisioned Connect may reuse approved bytes,
+  # or bootstrap from no config/commit at all. Repair is not content approval.
+  # An explicit revision is the manual caller's authorization of inspected
+  # canonical content; the transaction below remains bound to that snapshot.
+  if [[ -z $expected_revision ]] && ! configuration_is_committed "$candidate_revision" 1; then
+    rm -f -- "$candidate"
+    fail "Review the changed configuration with 'omachord config snapshot', then connect its inspected revision with 'omachord connect <revision>'" uncommitted-config
+  fi
+  if ! active_end_plans_match "$candidate"; then
+    rm -f -- "$candidate"
+    fail "$LAST_ERROR" active-plan-conflict
   fi
   if [[ $already_connected == true ]]; then
     rm -f -- "$candidate"
@@ -2043,6 +2068,14 @@ command_connect() {
       snapshot_end
       rm -f -- "$candidate"
       fail "$LAST_ERROR" snapshot-failed
+    fi
+    # Acquiring a newly managed artifact authorizes only absence, even if
+    # another creator publishes after the initial collision check.
+    if [[ $previously_owned_icon != true ]] \
+      && [[ ${SNAPSHOT_BASELINES[$(snapshot_index "$ICON_FILE")]} != missing ]]; then
+      snapshot_end
+      rm -f -- "$candidate"
+      fail "Refusing to replace an unowned file created during Connect: $ICON_FILE" ownership-conflict
     fi
     for event in "${HOOK_EVENTS[@]}"; do
       if ! snapshot_file "$(hook_wrapper_path "$event")" "hook-$event"; then
@@ -2182,6 +2215,7 @@ command_disconnect() {
 command_autostart() {
   local disabled_state=0
   [[ $# -eq 0 ]] || fail "Usage: omachord autostart" usage
+  acquire_config_lock || fail "$LAST_ERROR" unsafe-state
   connection_disabled || disabled_state=$?
   if ((disabled_state == 2)); then
     fail "$LAST_ERROR" unsafe-state
@@ -2190,7 +2224,7 @@ command_autostart() {
     jq -cn '{ok:true,connected:false,disabled:true,skipped:true}'
     return
   fi
-  command_connect
+  connect_locked
 }
 
 command_status() {
@@ -2327,9 +2361,14 @@ log_run() {
 }
 
 cleanup_active_action() {
+  local coproc_input=${OMACHORD_CAPTURE[1]:-}
   set +e
   # EOF is cancellation, including disk-full and lost-marker failure paths.
   # Bash may reap a completed job before wait; never signal its numeric PID.
+  # A signal may arrive while run_capture is duplicating the original writer.
+  # Close both handles before waiting, including that startup interval.
+  [[ -z $coproc_input ]] || exec {coproc_input}>&-
+  unset 'OMACHORD_CAPTURE[1]'
   [[ -z $ACTIVE_CONTROL_FD ]] || exec {ACTIVE_CONTROL_FD}>&-
   [[ -z $ACTIVE_SUPERVISOR_PID ]] || wait "$ACTIVE_SUPERVISOR_PID" 2>/dev/null
   [[ -z $ACTIVE_CAPTURE_DIR ]] || rm -rf -- "$ACTIVE_CAPTURE_DIR"
@@ -2396,6 +2435,7 @@ run_capture() {
     # the job exits, independently of our explicit wait.
     exec {ACTIVE_CONTROL_FD}>&"$pipe_in"
     exec {pipe_in}>&-
+    unset 'OMACHORD_CAPTURE[1]'
   fi
   [[ -z $pipe_out ]] || exec {pipe_out}<&-
   wait "$supervisor_pid"
@@ -2700,9 +2740,12 @@ active_routine_ids() {
 # Returns 0 when loaded, 1 when the routine is not active, 2 when a snapshot
 # exists but is not trustworthy (LAST_ERROR is set).
 SNAPSHOT_JSON=""
+SNAPSHOT_READ_FINGERPRINT=""
 read_snapshot() {
-  local routine_id=$1 path filter size
+  local routine_id=$1 path filter size temporary
+  local CONFIG_SNAPSHOT_FINGERPRINT=""
   SNAPSHOT_JSON=""
+  SNAPSHOT_READ_FINGERPRINT=""
   path=$(snapshot_path "$routine_id")
   [[ -e $path || -L $path ]] || return 1
   secure_optional_private_file "$path" 600 "activation snapshot" || return 2
@@ -2711,9 +2754,20 @@ read_snapshot() {
     LAST_ERROR="Activation snapshot exceeds the size limit: $path"
     return 2
   fi
+  temporary=$(mktemp) || { LAST_ERROR="Could not capture activation snapshot"; return 2; }
+  # Reuse bounded, stable byte capture while preserving the caller's config
+  # fingerprint. Parsing and the recovery approval revision describe one copy.
+  local CONFIG_FILE="$path" MAX_CONFIG_BYTES=$MAX_CONTROL_BYTES
+  if ! write_config_snapshot "$temporary" || [[ $CONFIG_SNAPSHOT_FINGERPRINT != file:600:* ]]; then
+    rm -f -- "$temporary"
+    LAST_ERROR=${LAST_ERROR:-"Activation snapshot changed or has unsafe permissions during capture"}
+    return 2
+  fi
+  SNAPSHOT_READ_FINGERPRINT=$CONFIG_SNAPSHOT_FINGERPRINT
   read -r -d '' filter <<'JQ' || true
 type == "object"
-  and .version == 1
+  and (.version == 1 or (.version == 2
+       and (.endPlanDigest | type == "string" and test("^sha256:[0-9a-f]{64}$"))))
   and .routineId == $id
   and (.activatedAt | type == "string")
   and (.trigger | type == "string")
@@ -2744,11 +2798,13 @@ type == "object"
         end))
   and (.claims == null or ([.setters[].type] - .claims | length) == 0)
 JQ
-  if ! SNAPSHOT_JSON=$(jq -ecs --arg id "$routine_id" "select(length == 1) | .[0] | select($filter)" "$path" 2>/dev/null); then
+  if ! SNAPSHOT_JSON=$(jq -ecs --arg id "$routine_id" "select(length == 1) | .[0] | select($filter)" "$temporary" 2>/dev/null); then
+    rm -f -- "$temporary"
     SNAPSHOT_JSON=""
     LAST_ERROR="Activation snapshot is invalid: $path"
     return 2
   fi
+  rm -f -- "$temporary"
   if jq -e '(.keepUntil | type) == "object"' <<<"$SNAPSHOT_JSON" >/dev/null \
     && ! date -d "$(jq -r '.expiresAt' <<<"$SNAPSHOT_JSON")" +%s >/dev/null 2>&1; then
     SNAPSHOT_JSON=""
@@ -2833,6 +2889,65 @@ claim_activation_snapshot() {
     return 1
   fi
   exec 6>&-
+}
+
+# Bind only the ending definition, so unrelated future-activation edits remain
+# possible. No executable source is copied into the recovery record.
+end_plan_digest() {
+  local canonical hash
+  canonical=$(jq -cS '
+    ((.onEnd // {}).mode // "restore") as $mode
+    | {mode:$mode,actions:(if $mode == "actions" then ((.onEnd // {}).actions // []) else [] end)}' <<<"$1") || return 1
+  hash=$(printf '%s' "$canonical" | sha256sum | awk '{print $1}') || return 1
+  printf 'sha256:%s\n' "$hash"
+}
+
+snapshot_end_plan_matches() {
+  local snapshot=$1 routine=$2 digest mode
+  mode=$(jq -r '.onEndMode' <<<"$snapshot")
+  if [[ $(jq -r '.version' <<<"$snapshot") == 1 ]]; then
+    if [[ $mode == actions ]]; then
+      LAST_ERROR="Legacy end-action recovery has no bound plan; inspect it with 'omachord recovery inspect <id>' and explicitly restore with --skip-end-actions"
+      return 1
+    fi
+    [[ $(jq -r '(.onEnd // {}).mode // "restore"' <<<"$routine") == "$mode" ]] && return 0
+  else
+    digest=$(end_plan_digest "$routine") || return 1
+    [[ $digest == "$(jq -r '.endPlanDigest' <<<"$snapshot")" ]] && return 0
+  fi
+  LAST_ERROR="The active end-action plan changed; restore the original ending or inspect recovery and explicitly use --skip-end-actions"
+  return 1
+}
+
+# Called under the exclusive config lock, before committing any configuration.
+# Apply may end removed/disabled/stateless routines using the old committed
+# config. Connect cannot do that after a direct edit, so it rejects the conflict.
+active_end_plans_match() {
+  local config_file=$1 allow_orphans=${2:-0} routine_id routine state active_ids
+  if ! active_ids=$(active_routine_ids); then
+    LAST_ERROR="Could not inspect active end plans"
+    return 1
+  fi
+  while IFS= read -r routine_id; do
+    [[ -n $routine_id ]] || continue
+    state=0
+    read_snapshot "$routine_id" || state=$?
+    ((state != 2)) || return 1
+    ((state == 0)) || continue
+    if ! routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file"); then
+      LAST_ERROR="Could not read the active routine's candidate ending: $routine_id"
+      return 1
+    fi
+    if ((allow_orphans)) && { [[ -z $routine ]] \
+      || [[ $(jq -r '.enabled' <<<"$routine") != true ]] || ! routine_is_stateful "$routine"; }; then
+      continue
+    fi
+    if [[ -z $routine ]]; then
+      LAST_ERROR="Active routine is absent from the candidate configuration: $routine_id"
+      return 1
+    fi
+    snapshot_end_plan_matches "$SNAPSHOT_JSON" "$routine" || return 1
+  done <<<"$active_ids"
 }
 
 # A routine is stateful when activating it leaves something to undo.
@@ -2994,7 +3109,7 @@ run_routine() {
 # interrupted activation always leaves a restorable record.
 activate_resolved_routine() {
   local routine=$1 routine_id=$2 trigger=$3 already_locked=${4:-0}
-  local snapshot_state=0 snapshot next_snapshot claims keep_until on_end_mode minutes expires_at="" now
+  local snapshot_state=0 snapshot next_snapshot claims keep_until on_end_mode end_plan minutes expires_at="" now
   local entry index action type value restore start end duration status="activated" error=""
   if ((!already_locked)) && ! lock_routine "$routine_id"; then
     json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
@@ -3031,6 +3146,7 @@ activate_resolved_routine() {
       return 1
     fi
   fi
+  end_plan=$(end_plan_digest "$routine") || { unlock_routine; json_error "Could not identify the end-action plan" unsafe-state; return 1; }
   if ! claims=$(jq -c '[.actions[] | select(.restore == true) | .type
     | select(. == "nightlight" or . == "dnd" or . == "stay-awake" or . == "theme" or . == "brightness")] | unique' <<<"$routine") \
     || ! snapshot=$(jq -cn \
@@ -3040,8 +3156,9 @@ activate_resolved_routine() {
     --argjson keepUntil "$keep_until" \
     --arg expiresAt "$expires_at" \
     --arg onEndMode "$on_end_mode" \
+    --arg endPlanDigest "$end_plan" \
     --argjson claims "$claims" \
-    '{version:1,routineId:$routineId,activatedAt:$activatedAt,trigger:$trigger,keepUntil:$keepUntil,expiresAt:(if $expiresAt == "" then null else $expiresAt end),onEndMode:$onEndMode,endActionIndex:0,claims:$claims,setters:[]}'); then
+    '{version:2,routineId:$routineId,activatedAt:$activatedAt,trigger:$trigger,keepUntil:$keepUntil,expiresAt:(if $expiresAt == "" then null else $expiresAt end),onEndMode:$onEndMode,endPlanDigest:$endPlanDigest,endActionIndex:0,claims:$claims,setters:[]}'); then
     unlock_routine
     json_error "Could not prepare the activation snapshot" unsafe-state
     return 1
@@ -3142,7 +3259,7 @@ activate_routine() {
 # deleted or disabled after activation can still be restored.
 deactivate_routine() {
   local routine_id=$1 reason=$2 already_locked=${3:-0}
-  local snapshot_state=0 snapshot on_end_mode end_action_index routine="" config_file entry action index action_count
+  local snapshot_state=0 snapshot on_end_mode end_action_index routine="" config_file entry action index action_count end_rows
   local start end duration status="deactivated" error=""
   if ((!already_locked)) && ! lock_routine "$routine_id"; then
     json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
@@ -3195,6 +3312,9 @@ deactivate_routine() {
       if [[ -z $routine ]]; then
         status="failed"
         error="end action: the committed routine is unavailable"
+      elif ! snapshot_end_plan_matches "$snapshot" "$routine"; then
+        status="failed"
+        error="end action: $LAST_ERROR"
       else
         action_count=$(jq -r '((.onEnd // {}).actions // []) | length' <<<"$routine")
         if ((end_action_index > action_count)); then
@@ -3220,7 +3340,15 @@ deactivate_routine() {
     fi
   fi
   if [[ $on_end_mode == actions && -n $routine && $status == deactivated ]]; then
+    if ! end_rows=$(jq -c --argjson start "$end_action_index" \
+        '((.onEnd // {}).actions // []) | to_entries[] | select(.key >= $start)' <<<"$routine"); then
+      status="failed"
+      error="end action: could not read the remaining action plan"
+    fi
+  fi
+  if [[ $on_end_mode == actions && -n $routine && $status == deactivated ]]; then
     while IFS= read -r entry; do
+      [[ -n $entry ]] || continue
       index=$(jq -r '.key' <<<"$entry")
       action=$(jq -c '.value' <<<"$entry")
       # End actions are at-most-once: checkpoint consumption before execution
@@ -3241,8 +3369,7 @@ deactivate_routine() {
         error="end action: $LAST_ERROR"
         break
       fi
-    done < <(jq -c --argjson start "$end_action_index" \
-      '((.onEnd // {}).actions // []) | to_entries[] | select(.key >= $start)' <<<"$routine")
+    done <<<"$end_rows"
   fi
   # A snapshot is only discarded once everything it recorded has been dealt
   # with; otherwise it stays so a later deactivation can finish the restore.
@@ -3386,6 +3513,59 @@ command_deactivate() {
     fail "Only service deactivations accept an expected revision" usage
   fi
   deactivate_routine "$routine_id" "$reason"
+}
+
+command_recovery() {
+  local operation=${1:-} routine_id=${2:-} expected_revision=${3:-} flag=${4:-}
+  local snapshot revision baseline replacement temporary state=0 digest
+  [[ $routine_id =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "Invalid recovery routine id" usage
+  case $operation in
+    inspect) [[ $# -eq 2 ]] || fail "Usage: omachord recovery inspect <routine-id>" usage ;;
+    restore) [[ $# -eq 4 && $expected_revision =~ ^sha256:[0-9a-f]{64}$ && $flag == --skip-end-actions ]] \
+      || fail "Usage: omachord recovery restore <routine-id> <inspected-revision> --skip-end-actions" usage ;;
+    *) fail "Usage: omachord recovery <inspect|restore>" usage ;;
+  esac
+  acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  lock_routine "$routine_id" || fail "$LAST_ERROR" "$LOCK_ERROR_CODE"
+  read_snapshot "$routine_id" || state=$?
+  if ((state != 0)); then
+    unlock_routine
+    fail "${LAST_ERROR:-No activation recovery record exists}" unsafe-state
+  fi
+  snapshot=$SNAPSHOT_JSON
+  baseline=$SNAPSHOT_READ_FINGERPRINT
+  revision=$(revision_for_fingerprint "$baseline") || { unlock_routine; fail "Could not identify recovery revision" unsafe-state; }
+  if [[ $operation == inspect ]]; then
+    unlock_routine
+    jq -cn --arg revision "$revision" --argjson snapshot "$snapshot" \
+      '{ok:true,revision:$revision,snapshot:$snapshot}'
+    return
+  fi
+  if [[ $expected_revision != "$revision" ]]; then
+    unlock_routine
+    fail "Recovery changed since it was inspected; inspect it again before deciding to skip end actions" stale-recovery
+  fi
+  # Persist the explicit skip decision before restoration. A crash or failed
+  # removal must not cause a normal retry to resume abandoned executable work.
+  digest=$(end_plan_digest '{"onEnd":{"mode":"restore"}}') || { unlock_routine; fail "Could not identify recovery plan" unsafe-state; }
+  if ! replacement=$(jq -c --arg digest "$digest" \
+      '.version=2 | .onEndMode="restore" | .endPlanDigest=$digest' <<<"$snapshot"); then
+    unlock_routine
+    fail "Could not prepare the restore-only recovery record" unsafe-state
+  fi
+  temporary=$(mktemp) || { unlock_routine; fail "Could not prepare recovery" unsafe-state; }
+  if ! printf '%s\n' "$replacement" >"$temporary"; then
+    rm -f -- "$temporary"
+    unlock_routine
+    fail "Could not stage the restore-only recovery record" unsafe-state
+  fi
+  if ! atomic_replace_if_fingerprint "$temporary" "$(snapshot_path "$routine_id")" "$baseline" 600; then
+    rm -f -- "$temporary"
+    unlock_routine
+    fail "$LAST_ERROR" concurrent-edit
+  fi
+  rm -f -- "$temporary"
+  deactivate_routine "$routine_id" recovery 1
 }
 
 command_active() {
@@ -3763,7 +3943,7 @@ Commands:
   config validate       Read candidate JSON from stdin
   config apply <revision>
   connect [revision]
-  autostart             Connect on first use unless explicitly disabled
+  autostart             Reuse committed config or bootstrap, unless disabled
   disconnect
   bindings
   commands
@@ -3774,6 +3954,10 @@ Commands:
   activate <routine-id> <condition|service> <expected-revision>
   deactivate <routine-id> [manual|shortcut|test]
   deactivate <routine-id> <condition|service|timer> <expected-revision>
+  recovery inspect <routine-id>
+                        Inspect recovery data and its approval revision
+  recovery restore <routine-id> <revision> --skip-end-actions
+                        Explicitly skip remaining end actions and restore setters
   active                Snapshots of currently active stateful routines
   trigger hook <event> [args...]
   logs [limit]
@@ -3828,6 +4012,7 @@ main() {
     activate) require_prepared_state; command_activate "$@" ;;
     deactivate) require_prepared_state; command_deactivate "$@" ;;
     active) require_prepared_state; command_active "$@" ;;
+    recovery) require_prepared_state; command_recovery "$@" ;;
     trigger)
       local trigger_type=${1:-}
       shift || true
