@@ -240,6 +240,8 @@ Tests additionally require Node.js, `luac`, `qmllint`, `qmltestrunner`, `desktop
 
 It exercises strict and byte-bounded schema validation, bounded toggle discovery, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, descriptor-pinned transaction races and durability failures, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, model and condition logic, runtime QML interaction, an offscreen run of the condition service against a fake runner, plugin validation, and QML linting.
 
+GitHub Actions runs the required `portable` check on pushes and pull requests. It includes source and manifest validation, the filesystem transaction tests, the action-supervisor tests, the runner integration tests with mocked desktop commands, and the Node.js model, condition, and QML policy tests. The job uses Debian 13 for GNU coreutils 9.5+ (`mv --exchange` and `--update=none-fail`); the shell test suites run as a non-root user so permission-denial checks remain meaningful. It does not replace the full local gate: run `test/run.sh` before releasing to also check the target desktop versions, plugin validation, runtime QML behavior, and QML linting.
+
 `test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup offscreen into `test/render/out/` so a change can be reviewed as images. It reads your real configuration through the runner but never writes.
 
 ## License
