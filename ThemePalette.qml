@@ -13,10 +13,12 @@ Item {
   id: root
 
   readonly property string home: Quickshell.env("HOME")
-  readonly property string themeDir: Quickshell.env("OMACHORD_THEME_DIR")
-    || (home + "/.local/state/omarchy/current/theme")
-  readonly property string themeNamePath: Quickshell.env("OMACHORD_THEME_NAME_FILE")
-    || (home + "/.local/state/omarchy/current/theme.name")
+  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
+  property string runnerPath: configuredRunnerPath.indexOf("/") === 0
+    ? configuredRunnerPath
+    : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord"
+  property bool active: visible
+  property bool readQueued: false
 
   // Used when the theme ships no colors.toml (older themes) or no green.
   property color fallbackSuccess: "#68c98b"
@@ -27,32 +29,40 @@ Item {
   property int revision: 0
 
   function reload() {
-    settle.restart()
+    if (active) settle.restart()
   }
 
-  function colorToken(text, key) {
-    var lines = String(text || "").split("\n")
-    for (var i = 0; i < lines.length; i++) {
-      var match = /^\s*([A-Za-z0-9_-]+)\s*=\s*["']?(#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?)["']?\s*(#.*)?$/.exec(lines[i])
-      if (match && match[1] === key) return match[2]
-    }
-    return ""
-  }
-
-  function applyColors(text) {
-    var green = colorToken(text, "green")
+  function applyPalette(result) {
+    var green = result && typeof result.green === "string"
+      && /^#[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?$/.test(result.green) ? result.green : ""
     hasPalette = green !== ""
     success = green ? green : fallbackSuccess
+    themeName = result && typeof result.name === "string" ? result.name : ""
     revision++
   }
 
-  function applyName(text) {
-    themeName = String(text || "").trim()
+  function readPalette() {
+    if (!active) return
+    if (paletteProc.running) readQueued = true
+    else { paletteProc.startPending = true; paletteProc.running = true }
   }
 
-  // A theme switch replaces the staged theme directory wholesale, so a file
-  // watch on the old inode goes quiet; the shell's palette change is the
-  // reliable signal. The short delay lets omarchy-theme-set finish staging.
+  function finishRead(result) {
+    applyPalette(result && result.ok === true ? result : null)
+    if (readQueued) {
+      readQueued = false
+      Qt.callLater(readPalette)
+    }
+  }
+
+  onActiveChanged: {
+    if (active) reload()
+    else { settle.stop(); readQueued = false }
+  }
+  Component.onCompleted: reload()
+
+  // Shell changes settle for 250ms. A coalesced 2s active-only poll also picks
+  // up direct file edits without FileView's unbounded eager reads.
   Connections {
     target: Color
     function onForegroundChanged() { root.reload() }
@@ -65,29 +75,35 @@ Item {
     id: settle
     interval: 250
     repeat: false
-    onTriggered: {
-      colorsFile.reload()
-      nameFile.reload()
+    onTriggered: root.readPalette()
+  }
+
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.active
+    onTriggered: root.readPalette()
+  }
+
+  Process {
+    id: paletteProc
+    property bool startPending: false
+    command: [root.runnerPath, "theme-palette"]
+    stdout: StdioCollector { id: paletteOutput; waitForEnd: true }
+    onStarted: startPending = false
+    onExited: function(exitCode) {
+      startPending = false
+      var result = null
+      if (exitCode === 0) {
+        try { result = JSON.parse(paletteOutput.text) } catch (e) {}
+      }
+      root.finishRead(result)
     }
-  }
-
-  FileView {
-    id: colorsFile
-    path: root.themeDir + "/colors.toml"
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.applyColors(text())
-    onLoadFailed: root.applyColors("")
-    onFileChanged: reload()
-  }
-
-  FileView {
-    id: nameFile
-    path: root.themeNamePath
-    watchChanges: true
-    printErrors: false
-    onLoaded: root.applyName(text())
-    onLoadFailed: root.applyName("")
-    onFileChanged: reload()
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (paletteProc.running || !paletteProc.startPending) return
+        paletteProc.startPending = false
+        root.finishRead(null)
+      })
   }
 }

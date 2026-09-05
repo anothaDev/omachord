@@ -21,6 +21,9 @@ case $operation in
   disconnect) reply='{"ok":true,"connected":false}' ;;
   run) reply='{"ok":true,"state":"activated"}' ;;
   deactivate) reply='{"ok":true,"state":"deactivated","restored":1}' ;;
+  themes) reply='Fixture Theme' ;;
+  service-status) reply='{"ready":true,"enabled":true,"routines":[]}' ;;
+  theme-palette) reply='{"ok":true,"green":"#aabbcc","name":"Fixture Theme"}' ;;
   active|bindings|commands|logs|toggles) reply='[]' ;;
   *) printf 'Unexpected fixture call: %s\n' "$*" >&2; exit 1 ;;
 esac

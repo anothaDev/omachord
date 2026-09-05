@@ -29,7 +29,7 @@ Item {
   property var commandOptions: []
   property var themeOptions: []
   property var toggleOptions: []
-  property var activeIds: ({})
+  property var activeIds: Object.create(null)
   property var serviceStatus: null
   readonly property bool wifiAvailable: Networking.backend === NetworkBackendType.NetworkManager
   readonly property var networkDevices: Networking.devices ? Networking.devices.values : []
@@ -46,6 +46,9 @@ Item {
   property string activeView: "routines"
   property string selectedRoutineId: ""
   property var editorRoutine: null
+  // The editor can intentionally retain a draft while the list/base revision
+  // refreshes. Only a displayed-definition update may advance this revision.
+  property string editorRevision: ""
   property bool editorPersisted: false
   property bool configLoaded: false
   property bool configUncommitted: false
@@ -78,19 +81,20 @@ Item {
   property bool revisionStarted: false
   property string revisionRefreshPurpose: ""
   // Saved-routine enable switches are optimistic. The intent map always holds
-  // the latest value a person asked for, including values changed again while
-  // an older batch is being written. `enableSubmitted` is the immutable slice
-  // owned by the one apply currently in flight.
-  property var enableIntents: ({})
-  property var enableSubmitted: ({})
+  // the latest value and immutable definition a person reviewed, including
+  // values changed while an older batch is being written. `enableSubmitted`
+  // is the immutable slice owned by the one apply currently in flight.
+  property var enableIntents: Object.create(null)
+  property var enableSubmitted: Object.create(null)
   property var enableCommittedConfig: null
   property var enableSubmittedConfig: null
   property var enableWarnings: []
   property var enableDeactivated: []
+  property var enableConflicts: []
   property string runningRoutineId: ""
   // A direct routine request remains pending until a probe started after its
   // completion settles. Other routines need not wait for that probe.
-  property var actionSettling: ({})
+  property var actionSettling: Object.create(null)
   property date displayNow: new Date()
 
   readonly property string home: Quickshell.env("HOME")
@@ -131,7 +135,7 @@ Item {
   readonly property color subtle: Qt.darker(fg, 1.5)
   readonly property color hairline: Util.alpha(fg, 0.12)
 
-  ThemePalette { id: palette }
+  ThemePalette { id: palette; active: window.visible; runnerPath: root.runnerPath }
 
   onCompactChanged: {
     if (compact && editorRoutine) compactEditorOpen = true
@@ -262,7 +266,7 @@ Item {
 
   function objectValues(map) {
     var rows = []
-    for (var key in map) rows.push(map[key])
+    for (var key in map) if (mapOwns(map, key)) rows.push(map[key])
     return rows
   }
 
@@ -271,7 +275,7 @@ Item {
   function buildWifiOptions() {
     var rows = []
     if (!wifiAvailable) return rows
-    var seen = ({})
+    var seen = Object.create(null)
     var devices = networkDevices || []
     for (var d = 0; d < devices.length; d++) {
       var device = devices[d]
@@ -357,6 +361,7 @@ Item {
   function buildActiveRows(active, currentConfig) {
     var rows = []
     for (var id in active) {
+      if (!mapOwns(active, id)) continue
       var record = active[id] || {}
       rows.push({
         id: id,
@@ -447,12 +452,13 @@ Item {
           || noticeText.indexOf("The routine configuration is not committed") === 0))
         clearNotice()
     } else if (parsed && parsed.ok && parsed.committed === false) {
-      // A connected install from before the commit record existed lands here.
-      // Keep the revision so Enable/Repair can commit exactly this file.
+      // Unknown executable content remains inert. A revision alone is not
+      // evidence of review; Enable/Repair must not approve an unseen file.
       if (typeof parsed.revision === "string") configRevision = parsed.revision
       configUncommitted = true
-      failConfigLoad("The routine configuration is not committed and was not loaded. Choose "
-        + (connectionNeedsRepair || status.connected ? "Repair" : "Enable") + " to commit it.")
+      failConfigLoad("The routine configuration is not committed and was not loaded. Inspect it with "
+        + "omachord config snapshot, review every routine, then approve that snapshot using omachord connect "
+        + configRevision + ". Refresh this panel afterward.")
     } else if (parsed && parsed.error) failConfigLoad(parsed.error)
     else failConfigLoad("The runner returned invalid configuration JSON")
   }
@@ -505,6 +511,40 @@ Item {
     return mapOwns(enableIntents, id)
   }
 
+  function definitionValue(value) {
+    if (Array.isArray(value)) return ["array", value.map(definitionValue)]
+    if (value !== null && typeof value === "object") {
+      var keys = Object.keys(value).sort()
+      return ["object", keys.map(function(key) { return [key, definitionValue(value[key])] })]
+    }
+    return value
+  }
+
+  function routineDefinitionKey(routine) {
+    var definition = Model.clone(routine)
+    delete definition.enabled
+    // Include every field except the switch itself, including future fields.
+    // Sorted key/value pairs avoid order-only conflicts and object-key setters.
+    return JSON.stringify(definitionValue(definition))
+  }
+
+  function retainReviewedEnableIntents(base, intents) {
+    var definitions = Object.create(null)
+    var routines = base && Array.isArray(base.routines) ? base.routines : []
+    for (var r = 0; r < routines.length; r++)
+      definitions[String(routines[r].id)] = routineDefinitionKey(routines[r])
+    var retained = Object.create(null)
+    var conflicts = enableConflicts.slice()
+    for (var id in intents) {
+      if (!mapOwns(intents, id)) continue
+      if (mapOwns(definitions, id) && definitions[id] === intents[id].definition)
+        retained[id] = intents[id]
+      else conflicts.push(id)
+    }
+    enableConflicts = conflicts
+    return retained
+  }
+
   // Applies intent values to a fresh clone, making the optimistic view and
   // every submitted full-document payload derive from an explicit base.
   function configWithEnableIntents(base, intents) {
@@ -512,7 +552,9 @@ Item {
     if (!next || !Array.isArray(next.routines)) return next
     for (var i = 0; i < next.routines.length; i++) {
       var id = String(next.routines[i].id || "")
-      if (mapOwns(intents, id)) next.routines[i].enabled = intents[id] === true
+      if (mapOwns(intents, id)
+          && routineDefinitionKey(next.routines[i]) === intents[id].definition)
+        next.routines[i].enabled = intents[id].enabled
     }
     return next
   }
@@ -520,8 +562,10 @@ Item {
   function syncSelectedRoutineFromConfig() {
     if (!editorPersisted || !selectedRoutineId || routineEditor.dirty) return
     var selected = routineById(selectedRoutineId)
-    if (selected) editorRoutine = Model.clone(selected)
-    else ensureRoutineSelection()
+    if (selected) {
+      editorRoutine = Model.clone(selected)
+      editorRevision = configRevision
+    } else ensureRoutineSelection()
   }
 
   function selectRoutineNow(id, showEditor) {
@@ -529,6 +573,7 @@ Item {
     selectedRoutineId = routine ? id : ""
     editorPersisted = !!routine
     editorRoutine = routine ? Model.clone(routine) : null
+    editorRevision = routine ? configRevision : ""
     if (showEditor !== false && routine) compactEditorOpen = true
     setActiveView("routines")
   }
@@ -537,6 +582,7 @@ Item {
     selectedRoutineId = routine.id
     editorPersisted = false
     editorRoutine = Model.clone(routine)
+    editorRevision = ""
     compactEditorOpen = true
     setActiveView("routines")
   }
@@ -573,12 +619,13 @@ Item {
     routineEditor.stopShortcutCapture()
     if (action === "routine") selectRoutineNow(String(value), true)
     else if (action === "draft") selectDraftNow(value)
-    else if (action === "enabled") setRoutineEnabled(String(value.id), value.enabled === true)
+    else if (action === "enabled") setRoutineEnabled(String(value.id), value.enabled === true, value.definition)
     else if (action === "refresh") refreshAll()
     else if (action === "back") {
       selectedRoutineId = ""
       editorPersisted = false
       editorRoutine = null
+      editorRevision = ""
       compactEditorOpen = false
     }
   }
@@ -606,6 +653,7 @@ Item {
       if (selected) {
         editorPersisted = true
         editorRoutine = Model.clone(selected)
+        editorRevision = configRevision
         return
       }
     }
@@ -614,6 +662,7 @@ Item {
       selectedRoutineId = ""
       editorPersisted = false
       editorRoutine = null
+      editorRevision = ""
       compactEditorOpen = false
     }
   }
@@ -690,7 +739,7 @@ Item {
     requestRefreshProcess(logsProc)
     requestRefreshProcess(statusProc)
     if (!serviceLive) requestRefreshProcess(activeProc)
-    if (pendingAfterApply === "run" && selectId) runRoutine(selectId)
+    if (pendingAfterApply === "run" && selectId) runRoutine(selectId, result.revision)
     pendingAfterApply = ""
   }
 
@@ -706,9 +755,11 @@ Item {
     if (!configLoaded || (mutating && mutationOperation !== "enable-apply")) return
     if (loading || revisionRefreshPending || routineEnablePending(id)
         || serviceConnectionBusy() || routineActionBusy(id)) return
+    var routine = routineById(id)
+    if (!routine) return
     if (routineEditor.dirty) {
       pendingUiAction = "enabled"
-      pendingUiValue = ({ id: id, enabled: enabled === true })
+      pendingUiValue = ({ id: id, enabled: enabled === true, definition: routineDefinitionKey(routine) })
       showConfirmation(
         "discard",
         "Discard the unsaved changes before turning this routine " + (enabled ? "on" : "off") + "?",
@@ -721,18 +772,24 @@ Item {
   // List switches update the displayed config immediately. A short debounce
   // folds nearby clicks into one full-document CAS apply; later clicks remain
   // intents even if an older slice is already in flight.
-  function setRoutineEnabled(id, enabled) {
+  function setRoutineEnabled(id, enabled, reviewedDefinition) {
     var routine = routineById(id)
     if (!routine || !configLoaded || (mutating && mutationOperation !== "enable-apply")) return
+    var definition = routineDefinitionKey(routine)
+    if (reviewedDefinition !== undefined && reviewedDefinition !== definition) {
+      showNotice("This routine changed while confirmation was open. Please review it before switching again.", true)
+      return
+    }
     if (mutationOperation !== "enable-apply") {
       enableCommittedConfig = Model.clone(config)
       enableWarnings = []
       enableDeactivated = []
+      enableConflicts = []
       mutationOperation = "enable-apply"
       mutating = true
     }
-    var intents = Object.assign({}, enableIntents)
-    intents[String(id)] = enabled === true
+    var intents = Object.assign(Object.create(null), enableIntents)
+    intents[String(id)] = { enabled: enabled === true, definition: definition }
     enableIntents = intents
     config = configWithEnableIntents(config, intents)
     syncSelectedRoutineFromConfig()
@@ -747,7 +804,7 @@ Item {
       finishEnableBatchSuccess()
       return
     }
-    enableSubmitted = Object.assign({}, enableIntents)
+    enableSubmitted = Object.assign(Object.create(null), enableIntents)
     enableSubmittedConfig = Model.clone(config)
     pendingPayload = JSON.stringify(enableSubmittedConfig)
     applyStarted = false
@@ -757,20 +814,21 @@ Item {
   }
 
   function clearSubmittedEnableIntents(base) {
-    var remaining = ({})
+    var remaining = Object.create(null)
     var current = enableIntents || {}
     var submitted = enableSubmitted || {}
     var routines = base && Array.isArray(base.routines) ? base.routines : []
-    var existing = ({})
+    var existing = Object.create(null)
     for (var r = 0; r < routines.length; r++) existing[String(routines[r].id || "")] = true
     for (var id in current) {
       if (!mapOwns(current, id) || !mapOwns(existing, id)) continue
       // An in-flight value is acknowledged only when it is still the latest
       // request. A newer value for this same row must survive and be rebased.
-      if (mapOwns(submitted, id) && current[id] === submitted[id]) continue
-      remaining[id] = current[id] === true
+      if (mapOwns(submitted, id) && current[id].enabled === submitted[id].enabled
+          && current[id].definition === submitted[id].definition) continue
+      remaining[id] = current[id]
     }
-    enableIntents = remaining
+    enableIntents = retainReviewedEnableIntents(base, remaining)
   }
 
   function appendEnableResults(result) {
@@ -794,7 +852,7 @@ Item {
 
     pendingPayload = ""
     if (!result.ok) {
-      enableSubmitted = ({})
+      enableSubmitted = Object.create(null)
       enableSubmittedConfig = null
       if (result.code === "stale-config" || result.code === "concurrent-edit") {
         enableApplyDebounce.stop()
@@ -815,7 +873,7 @@ Item {
     configRevision = result.revision
     enableCommittedConfig = Model.clone(committed)
     clearSubmittedEnableIntents(committed)
-    enableSubmitted = ({})
+    enableSubmitted = Object.create(null)
     enableSubmittedConfig = null
     config = configWithEnableIntents(committed, enableIntents)
     syncSelectedRoutineFromConfig()
@@ -826,7 +884,7 @@ Item {
   function finishEnableBatchSuccess() {
     enableApplyDebounce.stop()
     var endedNames = []
-    var seen = ({})
+    var seen = Object.create(null)
     for (var i = 0; i < enableDeactivated.length; i++) {
       var id = String(enableDeactivated[i])
       if (mapOwns(seen, id)) continue
@@ -835,16 +893,20 @@ Item {
     }
     var message = enableWarnings.length ? enableWarnings.join(" ")
       : (endedNames.length ? "Saved. Ended " + endedNames.join(", ") + "." : "Saved")
-    enableIntents = ({})
-    enableSubmitted = ({})
+    var conflicted = enableConflicts.length > 0
+    if (conflicted) message = "Routine switches were canceled because these definitions changed or were removed: "
+      + enableConflicts.join(", ") + ". Please review them before switching again."
+    enableIntents = Object.create(null)
+    enableSubmitted = Object.create(null)
     enableCommittedConfig = null
     enableSubmittedConfig = null
     enableWarnings = []
     enableDeactivated = []
+    enableConflicts = []
     pendingPayload = ""
     mutationOperation = ""
     mutating = false
-    showNotice(message, false)
+    showNotice(message, conflicted)
     ensureRoutineSelection()
     requestRefreshProcess(bindingsProc)
     requestRefreshProcess(logsProc)
@@ -855,12 +917,13 @@ Item {
   function failEnableBatch(message) {
     enableApplyDebounce.stop()
     if (enableCommittedConfig) config = Model.clone(enableCommittedConfig)
-    enableIntents = ({})
-    enableSubmitted = ({})
+    enableIntents = Object.create(null)
+    enableSubmitted = Object.create(null)
     enableCommittedConfig = null
     enableSubmittedConfig = null
     enableWarnings = []
     enableDeactivated = []
+    enableConflicts = []
     pendingPayload = ""
     revisionRefreshPending = false
     revisionStarted = false
@@ -898,18 +961,23 @@ Item {
     applyConfig(next, next.routines.length ? next.routines[0].id : "", "")
   }
 
-  function runRoutine(id) {
+  function runRoutine(id, expectedRevision) {
     if (!id || !configLoaded || !editorPersisted || routineActionBlocked(id)) return
+    var reviewed = expectedRevision === undefined
+      ? (editorRoutine && editorRoutine.id === id ? editorRevision : configRevision) : expectedRevision
+    if (typeof reviewed !== "string" || !reviewed) { showNotice("Refresh the routine before running it", true); return }
     showNotice((activeIds[id] ? "Ending " : "Running ") + Model.nameFor(config, id) + "...", false, true)
-    if (service && (typeof service.testRoutine === "function"
+    // An older cached Service would ignore an extra argument. Use the direct
+    // runner fallback unless the service advertises revision-bound requests.
+    if (service && service.manualRevisionBinding === true && (typeof service.testRoutine === "function"
         || typeof service.toggleRoutine === "function")) {
       var queued = typeof service.testRoutine === "function"
-        ? service.testRoutine(id) : service.toggleRoutine(id)
+        ? service.testRoutine(id, reviewed) : service.toggleRoutine(id, reviewed)
       if (!queued) showNotice("The routine queue is full", true)
       return
     }
     runningRoutineId = id
-    actionProc.command = [runnerPath, "run", id, "test"]
+    actionProc.command = [runnerPath, "run", id, "test", reviewed]
     actionStarted = false
     startProcess(actionProc)
   }
@@ -934,9 +1002,9 @@ Item {
   }
 
   function routineActionBlocked(id) {
-    if (routineActionBusy(id)) return true
+    if (routineActionBusy(id) || actionProc.running) return true
     if (service) return serviceConnectionBusy()
-    return actionProc.running
+    return false
   }
 
   // Ending from the Activity list goes through the service when it is loaded
@@ -957,6 +1025,7 @@ Item {
 
   function mutateConnection(operation) {
     if (mutating || loading || integrationBusy || !(configLoaded || configUncommitted)) return
+    if (operation === "connect" && !configLoaded) return
     connectionEpoch++
     mutationOperation = operation
     mutating = true
@@ -1061,7 +1130,7 @@ Item {
       ? (parsed || { ok: false, error: fallback })
       : (parsed && parsed.ok === false ? parsed : { ok: false, error: fallback })
     if (!serviceLive && actionStarted) {
-      var settling = Object.assign({}, actionSettling)
+      var settling = Object.assign(Object.create(null), actionSettling)
       settling[runningRoutineId] = activeProc.generation + 1
       actionSettling = settling
     }
@@ -1074,9 +1143,9 @@ Item {
   }
 
   function finishActionSettling(generation) {
-    var remaining = ({})
+    var remaining = Object.create(null)
     for (var id in actionSettling)
-      if (actionSettling[id] > generation) remaining[id] = actionSettling[id]
+      if (mapOwns(actionSettling, id) && actionSettling[id] > generation) remaining[id] = actionSettling[id]
     actionSettling = remaining
   }
 
@@ -1091,7 +1160,7 @@ Item {
   }
 
   function rebuildActiveIds(rows) {
-    var next = ({})
+    var next = Object.create(null)
     for (var i = 0; i < rows.length; i++)
       if (rows[i] && rows[i].routineId) next[String(rows[i].routineId)] = rows[i]
     activeIds = next
@@ -1109,14 +1178,9 @@ Item {
           && parsed.config.version === 1 && typeof parsed.revision === "string") {
         enableCommittedConfig = Model.clone(parsed.config)
         configRevision = parsed.revision
-        // Drop intents for routines removed elsewhere; every surviving latest
-        // value is overlaid onto the newly committed full-document base.
-        var rebased = ({})
-        for (var i = 0; i < parsed.config.routines.length; i++) {
-          var id = String(parsed.config.routines[i].id || "")
-          if (mapOwns(enableIntents, id)) rebased[id] = enableIntents[id] === true
-        }
-        enableIntents = rebased
+        // A matching ID cannot transfer a decision to a changed definition.
+        // Keep independent switches, but dropped decisions never reappear.
+        enableIntents = retainReviewedEnableIntents(parsed.config, enableIntents)
         config = configWithEnableIntents(parsed.config, enableIntents)
         syncSelectedRoutineFromConfig()
         if (hasEnableIntents()) enableApplyDebounce.restart()
@@ -1373,7 +1437,7 @@ Item {
   Process {
     id: themesProc
     property bool refreshQueued: false
-    command: ["omarchy-theme-list"]
+    command: [root.runnerPath, "themes"]
     stdout: StdioCollector { id: themesStdout; waitForEnd: true }
     onExited: function(exitCode) {
       if (exitCode === 0) root.rebuildThemeOptions(themesStdout.text)
@@ -1406,7 +1470,7 @@ Item {
   Process {
     id: serviceStatusProc
     property bool refreshQueued: false
-    command: ["omarchy-shell", "omachord", "status"]
+    command: [root.runnerPath, "service-status"]
     stdout: StdioCollector { id: serviceStatusStdout; waitForEnd: true }
     onExited: function(exitCode) {
       root.serviceStatus = exitCode === 0 ? root.parseJson(serviceStatusStdout.text, null) : null
@@ -1589,7 +1653,7 @@ Item {
                   objectName: "panelIntegrationSwitch"
                   checked: root.integrationOn
                   busy: root.integrationBusy || root.loading || root.mutating || root.revisionRefreshPending
-                  interactive: root.configLoaded || root.configUncommitted
+                  interactive: root.configLoaded || (root.configUncommitted && root.integrationOn)
                   foreground: root.fg
                   accent: root.accent
                   activeFocusOnTab: true
@@ -1697,7 +1761,7 @@ Item {
                 focusable: true
                 foreground: root.fg
                 accent: root.accent
-                enabled: (root.configLoaded || root.configUncommitted) && !root.loading && !root.mutating
+                enabled: root.configLoaded && !root.loading && !root.mutating
                 onClicked: root.mutateConnection("connect")
                 Accessible.name: "Repair Omachord integration"
                 Accessible.role: Accessible.Button
@@ -2519,7 +2583,7 @@ Item {
                         accent: root.accent
                         hasCursor: conditionHover.hovered
                         Accessible.role: Accessible.Button
-                        Accessible.name: modelData.name + ", " + (isOn ? "on" : reason.label)
+                        Accessible.name: modelData.name + ", " + (isOn ? "on" : reason ? reason.label : "")
 
                         HoverHandler { id: conditionHover }
 

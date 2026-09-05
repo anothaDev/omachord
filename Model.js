@@ -16,6 +16,22 @@ function codePointLength(value) {
   return length
 }
 
+function utf8ByteLength(value) {
+  var text = String(value || "")
+  var length = 0
+  for (var i = 0; i < text.length; i++) {
+    var first = text.charCodeAt(i)
+    if (first < 0x80) length++
+    else if (first < 0x800) length += 2
+    else if (first >= 0xD800 && first <= 0xDBFF && i + 1 < text.length
+        && text.charCodeAt(i + 1) >= 0xDC00 && text.charCodeAt(i + 1) <= 0xDFFF) {
+      length += 4
+      i++
+    } else length += 3
+  }
+  return length
+}
+
 function truncateCodePoints(value, maximum) {
   var text = String(value || "")
   var end = 0
@@ -46,7 +62,7 @@ function slugify(value) {
 
 function uniqueId(name, routines) {
   var base = slugify(name)
-  var used = {}
+  var used = Object.create(null)
   var list = routines || []
   for (var i = 0; i < list.length; i++) used[String(list[i].id)] = true
   if (!used[base]) return base
@@ -521,8 +537,9 @@ function validateCondition(condition) {
       if (!Array.isArray(condition.ssids) || condition.ssids.length === 0) return "Add at least one Wi-Fi network"
       if (condition.ssids.length > 16) return "A Wi-Fi condition can list at most 16 networks"
       for (var i = 0; i < condition.ssids.length; i++) {
-        var ssid = String(condition.ssids[i] || "")
-        if (!ssid || ssid.length > 32) return "Wi-Fi network names must be 1 to 32 characters"
+        var ssid = condition.ssids[i]
+        if (typeof ssid !== "string" || !ssid || utf8ByteLength(ssid) > 32)
+          return "Wi-Fi network names must be 1 to 32 UTF-8 bytes"
         if (condition.ssids.indexOf(ssid) !== i) return "Wi-Fi network names must be unique"
       }
       return ""

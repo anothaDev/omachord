@@ -31,6 +31,8 @@ Create an annotated `v*` tag only after the local gate and review pass, and sign
 
 ## Repository Rules
 
-After the repository is published, protect the default branch against force-pushes and deletion, require pull-request and CODEOWNERS approval, and require the CI checks. Protect `v*` tags from deletion or unreviewed creation. Enable private vulnerability reporting, secret scanning, and least-privilege GitHub Actions permissions.
+The maintainer's current solo-maintainer workflow protects the default branch against force-pushes and deletion and requires a pull request, resolved conversations, an up-to-date branch, and the `portable` check. It requires zero GitHub approvals and permits no bypass. Independent release review is a separate requirement above; the branch rules do not certify it automatically.
+
+Before release, record the current controls and any difference from the intended policy. Prospective tag protection, immutable releases, signing identity, CODEOWNERS approvals, and secret-scanning/push-protection settings are maintainer decisions. Do not silently change repository settings, rewrite existing tags, or describe an unenforced control as active. Keep private vulnerability reporting and least-privilege workflow permissions, and use normal PR/CI flow for fixes.
 
 Hosted CI may run portable checks, but the local Omarchy/QML suite remains a required release gate until an equivalent reproducible CI environment exists.

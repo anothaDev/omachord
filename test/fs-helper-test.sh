@@ -6,11 +6,15 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 HELPER="$ROOT/bin/omachord-fs"
 if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
 TEST_ROOT=$(mktemp -d "$TEST_TMP/omachord-fs-test.XXXXXX")
+INSTRUMENTED_HELPER="$TEST_ROOT/instrumented/bin/omachord-fs"
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
+
+# Only explicit fault-injection calls use this disposable plugin fixture.
+python3 "$ROOT/test/fs_test_support.py" "$ROOT" "$TEST_ROOT/instrumented" >/dev/null
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -34,7 +38,7 @@ run_parent_swap() {
   printf '%s' payload \
     | env OMACHORD_FS_TEST_MATCH="$parent/value" OMACHORD_FS_TEST_PAUSE=before-publish \
         OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-        "$HELPER" atomic-write "$parent/value" 600 private "$root/archive" >"$result" &
+        "$INSTRUMENTED_HELPER" atomic-write "$parent/value" 600 private "$root/archive" >"$result" &
   pid=$!
   for _ in {1..500}; do
     [[ -e $ready ]] && break
@@ -71,11 +75,11 @@ for operation in cas-write cas-remove; do
     printf '%s' candidate \
       | env OMACHORD_FS_TEST_MATCH="$root/parent/value" OMACHORD_FS_TEST_PAUSE=before-publish \
           OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-          "$HELPER" cas-write "$root/parent/value" 600 "$baseline_fingerprint" private "$root/archive" >"$result" &
+          "$INSTRUMENTED_HELPER" cas-write "$root/parent/value" 600 "$baseline_fingerprint" private "$root/archive" >"$result" &
   else
     env OMACHORD_FS_TEST_MATCH="$root/parent/value" OMACHORD_FS_TEST_PAUSE=before-publish \
       OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-      "$HELPER" cas-remove "$root/parent/value" "$baseline_fingerprint" private "$root/archive" >"$result" &
+      "$INSTRUMENTED_HELPER" cas-remove "$root/parent/value" "$baseline_fingerprint" private "$root/archive" >"$result" &
   fi
   pid=$!
   for _ in {1..500}; do
@@ -102,7 +106,7 @@ release="$root/release"
 result="$root/result"
 env OMACHORD_FS_TEST_MATCH="$root/parent/value" OMACHORD_FS_TEST_PAUSE=before-publish \
   OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-  "$HELPER" cas-remove "$root/parent/value" missing private "$root/archive" >"$result" &
+  "$INSTRUMENTED_HELPER" cas-remove "$root/parent/value" missing private "$root/archive" >"$result" &
 pid=$!
 for _ in {1..500}; do
   [[ -e $ready ]] && break
@@ -127,7 +131,7 @@ release="$toggle_root/release"
 result="$toggle_root/result"
 env OMACHORD_FS_TEST_MATCH="$toggle_root/state/toggles" OMACHORD_FS_TEST_PAUSE=before-scan \
   OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-  "$HELPER" list-toggles "$toggle_root/state/toggles" 4096 524288 >"$result" &
+  "$INSTRUMENTED_HELPER" list-toggles "$toggle_root/state/toggles" 4096 524288 >"$result" &
 pid=$!
 for _ in {1..500}; do
   [[ -e $ready ]] && break
@@ -151,7 +155,7 @@ baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
 result="$durable/file-sync.result"
 if printf '%s' candidate \
     | env OMACHORD_FS_TEST_MATCH="$durable/value" OMACHORD_FS_TEST_FAIL_SYNC=1 \
-        "$HELPER" cas-write "$durable/value" 600 "$baseline" private "$durable/archive" >"$result"; then
+        "$INSTRUMENTED_HELPER" cas-write "$durable/value" 600 "$baseline" private "$durable/archive" >"$result"; then
   fail "filesystem helper reported success after a staged-file sync failure"
 fi
 grep -Fq 'durability-error' "$result" || fail "file sync failure returned the wrong error"
@@ -161,7 +165,7 @@ assert_no_transaction_files "$durable"
 result="$durable/directory-sync.result"
 if printf '%s' candidate \
     | env OMACHORD_FS_TEST_MATCH="$durable/value" OMACHORD_FS_TEST_FAIL_SYNC=3 \
-        "$HELPER" cas-write "$durable/value" 600 "$baseline" private "$durable/archive" >"$result"; then
+        "$INSTRUMENTED_HELPER" cas-write "$durable/value" 600 "$baseline" private "$durable/archive" >"$result"; then
   fail "filesystem helper reported success after a directory sync failure"
 fi
 grep -Fq 'durability-error' "$result" || fail "directory sync failure returned the wrong error"
@@ -176,7 +180,7 @@ chmod 600 "$post_commit/value"
 baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
 if ! printf '%s' candidate \
     | env OMACHORD_FS_TEST_MATCH="$post_commit/value" OMACHORD_FS_TEST_FAIL_SYNC=4 \
-        "$HELPER" cas-write "$post_commit/value" 600 "$baseline" private "$post_commit/archive" >/dev/null; then
+        "$INSTRUMENTED_HELPER" cas-write "$post_commit/value" 600 "$baseline" private "$post_commit/archive" >/dev/null; then
   fail "post-commit cleanup failure made a durable write ambiguous"
 fi
 [[ $(cat "$post_commit/value") == candidate ]] || fail "post-commit write did not retain the candidate"
@@ -190,7 +194,7 @@ for ordinal in 1 2 3 4; do
   baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
   result="$remove_root/result"
   if env OMACHORD_FS_TEST_MATCH="$remove_root/value" OMACHORD_FS_TEST_FAIL_SYNC="$ordinal" \
-      "$HELPER" cas-remove "$remove_root/value" "$baseline" private "$remove_root/archive" >"$result"; then
+      "$INSTRUMENTED_HELPER" cas-remove "$remove_root/value" "$baseline" private "$remove_root/archive" >"$result"; then
     [[ ! -e $remove_root/value ]] \
       || fail "successful removal sync phase $ordinal retained the destination"
   else
@@ -215,12 +219,12 @@ for operation in cas-write cas-remove; do
       | env OMACHORD_FS_TEST_MATCH="$recovery/value" OMACHORD_FS_TEST_PAUSE=before-exchange \
           OMACHORD_FS_TEST_READY="$ready" \
           OMACHORD_FS_TEST_RELEASE="$release" \
-          "$HELPER" cas-write "$recovery/value" 600 "$baseline" private "$recovery/archive" >"$result" &
+          "$INSTRUMENTED_HELPER" cas-write "$recovery/value" 600 "$baseline" private "$recovery/archive" >"$result" &
   else
     env OMACHORD_FS_TEST_MATCH="$recovery/value" OMACHORD_FS_TEST_PAUSE=before-exchange \
       OMACHORD_FS_TEST_READY="$ready" \
       OMACHORD_FS_TEST_RELEASE="$release" \
-      "$HELPER" cas-remove "$recovery/value" "$baseline" private "$recovery/archive" >"$result" &
+      "$INSTRUMENTED_HELPER" cas-remove "$recovery/value" "$baseline" private "$recovery/archive" >"$result" &
   fi
   pid=$!
   for _ in {1..500}; do
@@ -249,7 +253,7 @@ result="$replacement/result"
 printf '%s' candidate \
   | env OMACHORD_FS_TEST_MATCH="$replacement/value" OMACHORD_FS_TEST_PAUSE=after-exchange \
       OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-      "$HELPER" cas-write "$replacement/value" 600 "$baseline" private "$replacement/archive" >"$result" &
+      "$INSTRUMENTED_HELPER" cas-write "$replacement/value" 600 "$baseline" private "$replacement/archive" >"$result" &
 pid=$!
 for _ in {1..500}; do
   [[ -e $ready ]] && break
@@ -273,7 +277,7 @@ for ordinal in 2 4; do
   if printf '%s' candidate \
       | env OMACHORD_FS_TEST_MATCH="$unstable/value" \
           OMACHORD_FS_TEST_FAIL_FINGERPRINT="$ordinal" \
-          "$HELPER" cas-write "$unstable/value" 600 "$baseline" private "$unstable/archive" >"$result"; then
+          "$INSTRUMENTED_HELPER" cas-write "$unstable/value" 600 "$baseline" private "$unstable/archive" >"$result"; then
     fail "CAS write accepted forced fingerprint failure $ordinal"
   fi
   [[ $(cat "$unstable/value") == baseline ]] \
@@ -291,7 +295,7 @@ release="$modified_placeholder/release"
 result="$modified_placeholder/result"
 env OMACHORD_FS_TEST_MATCH="$modified_placeholder/value" OMACHORD_FS_TEST_PAUSE=after-exchange \
   OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-  "$HELPER" cas-remove "$modified_placeholder/value" "$baseline" private \
+  "$INSTRUMENTED_HELPER" cas-remove "$modified_placeholder/value" "$baseline" private \
     "$modified_placeholder/archive" >"$result" &
 pid=$!
 for _ in {1..500}; do
@@ -321,7 +325,7 @@ printf '%s' candidate \
   | env OMACHORD_FS_TEST_MATCH="$rollback_failure/value" \
       OMACHORD_FS_TEST_PAUSE=after-exchange OMACHORD_FS_TEST_FAIL_FINGERPRINT=4 \
       OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-      "$HELPER" cas-write "$rollback_failure/value" 600 "$baseline" private \
+      "$INSTRUMENTED_HELPER" cas-write "$rollback_failure/value" 600 "$baseline" private \
         "$rollback_failure/archive" >"$result" &
 pid=$!
 for _ in {1..500}; do
@@ -355,7 +359,7 @@ for held in original placeholder both; do
   result="$open_root/result"
   env OMACHORD_FS_TEST_MATCH="$open_root/value" OMACHORD_FS_TEST_PAUSE=after-exchange \
     OMACHORD_FS_TEST_READY="$ready" OMACHORD_FS_TEST_RELEASE="$release" \
-    "$HELPER" cas-remove "$open_root/value" "$baseline" private \
+    "$INSTRUMENTED_HELPER" cas-remove "$open_root/value" "$baseline" private \
       "$open_root/archive" 8>&- 9>&- >"$result" &
   pid=$!
   for _ in {1..500}; do
@@ -447,7 +451,7 @@ for ordinal in 8 10 12 14; do
   chmod 600 "$retirement/value"
   baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
   env OMACHORD_FS_TEST_MATCH="$retirement/value" OMACHORD_FS_TEST_FAIL_FINGERPRINT="$ordinal" \
-    "$HELPER" cas-remove "$retirement/value" "$baseline" private "$retirement/archive" \
+    "$INSTRUMENTED_HELPER" cas-remove "$retirement/value" "$baseline" private "$retirement/archive" \
       >"$retirement/result"
   jq -e '.ok' "$retirement/result" >/dev/null || fail "retirement fingerprint failure changed the result"
   [[ ! -e $retirement/value ]] || fail "retirement fingerprint failure retained the destination"
@@ -497,7 +501,7 @@ printf '%s' baseline >"$uncertain/value"
 chmod 600 "$uncertain/value"
 baseline="file:600:$(printf '%s' baseline | sha256sum | awk '{print $1}')"
 printf '%s' candidate \
-  | OMACHORD_FS_TEST_FAIL_FUSER=1 "$HELPER" cas-write "$uncertain/value" 600 \
+  | OMACHORD_FS_TEST_FAIL_FUSER=1 "$INSTRUMENTED_HELPER" cas-write "$uncertain/value" 600 \
       "$baseline" private "$uncertain/archive" >/dev/null
 find "$uncertain/archive/retired" -type f -exec grep -Flx baseline {} + | grep -q . \
   || fail "an uncertain open-inode check discarded the replaced inode"
@@ -576,7 +580,7 @@ mkdir -m 700 "$unique"
 result="$unique/result"
 if printf '%s' backup \
     | env OMACHORD_FS_TEST_MATCH="$unique" OMACHORD_FS_TEST_FAIL_SYNC=2 \
-        "$HELPER" unique-write "$unique" backup. 600 >"$result"; then
+        "$INSTRUMENTED_HELPER" unique-write "$unique" backup. 600 >"$result"; then
   fail "unique write reported success after its directory sync failed"
 fi
 if find "$unique" -maxdepth 1 -type f -name 'backup.*' -print -quit | grep -q .; then

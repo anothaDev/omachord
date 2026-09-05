@@ -358,7 +358,7 @@ Item {
   }
 
   function addSsid(index, ssid) {
-    var name = String(ssid || "").trim()
+    var name = String(ssid || "")
     if (!draft || !name || index < 0 || index >= draft.conditions.length) return
     var next = Model.clone(draft)
     var names = Array.isArray(next.conditions[index].ssids) ? next.conditions[index].ssids : []
@@ -907,6 +907,9 @@ Item {
                 required property var modelData
                 required property int index
                 readonly property string conditionType: modelData ? String(modelData.type || "") : ""
+                // Repeater modelData converts nested arrays to Qt sequences.
+                readonly property var ssidNames: root.draft && root.draft.conditions[index]
+                  && Array.isArray(root.draft.conditions[index].ssids) ? root.draft.conditions[index].ssids : []
                 readonly property string errorText: root.cardErrors.conditions[index] || ""
                 readonly property var liveDetail: root.serviceState && Array.isArray(root.serviceState.details)
                   && root.serviceState.details[index] ? root.serviceState.details[index] : null
@@ -1065,7 +1068,7 @@ Item {
                       width: parent.width
                       spacing: Style.space(6)
                       Repeater {
-                        model: conditionCard.modelData && Array.isArray(conditionCard.modelData.ssids) ? conditionCard.modelData.ssids : []
+                        model: conditionCard.ssidNames
                         Button {
                           required property var modelData
                           required property int index
@@ -1082,7 +1085,7 @@ Item {
                       }
                       Text {
                         textFormat: Text.PlainText
-                        visible: !conditionCard.modelData || !Array.isArray(conditionCard.modelData.ssids) || conditionCard.modelData.ssids.length === 0
+                        visible: conditionCard.ssidNames.length === 0
                         text: "No networks yet"
                         color: root.subtle
                         font.family: Style.font.family

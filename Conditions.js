@@ -4,6 +4,14 @@
 var WEEKDAY_KEYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"]
 var DAY_MS = 86400000
 
+function mapOwns(map, key) {
+  return !!map && Object.prototype.hasOwnProperty.call(map, String(key))
+}
+
+function mapValue(map, key) {
+  return mapOwns(map, key) ? map[String(key)] : undefined
+}
+
 function parseHHMM(text) {
   var match = /^([01][0-9]|2[0-3]):([0-5][0-9])$/.exec(String(text || ""))
   return match ? Number(match[1]) * 60 + Number(match[2]) : -1
@@ -56,7 +64,7 @@ function powerMatches(condition, onBattery, percent) {
 }
 
 function toggleMatches(condition, toggles) {
-  return !!(toggles && toggles[String(condition.flag || "")] === true)
+  return mapValue(toggles, String(condition.flag || "")) === true
 }
 
 function evaluate(condition, env) {
@@ -137,8 +145,8 @@ function latchHorizonMs(routine, now) {
 // already happened for this true period, must not fire again until its
 // conditions have been false once.
 function seedLatches(routines, logs, now) {
-  var latched = {}
-  var latest = {}
+  var latched = Object.create(null)
+  var latest = Object.create(null)
   for (var i = 0; i < (logs || []).length; i++) {
     var entry = logs[i]
     if (!entry || !entry.routineId || latest[entry.routineId]) continue
@@ -170,6 +178,7 @@ function expiryMs(snapshot) {
 function expiredIds(active, now) {
   var ids = []
   for (var id in active) {
+    if (!mapOwns(active, id)) continue
     var at = expiryMs(active[id])
     if (at !== null && at <= now.getTime()) ids.push(id)
   }
@@ -179,6 +188,7 @@ function expiredIds(active, now) {
 function nextExpiryMs(active, now) {
   var best = null
   for (var id in active) {
+    if (!mapOwns(active, id)) continue
     var at = expiryMs(active[id])
     if (at === null) continue
     var diff = at - now.getTime()
@@ -208,11 +218,11 @@ function desiredTransitions(routines, env, active, latched) {
     var id = String(routine.id)
     var matched = evaluateAll(routine.conditions, env)
     if (matched === null) continue
-    var snapshot = active ? active[id] : null
+    var snapshot = mapValue(active, id)
     if (matched) {
-      if (!snapshot && !(latched && latched[id])) transitions.push({ id: id, op: "activate", reason: "condition" })
+      if (!snapshot && !mapValue(latched, id)) transitions.push({ id: id, op: "activate", reason: "condition" })
     } else {
-      if (latched && latched[id]) release.push(id)
+      if (mapValue(latched, id)) release.push(id)
       if (snapshot && conditionOwned(snapshot)) transitions.push({ id: id, op: "deactivate", reason: "condition" })
     }
   }
@@ -226,7 +236,7 @@ function observedActiveIds(routines, env, active, deactivatingId) {
   var ids = []
   for (var i = 0; i < routines.length; i++) {
     var routine = routines[i]
-    if (!routine || !routine.id || !active || !active[String(routine.id)]) continue
+    if (!routine || !routine.id || !mapValue(active, String(routine.id))) continue
     if (String(routine.id) === String(deactivatingId || "")) continue
     if (evaluateAll(routine.conditions, env) === true) ids.push(String(routine.id))
   }
@@ -237,14 +247,14 @@ function observedActiveIds(routines, env, active, deactivatingId) {
 // event log. Recomputing it drops transitions invalidated while another job ran.
 function reconcileJobs(transitions, currentJob, revision, failures, nowMs, retryMs, maxPending) {
   var order = []
-  var jobs = {}
+  var jobs = Object.create(null)
   for (var i = 0; i < transitions.length; i++) {
     var transition = transitions[i]
     if (!transition || !transition.id || !transition.op) continue
     var id = String(transition.id)
     var op = String(transition.op)
     if (currentJob && String(currentJob.id) === id && String(currentJob.op) === op) continue
-    var failure = failures ? failures[id] : null
+    var failure = mapValue(failures, id)
     if (failure && String(failure.op) === op && String(failure.revision) === String(revision)
         && nowMs - Number(failure.at) < retryMs) continue
     if (!jobs[id]) order.push(id)
@@ -355,7 +365,7 @@ function describeToggle(condition, env) {
   var flag = String(condition.flag || "")
   return {
     summary: "toggle " + flag + " on",
-    state: env && env.toggles && env.toggles[flag] === true ? "on" : "off"
+    state: env && mapValue(env.toggles, flag) === true ? "on" : "off"
   }
 }
 
@@ -389,7 +399,7 @@ function describeFailure(failure, retryMs) {
 
 function routineSummary(routine, env, active, latched, failures, retryMs) {
   var id = String(routine.id)
-  var snapshot = active ? active[id] : null
+  var snapshot = mapValue(active, id)
   var conditions = Array.isArray(routine.conditions) ? routine.conditions : []
   var details = []
   for (var i = 0; i < conditions.length; i++) details.push(describeCondition(conditions[i], env))
@@ -400,9 +410,9 @@ function routineSummary(routine, env, active, latched, failures, retryMs) {
     active: !!snapshot,
     trigger: snapshot ? snapshot.trigger : null,
     expiresAt: snapshot ? snapshot.expiresAt : null,
-    latched: !!(latched && latched[id]),
+    latched: !!mapValue(latched, id),
     details: details,
-    failure: describeFailure(failures ? failures[id] : null, retryMs)
+    failure: describeFailure(mapValue(failures, id), retryMs)
   }
 }
 

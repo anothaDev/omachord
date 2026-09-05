@@ -63,6 +63,98 @@ ShellRoot {
     return String(callsView.text() || "")
   }
 
+  function checkReviewBinding() {
+    var original = { id: "reviewed", name: "Reviewed", enabled: false,
+      triggers: [], actions: [{ type: "exec", argv: ["/usr/bin/true"] }] }
+    var edits = [
+      { actions: [{ type: "shell", command: "changed" }] },
+      { actions: [{ type: "exec", argv: ["/usr/bin/true", "changed"] }] },
+      { conditions: [{ type: "power", source: "battery" }] },
+      { triggers: [{ type: "hook", event: "battery-low" }] },
+      { onEnd: { mode: "actions", actions: [{ type: "delay", milliseconds: 1 }] } },
+      { keepUntil: { minutes: 5 } },
+      { name: "Recreated under the same ID" },
+      { actions: [{ type: "exec", argv: ["/usr/bin/true"], cwd: "/elsewhere" }] },
+      { actions: [{ type: "exec", argv: ["/usr/bin/true"], env: { FLAG: "changed" } }] }
+    ]
+    for (var i = 0; i < edits.length; i++) {
+      panel.config = { version: 1, routines: [JSON.parse(JSON.stringify(original)),
+        { id: "independent", name: "Independent", enabled: true, triggers: [], actions: [] }] }
+      panel.configLoaded = true
+      panel.setRoutineEnabled("reviewed", true)
+      panel.setRoutineEnabled("independent", false)
+      var changed = Object.assign({}, original, edits[i])
+      panel.revisionRefreshPending = true
+      panel.revisionRefreshPurpose = "enable"
+      panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
+        revision: "sha256:changed-" + i,
+        config: { version: 1, routines: [changed, panel.config.routines[1]] } }), "", 0)
+      if (routineEnabled("reviewed") !== false || panel.routineEnablePending("reviewed")
+          || !panel.routineEnablePending("independent")) {
+        fail("changed reviewed definition inherited approval for edit " + i)
+        return false
+      }
+      panel.failEnableBatch("fixture reset")
+    }
+    // Losing an ID cancels its decision permanently, even if a later refresh
+    // recreates the exact original while another row is still pending.
+    panel.config = { version: 1, routines: [original,
+      { id: "independent", name: "Independent", enabled: true, triggers: [], actions: [] }] }
+    panel.setRoutineEnabled("reviewed", true)
+    panel.setRoutineEnabled("independent", false)
+    for (var pass = 0; pass < 2; pass++) {
+      panel.revisionRefreshPending = true
+      panel.revisionRefreshPurpose = "enable"
+      panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
+        revision: "sha256:recreated-" + pass, config: { version: 1,
+          routines: pass === 0 ? [panel.config.routines[1]] : [original, panel.config.routines[0]] } }), "", 0)
+      if (panel.routineEnablePending("reviewed")) {
+        fail("deleted or recreated routine inherited approval")
+        return false
+      }
+    }
+    panel.failEnableBatch("fixture reset")
+    // Reordered object keys and an enabled-only external edit are the same
+    // executable definition; a later material edit on a second retry is not.
+    panel.config = { version: 1, routines: [original] }
+    panel.setRoutineEnabled("reviewed", true)
+    var reordered = { actions: [{ argv: ["/usr/bin/true"], type: "exec" }],
+      triggers: [], enabled: true, name: "Reviewed", id: "reviewed" }
+    panel.revisionRefreshPending = true
+    panel.revisionRefreshPurpose = "enable"
+    panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
+      revision: "sha256:reordered", config: { version: 1, routines: [reordered] } }), "", 0)
+    if (!panel.routineEnablePending("reviewed")) {
+      fail("unchanged definition lost its legitimate retry")
+      return false
+    }
+    reordered.enabled = false
+    reordered.actions[0].argv.push("changed-later")
+    panel.revisionRefreshPending = true
+    panel.revisionRefreshPurpose = "enable"
+    panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
+      revision: "sha256:changed-later", config: { version: 1, routines: [reordered] } }), "", 0)
+    if (panel.routineEnablePending("reviewed") || routineEnabled("reviewed") !== false) {
+      fail("successive retry transferred an earlier approval")
+      return false
+    }
+    panel.performUiAction("enabled", { id: "reviewed", enabled: true,
+      definition: panel.routineDefinitionKey(original) })
+    if (panel.mutating || routineEnabled("reviewed") !== false) {
+      fail("queued confirmation transferred an earlier approval")
+      return false
+    }
+    panel.configHandled = false
+    panel.handleConfigResult(JSON.stringify({ ok: true, committed: false,
+      revision: "sha256:unreviewed", config: { version: 1, routines: [original] } }), "", 0)
+    panel.mutateConnection("connect")
+    if (panel.mutating || panel.configLoaded || panel.noticeText.indexOf("config snapshot") === -1) {
+      fail("uncommitted unseen config could be blindly approved by Repair")
+      return false
+    }
+    return true
+  }
+
   FileView {
     id: callsView
     path: root.callsPath
@@ -161,6 +253,46 @@ ShellRoot {
           root.fail("hard apply failure did not roll back to the last committed base")
           return
         }
+        root.panel.setRoutineEnabled("alpha", true)
+        root.panel.setRoutineEnabled("beta", false)
+        root.phase = 6
+        return
+      }
+
+      if (root.phase === 6 && calls.indexOf("START 7 ") !== -1) {
+        var seventh = root.payloadFor(calls, 7)
+        if (root.payloadEnabled(seventh, "alpha") !== false
+            || root.payloadEnabled(seventh, "beta") !== false) {
+          root.fail("native stale retry enabled the changed same-ID definition")
+          return
+        }
+        root.phase = 7
+        return
+      }
+
+      if (root.phase === 7 && !root.panel.mutating) {
+        if (!root.panel.noticeError || root.panel.noticeText.indexOf("review") === -1) {
+          root.fail("changed-definition conflict did not ask for fresh review")
+          return
+        }
+        // An explicit new decision and object-key-shaped IDs remain usable.
+        root.panel.setRoutineEnabled("alpha", true)
+        root.panel.setRoutineEnabled("__proto__", true)
+        root.panel.setRoutineEnabled("constructor", true)
+        root.panel.setRoutineEnabled("prototype", true)
+        root.phase = 8
+        return
+      }
+
+      if (root.phase === 8 && calls.indexOf("START 8 ") !== -1 && !root.panel.mutating) {
+        var eighth = root.payloadFor(calls, 8)
+        var ids = ["alpha", "__proto__", "constructor", "prototype"]
+        for (var i = 0; i < ids.length; i++) {
+          if (root.payloadEnabled(eighth, ids[i]) !== true || root.panel.routineEnablePending(ids[i])) {
+            root.fail("fresh decision or literal ID was lost: " + ids[i])
+            return
+          }
+        }
         root.pass()
       }
     }
@@ -184,6 +316,8 @@ ShellRoot {
       fail("Panel.qml createObject returned null")
       return
     }
+    if (!checkReviewBinding()) return
+    panel.configUncommitted = false
     panel.config = {
       version: 1,
       routines: [

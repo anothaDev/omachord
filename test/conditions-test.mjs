@@ -14,6 +14,32 @@ const env = (overrides) => Object.assign({
   now: at(31, 12, 0), ssid: null, wifiAvailable: true, onBattery: false, batteryPercent: -1, toggles: {}
 }, overrides || {})
 
+// constructor is a valid routine ID. Empty dictionaries cannot make it
+// active, latched, failed, or already queued. Exercise other prototype keys
+// at the map boundary too, without changing the runner's lowercase ID schema.
+for (const id of ["constructor", "toString", "valueOf", "hasOwnProperty", "toLocaleString", "__proto__"]) {
+  const routine = { id, enabled: true, conditions: [{ type: "power", source: "ac" }] }
+  const desired = conditions.desiredTransitions([routine], env(), {}, {})
+  assert.deepEqual(plain(desired.transitions), [{ id, op: "activate", reason: "condition" }], id)
+  assert.deepEqual(plain(conditions.observedActiveIds([routine], env(), {})), [], id)
+  const summary = conditions.routineSummary(routine, env(), {}, {}, {}, 300000)
+  assert.equal(summary.active, false, id)
+  assert.equal(summary.latched, false, id)
+  assert.equal(summary.failure, null, id)
+  assert.equal(conditions.reconcileJobs(desired.transitions, null, "revision", {}, 1000, 300000, 256).length, 1, id)
+  const failed = JSON.parse(JSON.stringify({ [id]: { at: 900, op: "activate", revision: "revision" } }))
+  assert.equal(conditions.reconcileJobs(desired.transitions, null, "revision", failed, 1000, 300000, 256).length, 0, id)
+  const seeded = conditions.seedLatches([routine], [{ routineId: id, timestamp: at(31, 11, 59).toISOString(),
+    status: "deactivated", trigger: "manual" }], at(31, 12, 0))
+  assert.equal(seeded[id], true, id)
+  const active = JSON.parse(JSON.stringify({ [id]: { trigger: "condition", keepUntil: "conditions",
+    expiresAt: at(31, 11, 59).toISOString() } }))
+  assert.deepEqual(plain(conditions.expiredIds(active, at(31, 12, 0))), [id], id)
+}
+const inheritedActive = Object.create({ ignored: { expiresAt: at(31, 11, 59).toISOString() } })
+assert.deepEqual(plain(conditions.expiredIds(inheritedActive, at(31, 12, 0))), [])
+assert.equal(conditions.nextExpiryMs(inheritedActive, at(31, 12, 0)), null)
+
 assert.equal(conditions.parseHHMM("18:30"), 18 * 60 + 30)
 assert.equal(conditions.parseHHMM("24:00"), -1)
 assert.equal(conditions.parseHHMM("9:00"), -1)

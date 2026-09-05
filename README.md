@@ -237,16 +237,21 @@ The status names every active routine and, for each condition routine, one `deta
 | Command | Purpose |
 | --- | --- |
 | `omachord status` | Inspect configuration and integration health |
-| `omachord connect [revision]` | Connect or repair owned integration |
+| `omachord connect [revision]` | Reuse committed configuration; supply the inspected revision to approve changed configuration |
 | `omachord disconnect` | End active routines and remove owned integration, keeping configuration and history |
 | `omachord config snapshot` | Read configuration with its compare-and-swap revision |
 | `omachord config validate` | Validate candidate JSON from stdin without saving |
 | `omachord config apply <revision>` | Apply candidate JSON from stdin only if the loaded revision still matches |
-| `omachord run <id> [manual\|shortcut\|test]` | Run a routine; toggles a stateful routine |
-| `omachord activate <id> [manual\|shortcut\|test]` | Activate without toggling; already-active routines report `alreadyActive` |
+| `omachord run <id> [source [revision]]` | Run a routine; toggles a stateful routine; an optional reviewed revision must still match |
+| `omachord activate <id> [source [revision]]` | Activate without toggling; manual/test callers may bind a reviewed revision |
 | `omachord deactivate <id> [manual\|shortcut\|test]` | End a routine from its activation record |
 | `omachord active` | List activation records |
+| `omachord recovery inspect <id>` | Inspect an activation record and its recovery revision |
+| `omachord recovery restore <id> <revision> --skip-end-actions` | Restore recorded setter values without executing remaining end actions, only for the inspected record |
 | `omachord toggles` | List valid top-level Omarchy toggle flags as bounded JSON |
+| `omachord themes` | List installed themes through a bounded control probe |
+| `omachord service-status` | Read one validated condition-service status object through a bounded probe |
+| `omachord theme-palette` | Read the current theme name and green within fixed file-size limits |
 | `omachord logs [limit]` | Run history; stateful routines log `activated` and `deactivated` entries |
 | `omachord widget ensure\|status\|forget` | Place the bar widget once through the Omarchy shell, inspect or clear that record |
 
@@ -276,17 +281,24 @@ Routines are trusted local configuration and are not sandboxed.
 - `shell` intentionally runs `bash -lc` and can execute arbitrary commands as your user.
 - `exec` and `shell` can invoke `sudo`; cached credentials may allow a routine to elevate without another password prompt.
 - Omarchy command choices exclude commands marked hidden or `requires_sudo`, but command metadata is not a security boundary; a selected command can still open a privilege prompt internally.
-- Child output is bounded, and foreground program-execution stages have a 30-second default timeout. A detached supervisor keeps the action process-group identity pinned through final descendant cleanup. Explicit delays are capped at five minutes.
+- Ordinary action capture retains a 4 KiB combined stdout/stderr tail, and foreground program-execution stages have a 30-second default timeout. Built-in control capture rejects output above 1 MiB and defaults to five seconds. One native supervisor owns capture, cancellation, and the unreaped timeout-group leader through its final signal. These are per-stage limits, not a sandbox or a total CPU/output quota for user-authored code. Explicit delays are capped at five minutes.
 - Integration manages the files listed below, including hook dispatchers, the desktop entry, and the launcher icon. It also edits `~/.config/omarchy/shell.json` once when moving this plugin's entry onto the bar on an install upgraded from 0.2.0; the previous file is kept under `~/.local/state/omarchy/omachord/backups/`.
 - Setter writes are argv-literal calls to Omarchy tools. Activation records are validated before use; a record that fails validation stops `run`, `activate`, `deactivate`, and `active` with `unsafe-state` instead of being treated as inactive.
 - A theme setter makes Omarchy fire its `theme-set` hook, which re-enters the runner. The per-routine lock reports the originating routine as busy, so a routine cannot recurse into itself.
 - Saves use revision-based compare-and-swap, so a stale panel cannot overwrite a newer configuration.
+- A queued routine switch is bound to the complete definition reviewed when it was requested. A retry cancels that switch if the definition changed or disappeared; independent switches remain available.
+- Run now, Save & Run, and service-backed live starts retain the configuration revision reviewed when queued. If any save overtakes the request, including a save to another routine, the start reports that the configuration changed and requires a fresh retry. The runner checks and executes the same captured snapshot. Explicit runner CLI calls without a revision keep selecting the latest committed configuration.
 - Condition-service jobs carry the revision they evaluated; the runner rejects stale jobs and post-Disconnect activations before any routine action runs.
+- Events and shortcuts already waiting for the configuration lock are also rejected after a completed Disconnect; removing their on-disk dispatchers is not the only revocation check.
 - Readers require the canonical configuration to match a post-reload commit record. A candidate cannot execute before its integration transaction commits, and an interrupted candidate fails closed.
-- Managed writes and removals pin verified parent-directory descriptors, use descriptor-relative atomic compare-and-swap operations, and sync both the file and containing directory before reporting success. Concurrent versions and verified inodes still held open by another process are preserved under the private state directory instead of being overwritten.
+- Configuration is exactly one JSON document. Automatic startup checks persistent Off while holding the mutation lock and cannot approve a changed or unmarked configuration. Bare Connect reuses committed content; initially absent configuration and commit records may bootstrap an empty setup.
+- Active routines bind their ending mode and end-action list to an immutable digest. Saves reject changes to a retained active routine's end plan. End the routine before editing that plan; disabling or removing a routine still performs the existing cleanup first.
+- Managed writes and removals pin verified parent-directory descriptors, use descriptor-relative atomic compare-and-swap operations, and check staged producer failures before publication. Successful publication syncs both the file and containing directory. Concurrent versions and open or uncertain inodes are preserved, using private state archives where possible and adjacent private archives when inode identity requires it.
 
 Review routine JSON added outside the panel before running it, especially `exec` and `shell` actions.
-If an interrupted transaction leaves an uncommitted configuration, the panel refuses to load or run it. Inspect the canonical JSON before explicitly repairing or replacing it.
+If an interrupted transaction leaves an uncommitted configuration, the panel refuses to load or run it. Inspect `omachord config snapshot`, review all routines in that snapshot, then use `omachord connect <inspected-revision>` or replace the configuration through revision-bound `config apply`. A revision identifies bytes; it does not replace reviewing them.
+
+Activation records from this version use schema version 2. Older runners intentionally reject them, so finish restoring active routines before downgrading. Legacy records with end actions cannot prove which action list their saved progress referred to and require explicit recovery. Run `omachord recovery inspect <id>`, review the snapshot and recorded setter values, then use `omachord recovery restore <id> <revision> --skip-end-actions` if restoring those values and skipping remaining executable end effects is the intended outcome. The runner records that choice durably before restoring setters. If restoration fails, it keeps the record so recovery can be retried.
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
@@ -309,6 +321,9 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 | `~/.local/state/omarchy/omachord/config.commit.json` | Last committed configuration revision |
 | `~/.local/state/omarchy/omachord/conflicts/` | Concurrent file versions preserved during a rare transaction conflict |
 | `~/.local/state/omarchy/omachord/retired/` | Replaced inodes retained only when changed after verification or still open elsewhere |
+| `<managed-parent>/.omachord-conflicts/` and `.omachord-retired/` | Private adjacent archives when state-directory storage cannot retain the original inode |
+
+Recovery archives may contain unique later writes made through an already-open file descriptor. They have no automatic age-based deletion or total storage quota; closing a file or waiting does not prove it is safe to delete. Preserve the reported recovery locations, inspect their contents, and decide which versions to keep before manual cleanup. An interrupted cleanup may also leave a private transaction file beside a managed destination. See [SECURITY.md](SECURITY.md) for the durability and recovery boundaries.
 
 ## Remove
 
@@ -339,7 +354,9 @@ The test suite uses temporary HOME and XDG directories and does not touch the li
 test/run.sh
 ```
 
-Tests additionally require Node.js, `luac`, `qmllint`, `qmltestrunner`, `desktop-file-validate`, and the Omarchy plugin validator. The local gate verifies the exact Omarchy, Hyprland, and Quickshell release targets above.
+Tests additionally require Python 3 (standard library only), Node.js, `strace`, `luac`, `qmllint`, `qmltestrunner`, `desktop-file-validate`, and the Omarchy plugin validator. `strace` verifies that notification-only service watchers do not read file bodies and enables the real write-error injection checks. Skipped injections in environments without it must be reported and do not count as local release evidence. The local gate verifies the exact Omarchy, Hyprland, and Quickshell release targets above.
+
+Deterministic filesystem race and failure calls explicitly select disposable instrumented helper copies. Ordinary calls still test the shipped files. Production helpers ignore the former filesystem test variables and reload-bypass flag; the production-boundary suite verifies this separately. Fixture insertion points are checked so source changes cannot silently disable fault coverage.
 
 It exercises strict and byte-bounded schema validation, bounded toggle discovery, literal argv handling, isolated hooks, microphone sounds, setter activation and restore, compare-before-restore, orphan deactivation, revision conflicts, descriptor-pinned transaction races and durability failures, non-executable uncommitted state, private state paths, signal-safe action ownership, reload rollback, bar-widget placement and the `plugins[]` migration, launcher ownership upgrades, reload-free saves and their repair fallbacks, and detached audio lock release. Desktop checks cover model and condition logic, runtime QML interaction, service concurrency and panel enable batching against fake runners, transparent bar artwork and theme switching at 1×/2× scaling, plugin validation, and QML linting.
 

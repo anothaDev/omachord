@@ -39,11 +39,11 @@ apply_config() {
       jq -cn --arg revision "$revision" --argjson config "$payload" \
         '{ok:true,revision:$revision,config:$config,warnings:[],deactivated:[]}'
       ;;
-    3)
+    3|6)
       printf '%s\n' '{"ok":false,"code":"stale-config","error":"fixture stale revision"}'
       exit 1
       ;;
-    4)
+    4|7|8)
       sleep 0.2
       jq -cn --argjson config "$payload" \
         '{ok:true,revision:"sha256:rebased",config:$config,warnings:[],deactivated:[]}'
@@ -66,6 +66,10 @@ case "${1:-} ${2:-}" in
     ;;
   "config snapshot")
     record "SNAPSHOT"
+    if [[ $(cat "$counter_file") -ge 6 ]]; then
+      printf '%s\n' '{"ok":true,"revision":"sha256:changed","committed":true,"config":{"version":1,"routines":[{"id":"alpha","name":"Alpha","enabled":false,"triggers":[],"actions":[{"type":"shell","command":"changed"}]},{"id":"beta","name":"Beta","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]},{"id":"gamma","name":"Gamma from elsewhere","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]},{"id":"__proto__","name":"Proto","enabled":false,"triggers":[],"actions":[]},{"id":"constructor","name":"Constructor","enabled":false,"triggers":[],"actions":[]},{"id":"prototype","name":"Prototype","enabled":false,"triggers":[],"actions":[]}]}}'
+      exit 0
+    fi
     printf '%s\n' '{"ok":true,"revision":"sha256:external","committed":true,"config":{"version":1,"routines":[{"id":"alpha","name":"Alpha","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]},{"id":"beta","name":"Beta","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]},{"id":"gamma","name":"Gamma from elsewhere","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]}]}}'
     ;;
   "status ")

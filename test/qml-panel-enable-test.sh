@@ -27,15 +27,23 @@ done
 cp -- "$ROOT/test/qml-runtime/panel-enable-batching.qml" "$TEST_DIR/shell.qml"
 : >"$TEST_DIR/panel-calls.log"
 : >"$TEST_DIR/apply-count"
-mkdir -p "$TEST_DIR/theme"
+mkdir -p "$TEST_DIR/theme" "$TEST_DIR/home" "$TEST_DIR/config" "$TEST_DIR/state" \
+  "$TEST_DIR/data" "$TEST_DIR/cache" "$TEST_DIR/runtime" "$TEST_DIR/tmp"
+chmod 700 "$TEST_DIR/runtime"
 
 export OMACHORD_QML_TEST_DIR="$TEST_DIR"
 export OMACHORD_RUNNER_PATH="$ROOT/test/qml-runtime/fake-panel-runner"
 export OMACHORD_THEME_DIR="$TEST_DIR/theme"
 export OMACHORD_THEME_NAME_FILE="$TEST_DIR/theme.name"
 
-QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
-  quickshell --no-duplicate --path "$TEST_DIR/shell.qml" --no-color \
+env -i PATH=/usr/bin:/bin LANG=C HOME="$TEST_DIR/home" \
+  XDG_CONFIG_HOME="$TEST_DIR/config" XDG_STATE_HOME="$TEST_DIR/state" \
+  XDG_DATA_HOME="$TEST_DIR/data" XDG_CACHE_HOME="$TEST_DIR/cache" \
+  XDG_RUNTIME_DIR="$TEST_DIR/runtime" TMPDIR="$TEST_DIR/tmp" \
+  OMACHORD_QML_TEST_DIR="$OMACHORD_QML_TEST_DIR" OMACHORD_RUNNER_PATH="$OMACHORD_RUNNER_PATH" \
+  OMACHORD_THEME_DIR="$OMACHORD_THEME_DIR" OMACHORD_THEME_NAME_FILE="$OMACHORD_THEME_NAME_FILE" \
+  QT_QPA_PLATFORM=offscreen QT_QUICK_BACKEND=software \
+  /usr/bin/quickshell --no-duplicate --path "$TEST_DIR/shell.qml" --no-color \
   >"$LOG_FILE" 2>&1 &
 runtime_pid=$!
 
@@ -50,7 +58,7 @@ wait "$runtime_pid" 2>/dev/null || true
 runtime_pid=""
 
 if ! grep -q 'OMACHORD_QML_TEST_PASS' "$LOG_FILE" \
-  || grep -q 'OMACHORD_QML_TEST_FAIL' "$LOG_FILE"; then
+  || grep -q 'OMACHORD_QML_TEST_FAIL\|TypeError\|ReferenceError\|Binding loop detected\|Unable to assign' "$LOG_FILE"; then
   cat "$LOG_FILE" >&2
   printf 'FAIL: panel enable batching runtime regression\n' >&2
   exit 1

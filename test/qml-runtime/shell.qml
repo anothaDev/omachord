@@ -1,12 +1,126 @@
 import Quickshell
 import Quickshell.Io
 import QtQuick
+import "Conditions.js" as Conditions
 
 ShellRoot {
   id: root
 
   property bool editorPassed: false
   property int applyRuns: 0
+
+  FloatingWindow {
+    id: window
+    visible: true
+    implicitWidth: 800
+    implicitHeight: 700
+  }
+
+  function find(item, predicate) {
+    if (predicate(item)) return item
+    var children = item.children || []
+    for (var i = 0; i < children.length; i++) {
+      var found = find(children[i], predicate)
+      if (found) return found
+    }
+    return null
+  }
+
+  function check(condition, message) {
+    if (!condition) throw new Error(message)
+  }
+
+  function selectSsid(editor, name) {
+    var picker = find(editor, function(item) { return item.label === "Add a known or visible network" })
+    check(!!picker, "Wi-Fi picker is missing")
+    var option = { value: name, label: name }
+    editor.wifiOptions = [option]
+    picker.changed(picker.optionValue(option))
+    check(picker.value === "", "Wi-Fi picker did not reset after selection")
+  }
+
+  function typeSsid(editor, name) {
+    var field = find(editor, function(item) { return item.placeholderText === "Or type a network name" })
+    var button = find(editor, function(item) { return item.text === "Add" })
+    check(!!field && !!button, "Manual Wi-Fi controls are missing")
+    field.text = name
+    button.clicked()
+    check(field.text === "", "Manual Wi-Fi field did not reset after adding")
+  }
+
+  function ssidRoundTrips(editor) {
+    try {
+      editor.routine = {
+        id: "ssid-round-trip", name: "Exact SSIDs", enabled: true,
+        triggers: [], conditions: [{ type: "wifi", ssids: [] }],
+        actions: [{ type: "delay", milliseconds: 0 }]
+      }
+      selectSsid(editor, " Studio ")
+      typeSsid(editor, "Studio")
+      selectSsid(editor, " leading")
+      typeSsid(editor, "trailing ")
+      selectSsid(editor, " ")
+      typeSsid(editor, "   ")
+      var expected = [" Studio ", "Studio", " leading", "trailing ", " ", "   "]
+      check(JSON.stringify(editor.draft.conditions[0].ssids) === JSON.stringify(expected),
+        "Picker and manual entry must preserve exact SSIDs, including whitespace")
+      for (var name of expected)
+        check(Conditions.wifiMatches(editor.draft.conditions[0], name), "Selected SSID no longer matches: " + JSON.stringify(name))
+      check(!Conditions.wifiMatches(editor.draft.conditions[0], "leading"), "SSID matching must remain exact")
+
+      editor.dirty = false
+      selectSsid(editor, " Studio ")
+      typeSsid(editor, "   ")
+      typeSsid(editor, "")
+      selectSsid(editor, "")
+      check(!editor.dirty && JSON.stringify(editor.draft.conditions[0].ssids) === JSON.stringify(expected),
+        "Exact duplicates and empty input must leave the draft unchanged")
+
+      Qt.callLater(function() { finishSsidRoundTrip(editor, expected) })
+    } catch (error) {
+      console.error("OMACHORD_QML_TEST_FAIL", error.message)
+    }
+  }
+
+  function finishSsidRoundTrip(editor, expected) {
+    try {
+      var remove = find(editor, function(item) { return item.iconText === "󰅖" && item.text === " Studio " })
+      check(!!remove, "Exact SSID removal control is missing")
+      remove.clicked()
+      expected.shift()
+      check(JSON.stringify(editor.draft.conditions[0].ssids) === JSON.stringify(expected),
+        "Removing a spaced SSID must retain its distinct unspaced sibling")
+      selectSsid(editor, " Studio ")
+      expected.push(" Studio ")
+      var saved = null
+      editor.saveRequested.connect(function(routine) { saved = routine })
+      editor.save()
+      check(!!saved && JSON.stringify(saved.conditions[0].ssids) === JSON.stringify(expected),
+        "Saving must preserve exact SSIDs")
+      editor.routine = saved
+      check(JSON.stringify(editor.draft.conditions[0].ssids) === JSON.stringify(expected),
+        "Reopening a saved routine must preserve exact SSIDs")
+
+      editor.updateCondition(0, "ssids", [])
+      typeSsid(editor, "😀".repeat(8) + "x")
+      saved = null
+      editor.save()
+      check(saved === null && editor.localError.indexOf("UTF-8 bytes") !== -1,
+        "Saving a Unicode SSID over 32 UTF-8 bytes must be blocked")
+      check(editor.draft.conditions[0].ssids[0] === "😀".repeat(8) + "x",
+        "Byte-limit validation must preserve the invalid input for correction")
+      editor.removeSsid(0, 0)
+      typeSsid(editor, "😀".repeat(8))
+      selectSsid(editor, "é".repeat(16))
+      editor.save()
+      check(!!saved && JSON.stringify(saved.conditions[0].ssids) === JSON.stringify(["😀".repeat(8), "é".repeat(16)]),
+        "Manual and picker Unicode names at exactly 32 UTF-8 bytes must save unchanged")
+      root.editorPassed = true
+      eofProc.running = true
+    } catch (error) {
+      console.error("OMACHORD_QML_TEST_FAIL", error.message)
+    }
+  }
 
   function finishProcessTest(passed, detail) {
     if (editorPassed && passed && applyRuns === 2)
@@ -40,7 +154,7 @@ ShellRoot {
       console.error("OMACHORD_QML_TEST_FAIL", component.errorString())
       return
     }
-    var editor = component.createObject(this, {
+    var editor = component.createObject(window.contentItem, {
       width: 800,
       height: 700,
       routine: {
@@ -146,7 +260,6 @@ ShellRoot {
 
     editor.addConditionType = "wifi"
     editor.addCondition()
-    editor.addSsid(0, " Office ")
     editor.addSsid(0, "Office")
     editor.addSsid(0, "")
     editor.replaceCondition(0, "wifi")
@@ -175,8 +288,9 @@ ShellRoot {
         && mainErrorSurvivedEndRemoval && endSetterCannotRestore
         && endReplacementCannotRestore && keepUntilStaged && conditionPreserved
         && timeStaged && powerReset && conditionRemoved) {
-      root.editorPassed = true
-      eofProc.running = true
+      Qt.callLater(function() {
+        ssidRoundTrips(editor)
+      })
     } else {
       console.error("OMACHORD_QML_TEST_FAIL", JSON.stringify(editor.draft))
     }

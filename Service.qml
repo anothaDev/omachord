@@ -43,21 +43,22 @@ Item {
   property string disabledReason: "starting"
   property bool configLoaded: false
   property string configRevision: ""
+  readonly property bool manualRevisionBinding: true
   property var routines: []
   // Every routine in the committed configuration, keyed by id, so the bar
   // widget can name an activation record without reading the config itself.
-  property var routineMeta: ({})
+  property var routineMeta: Object.create(null)
   property bool activeLoaded: false
-  property var active: ({})
-  property var latched: ({})
-  property var failures: ({})
+  property var active: Object.create(null)
+  property var latched: Object.create(null)
+  property var failures: Object.create(null)
   property bool latchesSeeded: false
   property var pendingLogs: null
-  property var seenLogs: ({})
+  property var seenLogs: Object.create(null)
   property var toggles: Object.create(null)
   property var pending: []
   property var currentJob: null
-  property var awaitingDeactivation: ({})
+  property var awaitingDeactivation: Object.create(null)
   property string lastEvent: "starting"
   property string lastEventAt: ""
   property var lastResult: null
@@ -67,11 +68,11 @@ Item {
   // worker pool. Different routines can overlap, while requests for the same
   // routine remain ordered and connection changes form a global barrier.
   property var manualQueue: []
-  property var manualInFlight: ({})
+  property var manualInFlight: Object.create(null)
   // A completed routine stays keyed until an authoritative active-state probe
   // has observed it. This prevents a queued toggle or condition transition
   // from making a decision against the pre-action snapshot.
-  property var manualSettling: ({})
+  property var manualSettling: Object.create(null)
   property var manualJob: null
   // A failed connection retains the global barrier until a post-transaction
   // status attempt finishes (including a failed probe or FailedToStart).
@@ -285,7 +286,7 @@ Item {
       return
     }
     var rows = []
-    var meta = ({})
+    var meta = Object.create(null)
     for (var i = 0; i < parsed.config.routines.length; i++) {
       var routine = parsed.config.routines[i]
       if (!routine || !routine.id) continue
@@ -303,8 +304,8 @@ Item {
     routineMeta = meta
     configRevision = String(parsed.revision || "")
     configLoaded = true
-    var revisionLatches = Object.assign({}, latched)
-    var revisionFailures = Object.assign({}, failures)
+    var revisionLatches = Object.assign(Object.create(null), latched)
+    var revisionFailures = Object.assign(Object.create(null), failures)
     for (var failed in revisionFailures) {
       if (String(revisionFailures[failed].revision || "") === configRevision) continue
       if (revisionFailures[failed].op === "activate") delete revisionLatches[failed]
@@ -322,12 +323,12 @@ Item {
 
   // Latches only make sense for routines that still have conditions.
   function pruneLatches() {
-    var keep = ({})
+    var keep = Object.create(null)
     for (var i = 0; i < routines.length; i++) keep[String(routines[i].id)] = true
-    var nextLatched = ({})
-    var nextFailures = ({})
-    for (var id in latched) if (keep[id]) nextLatched[id] = latched[id]
-    for (var failed in failures) if (keep[failed]) nextFailures[failed] = failures[failed]
+    var nextLatched = Object.create(null)
+    var nextFailures = Object.create(null)
+    for (var id in latched) if (Conditions.mapOwns(latched, id) && keep[id]) nextLatched[id] = latched[id]
+    for (var failed in failures) if (Conditions.mapOwns(failures, failed) && keep[failed]) nextFailures[failed] = failures[failed]
     latched = nextLatched
     failures = nextFailures
   }
@@ -338,11 +339,11 @@ Item {
     if (!configLoaded) return
     if (!latchesSeeded) {
       var seeded = Conditions.seedLatches(routines, rows, new Date())
-      var initial = Object.assign({}, latched)
+      var initial = Object.assign(Object.create(null), latched)
       for (var id in seeded) initial[id] = true
       latched = initial
       latchesSeeded = true
-      var initialSeen = ({})
+      var initialSeen = Object.create(null)
       for (var s = 0; s < rows.length; s++) initialSeen[JSON.stringify(rows[s])] = true
       seenLogs = initialSeen
       logEvent("latches-seeded", Object.keys(seeded).join(" ") || "none")
@@ -354,7 +355,7 @@ Item {
       var signature = JSON.stringify(rows[entry])
       if (!known[signature]) applyLiveLog(rows[entry])
     }
-    var current = ({})
+    var current = Object.create(null)
     for (var seen = 0; seen < rows.length; seen++) current[JSON.stringify(rows[seen])] = true
     seenLogs = current
   }
@@ -377,10 +378,10 @@ Item {
   }
 
   function applyActive(rows, generation) {
-    var next = ({})
+    var next = Object.create(null)
     for (var i = 0; i < rows.length; i++)
       if (rows[i] && rows[i].routineId) next[String(rows[i].routineId)] = rows[i]
-    var waiting = Object.assign({}, awaitingDeactivation)
+    var waiting = Object.assign(Object.create(null), awaitingDeactivation)
     for (var id in waiting) {
       if (generation < waiting[id]) delete next[id]
       else delete waiting[id]
@@ -414,14 +415,14 @@ Item {
     var deactivatingId = currentJob && currentJob.op === "deactivate" ? currentJob.id : ""
     var observed = Conditions.observedActiveIds(routines, env, active, deactivatingId)
     if (observed.length) {
-      var observedLatches = Object.assign({}, latched)
+      var observedLatches = Object.assign(Object.create(null), latched)
       for (var a = 0; a < observed.length; a++) observedLatches[observed[a]] = true
       latched = observedLatches
     }
     var plan = Conditions.desiredTransitions(routines, env, active, latched)
     if (plan.release.length) {
-      var released = Object.assign({}, latched)
-      var retry = Object.assign({}, failures)
+      var released = Object.assign(Object.create(null), latched)
+      var retry = Object.assign(Object.create(null), failures)
       for (var r = 0; r < plan.release.length; r++) {
         delete released[plan.release[r]]
         if (retry[plan.release[r]] && retry[plan.release[r]].op === "activate")
@@ -436,7 +437,7 @@ Item {
       latch(expired[e])
       desired.push({ id: expired[e], op: "deactivate", reason: "timer" })
     }
-    var retainedFailures = Object.assign({}, failures)
+    var retainedFailures = Object.assign(Object.create(null), failures)
     for (var failed in retainedFailures) {
       if (retainedFailures[failed].op !== "deactivate") continue
       var stillDesired = false
@@ -469,7 +470,7 @@ Item {
     if (next !== 0) return next
     var expired = Conditions.expiredIds(active, now)
     for (var i = 0; i < expired.length; i++) {
-      var failure = failures[expired[i]]
+      var failure = Conditions.mapValue(failures, expired[i])
       if (!failure || failure.op !== "deactivate" || failure.revision !== configRevision
           || now.getTime() - Number(failure.at) >= failureRetryMs) return 0
     }
@@ -480,7 +481,7 @@ Item {
     var now = Date.now()
     var gap = now - lastTick
     lastTick = now
-    var expiredFailures = Object.assign({}, failures)
+    var expiredFailures = Object.assign(Object.create(null), failures)
     var changed = false
     for (var id in expiredFailures) {
       if (now - Number(expiredFailures[id].at) < failureRetryMs) continue
@@ -503,14 +504,14 @@ Item {
   }
 
   function latch(id) {
-    var next = Object.assign({}, latched)
+    var next = Object.assign(Object.create(null), latched)
     next[String(id)] = true
     latched = next
   }
 
   function unlatch(id) {
-    if (!latched[String(id)]) return
-    var next = Object.assign({}, latched)
+    if (!Conditions.mapValue(latched, String(id))) return
+    var next = Object.assign(Object.create(null), latched)
     delete next[String(id)]
     latched = next
   }
@@ -551,14 +552,14 @@ Item {
     if (ok) {
       if (job.op === "activate") latch(job.id)
       if (job.op === "deactivate") {
-        var waiting = Object.assign({}, awaitingDeactivation)
+        var waiting = Object.assign(Object.create(null), awaitingDeactivation)
         waiting[job.id] = activeProc.generation + 1
         awaitingDeactivation = waiting
-        var optimisticActive = Object.assign({}, active)
+        var optimisticActive = Object.assign(Object.create(null), active)
         delete optimisticActive[job.id]
         active = optimisticActive
       }
-      var cleared = Object.assign({}, failures)
+      var cleared = Object.assign(Object.create(null), failures)
       if (cleared[job.id] && cleared[job.id].op === job.op) delete cleared[job.id]
       failures = cleared
     }
@@ -566,7 +567,7 @@ Item {
       // Do not hammer the runner while the cause persists (a stopped shell, a
       // restore that could not complete); retry after the failure window or
       // once the conditions have gone false.
-      var next = Object.assign({}, failures)
+      var next = Object.assign(Object.create(null), failures)
       if (job.revision === configRevision) {
         if (job.op === "activate") latch(job.id)
         next[job.id] = {
@@ -585,8 +586,9 @@ Item {
   function buildActiveList(activeMap, meta) {
     var rows = []
     for (var id in activeMap) {
+      if (!Conditions.mapOwns(activeMap, id)) continue
       var record = activeMap[id] || {}
-      var info = meta && meta[id] ? meta[id] : null
+      var info = Conditions.mapValue(meta, id)
       rows.push({
         id: id,
         name: info ? info.name : id,
@@ -622,15 +624,15 @@ Item {
       var id = jobs[i] ? String(jobs[i].id || "") : ""
       if (id) result[id] = true
     }
-    var running = inFlight || ({})
-    for (var id in running) result[id] = true
-    var awaitingProbe = settling || ({})
-    for (var pendingId in awaitingProbe) result[pendingId] = true
+    var running = inFlight || Object.create(null)
+    for (var id in running) if (Conditions.mapOwns(running, id)) result[id] = true
+    var awaitingProbe = settling || Object.create(null)
+    for (var pendingId in awaitingProbe) if (Conditions.mapOwns(awaitingProbe, pendingId)) result[pendingId] = true
     return result
   }
 
   function settleManualActive(generation) {
-    var next = Object.assign({}, manualSettling)
+    var next = Object.assign(Object.create(null), manualSettling)
     var changed = false
     for (var id in next) {
       if (Number(next[id]) > generation) continue
@@ -643,7 +645,7 @@ Item {
   }
 
   function buildRoutinePendingIds(manualIds, conditionJob) {
-    var result = Object.assign(Object.create(null), manualIds || ({}))
+    var result = Object.assign(Object.create(null), manualIds || Object.create(null))
     if (conditionJob && conditionJob.id) result[String(conditionJob.id)] = true
     return result
   }
@@ -666,21 +668,23 @@ Item {
 
   function startManualRoutine(worker, job) {
     worker.job = job
-    var next = Object.assign({}, manualInFlight)
+    var next = Object.assign(Object.create(null), manualInFlight)
     next[job.id] = job
     manualInFlight = next
     logEvent("manual-start", job.op + " " + job.id)
     worker.command = [root.runnerPath, job.op, job.id, job.source || "manual"]
+    if (job.op === "activate" || job.op === "run")
+      worker.command = worker.command.concat([String(job.revision || "")])
     worker.startPending = true
     worker.running = true
   }
 
   function endRoutine(id) { return enqueueManual("deactivate", id) }
-  function startRoutine(id) { return enqueueManual("activate", id) }
-  function toggleRoutine(id) { return enqueueManual("run", id) }
+  function startRoutine(id, expectedRevision) { return enqueueManual("activate", id, undefined, expectedRevision) }
+  function toggleRoutine(id, expectedRevision) { return enqueueManual("run", id, undefined, expectedRevision) }
   // The editor's Run button deliberately accepts disabled routines so they
   // can be tested before their triggers and conditions are enabled.
-  function testRoutine(id) { return enqueueManual("run", id, "test") }
+  function testRoutine(id, expectedRevision) { return enqueueManual("run", id, "test", expectedRevision) }
   // The bar switch turns the whole integration on or off; the window keeps
   // its own confirmation for the same call and can pin the revision it showed.
   // Omitting the revision preserves the bar's two-element runner command.
@@ -702,6 +706,13 @@ Item {
     if (connection) connectionEpoch++
     var job = { op: op, id: routineId, source: source }
     if (op === "connect" && typeof expectedRevision === "string") job.revision = expectedRevision
+    if (op === "activate" || op === "run") {
+      // Capture the click's revision once. Neither a watcher nor a connection
+      // barrier may silently update the authority of a queued request.
+      var reviewed = expectedRevision === undefined ? configRevision : expectedRevision
+      if (typeof reviewed !== "string" || !reviewed) return false
+      job.revision = String(reviewed)
+    }
     manualQueue = manualQueue.concat([job])
     runNextManual()
     return true
@@ -734,8 +745,8 @@ Item {
     var suffix = barrier < 0 ? [] : manualQueue.slice(barrier)
     var kept = []
     var occupied = Object.create(null)
-    for (var runningId in manualInFlight) occupied[runningId] = true
-    for (var settlingId in manualSettling) occupied[settlingId] = true
+    for (var runningId in manualInFlight) if (Conditions.mapOwns(manualInFlight, runningId)) occupied[runningId] = true
+    for (var settlingId in manualSettling) if (Conditions.mapOwns(manualSettling, settlingId)) occupied[settlingId] = true
     if (currentJob) occupied[currentJob.id] = true
 
     for (var p = 0; p < prefix.length; p++) {
@@ -770,10 +781,10 @@ Item {
     worker.job = null
     worker.startPending = false
     if (job) {
-      var settling = Object.assign({}, manualSettling)
+      var settling = Object.assign(Object.create(null), manualSettling)
       settling[job.id] = activeProc.generation + 1
       manualSettling = settling
-      var next = Object.assign({}, manualInFlight)
+      var next = Object.assign(Object.create(null), manualInFlight)
       delete next[job.id]
       manualInFlight = next
     }
@@ -1066,9 +1077,12 @@ Item {
     function onScanFinished() { root.ensureWidget() }
   }
 
+  // Notification-only watchers must never acquire file bodies before the
+  // runner's bounded admission/read paths. Do not call text/data/reload here.
   // ------------------------------------------------------- watchers
   FileView {
     path: root.configPath
+    preload: false
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh(configProc)
@@ -1076,6 +1090,7 @@ Item {
 
   FileView {
     path: root.stateDir + "/config.commit.json"
+    preload: false
     watchChanges: true
     printErrors: false
     onFileChanged: {
@@ -1086,6 +1101,7 @@ Item {
 
   FileView {
     path: root.stateDir + "/connection.json"
+    preload: false
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh(statusProc)
@@ -1093,6 +1109,7 @@ Item {
 
   FileView {
     path: root.stateDir + "/active"
+    preload: false
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh(activeProc)
@@ -1100,6 +1117,7 @@ Item {
 
   FileView {
     path: root.stateDir + "/runs.jsonl"
+    preload: false
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh(logsProc)
@@ -1107,6 +1125,7 @@ Item {
 
   FileView {
     path: root.togglesDir
+    preload: false
     watchChanges: true
     printErrors: false
     onFileChanged: root.refresh(togglesProbe)
