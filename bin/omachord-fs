@@ -5,7 +5,7 @@ use warnings;
 use Digest::SHA;
 use Encode qw(decode FB_CROAK);
 use Errno qw(EEXIST ENOENT);
-use Fcntl qw(F_SETFD LOCK_EX O_CREAT O_DIRECTORY O_EXCL O_NOFOLLOW O_NONBLOCK O_RDONLY O_RDWR O_WRONLY S_ISDIR S_ISREG);
+use Fcntl qw(F_SETFD O_CREAT O_DIRECTORY O_EXCL O_NOFOLLOW O_NONBLOCK O_RDONLY O_RDWR O_WRONLY S_ISDIR S_ISREG);
 use IO::Handle;
 use JSON::PP qw(encode_json);
 
@@ -18,9 +18,6 @@ use JSON::PP qw(encode_json);
   }
 }
 
-our $ACTIVE_SYNC_PATH = "";
-our $SYNC_COUNT = 0;
-our $FINGERPRINT_COUNT = 0;
 our @RECOVERY_ENTRIES;
 
 sub abort_operation {
@@ -46,13 +43,6 @@ sub component_path {
 
 sub sync_handle {
   my ($handle, $label) = @_;
-  if (defined($ENV{OMACHORD_FS_TEST_MATCH})
-      && $ENV{OMACHORD_FS_TEST_MATCH} eq $ACTIVE_SYNC_PATH
-      && defined($ENV{OMACHORD_FS_TEST_FAIL_SYNC})) {
-    $SYNC_COUNT++;
-    abort_operation("durability-error", "Forced filesystem test sync failure: $label")
-      if $SYNC_COUNT == $ENV{OMACHORD_FS_TEST_FAIL_SYNC};
-  }
   $handle->sync or abort_operation("durability-error", "Could not sync $label: $!");
 }
 
@@ -156,13 +146,6 @@ sub parent_is_current {
 
 sub stable_fingerprint_handle {
   my ($file, $path, $require_private) = @_;
-  if (defined($ENV{OMACHORD_FS_TEST_MATCH})
-      && $ENV{OMACHORD_FS_TEST_MATCH} eq $ACTIVE_SYNC_PATH
-      && defined($ENV{OMACHORD_FS_TEST_FAIL_FINGERPRINT})) {
-    $FINGERPRINT_COUNT++;
-    abort_operation("compare-mismatch", "Forced unstable filesystem test fingerprint: $path")
-      if $FINGERPRINT_COUNT == $ENV{OMACHORD_FS_TEST_FAIL_FINGERPRINT};
-  }
   my @initial = stat($file);
   abort_operation("unsafe-entry", "File is not a regular user-owned file: $path")
     unless @initial && S_ISREG($initial[2]) && $initial[4] == $>
@@ -310,7 +293,7 @@ sub open_adjacent_directory {
 
 sub file_open_state {
   my (@paths) = @_;
-  return -1 if !@paths || $ENV{OMACHORD_FS_TEST_FAIL_FUSER};
+  return -1 if !@paths;
   my $pid = open(my $inspection, "-|");
   return -1 unless defined $pid;
   if ($pid == 0) {
@@ -440,45 +423,6 @@ sub retire_remove_entries {
         "$archive_root/retired", $closed ? $entry->[1] : undef, 0);
     };
   }
-}
-
-sub pause_for_test {
-  my ($destination, $phase) = @_;
-  return unless defined($ENV{OMACHORD_FS_TEST_MATCH})
-    && $ENV{OMACHORD_FS_TEST_MATCH} eq $destination
-    && defined($ENV{OMACHORD_FS_TEST_PAUSE})
-    && $ENV{OMACHORD_FS_TEST_PAUSE} eq $phase;
-  my $ready = $ENV{OMACHORD_FS_TEST_READY} // "";
-  my $release = $ENV{OMACHORD_FS_TEST_RELEASE} // "";
-  abort_operation("io-error", "Incomplete filesystem test synchronization")
-    unless $ready =~ m{^/} && $release =~ m{^/};
-  my $ordinal = $ENV{OMACHORD_FS_TEST_ORDINAL} // 1;
-  abort_operation("io-error", "Invalid filesystem test ordinal")
-    unless $ordinal =~ /\A[1-9][0-9]*\z/;
-  if (defined $ENV{OMACHORD_FS_TEST_COUNT_FILE}) {
-    my $count_path = $ENV{OMACHORD_FS_TEST_COUNT_FILE};
-    abort_operation("io-error", "Invalid filesystem test count path")
-      unless $count_path =~ m{^/};
-    sysopen(my $count_file, $count_path, O_RDWR | O_CREAT, 0600)
-      or abort_operation("io-error", "Could not open filesystem test count: $!");
-    flock($count_file, LOCK_EX)
-      or abort_operation("io-error", "Could not lock filesystem test count: $!");
-    seek($count_file, 0, 0);
-    my $count = <$count_file> // 0;
-    $count = 0 unless $count =~ /\A[0-9]+\s*\z/;
-    $count++;
-    seek($count_file, 0, 0);
-    truncate($count_file, 0);
-    print {$count_file} "$count\n";
-    sync_handle($count_file, "filesystem test count");
-    return if $count != $ordinal;
-  } else {
-    return if -e $ready;
-  }
-  sysopen(my $marker, $ready, O_WRONLY | O_CREAT | O_EXCL, 0600)
-    or abort_operation("io-error", "Could not publish filesystem test phase: $!");
-  close $marker;
-  select undef, undef, undef, 0.005 until -e $release;
 }
 
 sub stage_from_stdin {
@@ -696,7 +640,6 @@ sub publish_cas {
       $policy, $expected, $mode, $archive_root) = @_;
   my ($temporary, $stage, $stage_identity, $expected_new) =
     stage_from_stdin($directory, $destination, $mode, ".omachord.");
-  pause_for_test($destination, "before-publish");
   if (!parent_is_current($parent, $policy, $parent_identity)) {
     close $stage;
     unlink_entry($directory, $temporary, $destination);
@@ -752,13 +695,11 @@ sub publish_cas {
     sync_handle($directory, "directory containing $destination");
     abort_operation("compare-mismatch", "A file changed during the transaction: $destination");
   }
-  pause_for_test($destination, "before-exchange");
   if (!exchange_entries($directory, $temporary, $directory, $name, $destination)) {
     close $stage;
     unlink_entry($directory, $temporary, $destination);
     abort_operation("io-error", "Could not atomically exchange $destination");
   }
-  pause_for_test($destination, "after-exchange");
   my $observed;
   my $observed_ok = eval {
     $observed = fingerprint_entry($directory, $temporary, $destination, 0);
@@ -822,9 +763,6 @@ sub publish_cas {
 
 sub atomic_write {
   my ($destination, $mode_text, $policy, $archive_root, $expected) = @_;
-  local $ACTIVE_SYNC_PATH = $destination;
-  local $SYNC_COUNT = 0;
-  local $FINGERPRINT_COUNT = 0;
   abort_operation("usage", "Invalid file mode") unless $mode_text =~ /\A[0-7]{3,4}\z/;
   abort_operation("usage", "Invalid parent policy") unless $policy eq "private" || $policy eq "owned";
   my ($directory, $name, $parent, $identity) = parent_for_path($destination, 1, $policy);
@@ -839,15 +777,11 @@ sub atomic_write {
 
 sub cas_remove {
   my ($destination, $expected, $policy, $archive_root) = @_;
-  local $ACTIVE_SYNC_PATH = $destination;
-  local $SYNC_COUNT = 0;
-  local $FINGERPRINT_COUNT = 0;
   abort_operation("usage", "Invalid parent policy") unless $policy eq "private" || $policy eq "owned";
   my ($directory, $name, $parent, $identity) = parent_for_path($destination, 0, $policy);
   $expected = fingerprint_entry($directory, $name, $destination, $policy eq "private")
     unless defined $expected;
   if ($expected eq "missing") {
-    pause_for_test($destination, "before-publish");
     abort_operation("parent-changed", "The parent directory changed while checking $destination")
       unless parent_is_current($parent, $policy, $identity);
     abort_operation("compare-mismatch", "A file appeared during the transaction: $destination")
@@ -861,11 +795,6 @@ sub cas_remove {
   my $current = fingerprint_entry($directory, $name, $destination, $policy eq "private");
   abort_operation("compare-mismatch", "A file changed during the transaction: $destination")
     unless $current eq $expected;
-  if (defined($ENV{OMACHORD_FS_TEST_MATCH})
-      && $ENV{OMACHORD_FS_TEST_MATCH} eq $destination
-      && $ENV{OMACHORD_FS_TEST_FAIL_REMOVE}) {
-    abort_operation("io-error", "Forced filesystem test removal failure: $destination");
-  }
   my ($placeholder, $file) = create_file($directory, ".omachord-remove.", 0600);
   my ($placeholder_identity, $placeholder_fingerprint);
   my $staged = eval {
@@ -882,18 +811,15 @@ sub cas_remove {
     eval { sync_handle($directory, "directory containing $destination") };
     die $error;
   }
-  pause_for_test($destination, "before-publish");
   if (!parent_is_current($parent, $policy, $identity)) {
     unlink_entry($directory, $placeholder, $destination);
     sync_handle($directory, "directory containing $destination");
     abort_operation("parent-changed", "The parent directory changed before removing $destination");
   }
-  pause_for_test($destination, "before-exchange");
   if (!exchange_entries($directory, $placeholder, $directory, $name, $destination)) {
     unlink_entry($directory, $placeholder, $destination);
     abort_operation("io-error", "Could not atomically exchange $destination for removal");
   }
-  pause_for_test($destination, "after-exchange");
   my $observed = eval { fingerprint_entry($directory, $placeholder, $destination, 0) };
   if (!defined $observed) {
     my $error = $@;
@@ -1018,8 +944,6 @@ sub prepare_state {
 
 sub unique_write {
   my ($directory_path, $prefix, $mode_text) = @_;
-  local $ACTIVE_SYNC_PATH = $directory_path;
-  local $SYNC_COUNT = 0;
   abort_operation("usage", "Invalid unique-file prefix")
     unless $prefix =~ /\A[A-Za-z0-9._-]+\z/;
   abort_operation("usage", "Invalid file mode") unless $mode_text =~ /\A[0-7]{3,4}\z/;
@@ -1074,7 +998,6 @@ sub list_toggles {
   abort_operation("unsafe-path", "Toggle directory changed while it was being opened: $path")
     unless $opened_stat[0] == $named[0] && $opened_stat[1] == $named[1];
   my $directory_identity = "$opened_stat[0]:$opened_stat[1]";
-  pause_for_test($path, "before-scan");
   abort_operation("parent-changed", "The toggle directory changed before it was scanned: $path")
     unless parent_is_current($path, "owned", $directory_identity);
   opendir(my $entries, "/proc/self/fd/" . fileno($directory))

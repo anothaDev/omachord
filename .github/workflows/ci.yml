@@ -67,6 +67,7 @@ jobs:
 
       - name: Test filesystem transactions
         run: |
+          runuser -u test-runner -- python3 test/production-instrumentation-test.py
           runuser -u test-runner -- test/fs-helper-test.sh
           runuser -u test-runner -- python3 test/fs-recovery-test.py
 

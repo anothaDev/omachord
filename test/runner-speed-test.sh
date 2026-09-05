@@ -6,12 +6,16 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 RUNNER="$ROOT/bin/omachord"
 if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
 TEST_ROOT=$(mktemp -d "$TEST_TMP/omachord-speed-test.XXXXXX")
+INSTRUMENTED_RUNNER="$TEST_ROOT/instrumented/bin/omachord"
 export TEST_ROOT
 
 cleanup() {
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
+
+# Only explicit fault-injection calls use this disposable plugin fixture.
+python3 "$ROOT/test/fs_test_support.py" "$ROOT" "$TEST_ROOT/instrumented" >/dev/null
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -442,7 +446,7 @@ printf '%s\n' "$CONFIG" \
   | env OMACHORD_FS_TEST_MATCH="$CONFIG_PATH" OMACHORD_FS_TEST_PAUSE=before-publish \
       OMACHORD_FS_TEST_READY="$TEST_ROOT/race.ready" \
       OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/race.release" \
-      "$RUNNER" config apply "$race_revision" >"$TEST_ROOT/race.result" &
+      "$INSTRUMENTED_RUNNER" config apply "$race_revision" >"$TEST_ROOT/race.result" &
 race_pid=$!
 wait_for_path "$TEST_ROOT/race.ready"
 printf '%s\n' 'external generated Lua edit' >"$HYPR_DIR/omachord.lua"

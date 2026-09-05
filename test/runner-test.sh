@@ -6,6 +6,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 RUNNER="$ROOT/bin/omachord"
 if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
 TEST_ROOT=$(mktemp -d "$TEST_TMP/omachord-test.XXXXXX")
+INSTRUMENTED_RUNNER="$TEST_ROOT/instrumented/bin/omachord"
 export TEST_ROOT
 cd "$ROOT"
 
@@ -13,6 +14,9 @@ cleanup() {
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
+
+# Only explicit fault-injection calls use this disposable plugin fixture.
+python3 "$ROOT/test/fs_test_support.py" "$ROOT" "$TEST_ROOT/instrumented" >/dev/null
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -765,7 +769,7 @@ printf '%s\n' "$UNCOMMITTED_CONFIG" \
   | env OMACHORD_FS_TEST_MATCH="$CONFIG_PATH" OMACHORD_FS_TEST_PAUSE=after-exchange \
       OMACHORD_FS_TEST_READY="$TEST_ROOT/config-published" \
       OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/release-config-publish" \
-      "$RUNNER" config apply "$uncommitted_revision" >"$TEST_ROOT/uncommitted-apply.result" &
+      "$INSTRUMENTED_RUNNER" config apply "$uncommitted_revision" >"$TEST_ROOT/uncommitted-apply.result" &
 uncommitted_apply_pid=$!
 for _ in {1..500}; do
   [[ -f $TEST_ROOT/config-published ]] && break
@@ -1125,7 +1129,7 @@ printf '%s\n' "$ROLLBACK_CONFIG" \
       OMACHORD_FS_TEST_COUNT_FILE="$TEST_ROOT/config-rollback-count" \
       OMACHORD_FS_TEST_READY="$TEST_ROOT/config-rollback-ready" \
       OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/config-rollback-release" \
-      "$RUNNER" config apply "$(config_revision)" >"$rollback_result" &
+      "$INSTRUMENTED_RUNNER" config apply "$(config_revision)" >"$rollback_result" &
 rollback_pid=$!
 for _ in {1..500}; do
   [[ -e $TEST_ROOT/config-rollback-ready ]] && break
@@ -1274,7 +1278,7 @@ env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/bindings.lua" \
   OMACHORD_FS_TEST_PAUSE=before-publish \
   OMACHORD_FS_TEST_READY="$TEST_ROOT/bindings-race-ready" \
   OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/bindings-race-release" \
-  "$RUNNER" connect >"$connect_result" &
+  "$INSTRUMENTED_RUNNER" connect >"$connect_result" &
 connect_pid=$!
 for _ in {1..500}; do
   [[ -e $TEST_ROOT/bindings-race-ready ]] && break
@@ -1299,7 +1303,7 @@ env OMACHORD_FS_TEST_MATCH="$XDG_STATE_HOME/omarchy/omachord/connection.json" \
   OMACHORD_FS_TEST_PAUSE=before-publish \
   OMACHORD_FS_TEST_READY="$TEST_ROOT/ownership-race-ready" \
   OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/ownership-race-release" \
-  "$RUNNER" connect >"$connect_result" &
+  "$INSTRUMENTED_RUNNER" connect >"$connect_result" &
 connect_pid=$!
 for _ in {1..500}; do
   [[ -e $TEST_ROOT/ownership-race-ready ]] && break
@@ -1326,7 +1330,7 @@ env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/bindings.lua" \
   OMACHORD_FS_TEST_PAUSE=before-exchange \
   OMACHORD_FS_TEST_READY="$TEST_ROOT/exchange-back-ready" \
   OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/exchange-back-release" \
-  "$RUNNER" connect >"$connect_result" &
+  "$INSTRUMENTED_RUNNER" connect >"$connect_result" &
 connect_pid=$!
 for _ in {1..500}; do
   [[ -e $TEST_ROOT/exchange-back-ready ]] && break
@@ -1446,7 +1450,7 @@ env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/omachord.lua" \
   OMACHORD_FS_TEST_PAUSE=after-exchange \
   OMACHORD_FS_TEST_READY="$TEST_ROOT/generated-removal-window" \
   OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/release-generated-removal" \
-  "$RUNNER" disconnect >"$TEST_ROOT/interrupted-disconnect-result" &
+  "$INSTRUMENTED_RUNNER" disconnect >"$TEST_ROOT/interrupted-disconnect-result" &
 disconnect_pid=$!
 for _ in {1..500}; do
   [[ ! -f $TEST_ROOT/generated-removal-window ]] || break
@@ -1471,7 +1475,7 @@ env OMACHORD_FS_TEST_MATCH="$HYPR_CONFIG_DIR/omachord.lua" \
   OMACHORD_FS_TEST_PAUSE=after-exchange \
   OMACHORD_FS_TEST_READY="$TEST_ROOT/generated-remove-race-ready" \
   OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/generated-remove-race-release" \
-  "$RUNNER" disconnect >"$disconnect_result" &
+  "$INSTRUMENTED_RUNNER" disconnect >"$disconnect_result" &
 disconnect_pid=$!
 for _ in {1..500}; do
   [[ -e $TEST_ROOT/generated-remove-race-ready ]] && break
@@ -1866,7 +1870,7 @@ end_runs_before=$(grep -Fxc '<ended>' "$TEST_ROOT/capture-history" 2>/dev/null |
 "$RUNNER" run end-actions test | jq -e '.state == "activated"' >/dev/null
 end_failure=$(mktemp)
 if OMACHORD_FS_TEST_MATCH="$ACTIVE_DIR/end-actions.json" OMACHORD_FS_TEST_FAIL_REMOVE=1 \
-    "$RUNNER" deactivate end-actions test >"$end_failure"; then
+    "$INSTRUMENTED_RUNNER" deactivate end-actions test >"$end_failure"; then
   fail "end-action snapshot removal failure should be reported"
 fi
 jq -e '.code == "action-failed" and (.error | test("Could not remove.*recovery record kept"))' "$end_failure" >/dev/null
@@ -2042,7 +2046,7 @@ pass "failed restore keeps the recovery record"
 "$RUNNER" activate interrupted-activation test | jq -e '.state == "activated"' >/dev/null
 snapshot_remove_failure=$(mktemp)
 if OMACHORD_FS_TEST_MATCH="$ACTIVE_DIR/interrupted-activation.json" OMACHORD_FS_TEST_FAIL_REMOVE=1 \
-    "$RUNNER" deactivate interrupted-activation test >"$snapshot_remove_failure"; then
+    "$INSTRUMENTED_RUNNER" deactivate interrupted-activation test >"$snapshot_remove_failure"; then
   fail "deactivation should fail when its completed snapshot cannot be removed"
 fi
 jq -e '.code == "action-failed" and (.error | test("Could not remove.*recovery record kept"))' "$snapshot_remove_failure" >/dev/null
@@ -2225,7 +2229,7 @@ rm -f "$TEST_ROOT/shell-config-race-ready" "$TEST_ROOT/shell-config-race-release
 env OMACHORD_FS_TEST_MATCH="$shell_config" OMACHORD_FS_TEST_PAUSE=before-publish \
   OMACHORD_FS_TEST_READY="$TEST_ROOT/shell-config-race-ready" \
   OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/shell-config-race-release" \
-  "$RUNNER" widget ensure >"$widget_result" &
+  "$INSTRUMENTED_RUNNER" widget ensure >"$widget_result" &
 widget_pid=$!
 for _ in {1..500}; do
   [[ -e $TEST_ROOT/shell-config-race-ready ]] && break

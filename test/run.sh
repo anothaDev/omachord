@@ -5,6 +5,7 @@ set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 
 "$ROOT/test/version-test.sh"
+python3 "$ROOT/test/production-instrumentation-test.py"
 "$ROOT/test/fs-helper-test.sh"
 python3 "$ROOT/test/fs-recovery-test.py"
 "$ROOT/test/action-supervisor-test.sh"

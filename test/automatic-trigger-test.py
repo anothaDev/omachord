@@ -4,8 +4,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
+
+sys.dont_write_bytecode = True
+from fs_test_support import prepare_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "bin/omachord"
@@ -13,6 +17,7 @@ RUNNER = ROOT / "bin/omachord"
 for ingress in ("hook", "shortcut", "shortcut-activate"):
     with tempfile.TemporaryDirectory(prefix="omachord-automatic-") as temporary:
         fixture = Path(temporary)
+        instrumented_runner = prepare_fixture(ROOT, fixture / "instrumented") / "bin/omachord"
         for directory in ("home/.config/hypr", "home/.config/omarchy", "state", "data", "runtime", "tmp", "bin"):
             (fixture / directory).mkdir(parents=True, mode=0o700)
         for name, body in (("omarchy", "exit 0"), ("hyprctl", "exit 0")):
@@ -55,7 +60,7 @@ for ingress in ("hook", "shortcut", "shortcut-activate"):
         paused = env | {"OMACHORD_FS_TEST_MATCH": str(fixture / "home/.config/hypr/omachord.lua"),
                         "OMACHORD_FS_TEST_PAUSE": "before-publish", "OMACHORD_FS_TEST_READY": str(ready),
                         "OMACHORD_FS_TEST_RELEASE": str(release)}
-        disconnect = subprocess.Popen([str(RUNNER), "disconnect"], env=paused,
+        disconnect = subprocess.Popen([str(instrumented_runner), "disconnect"], env=paused,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         request = None
         try:

@@ -7,12 +7,16 @@ unset BASH_ENV ENV
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 RUNNER="$ROOT/bin/omachord"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/omachord-manual-revision.XXXXXX")
+INSTRUMENTED_RUNNER="$TEST_ROOT/instrumented/bin/omachord"
 export TEST_ROOT HOME="$TEST_ROOT/home" XDG_CONFIG_HOME="$TEST_ROOT/home/.config"
 export XDG_STATE_HOME="$TEST_ROOT/state" XDG_DATA_HOME="$TEST_ROOT/data" XDG_RUNTIME_DIR="$TEST_ROOT/runtime" TMPDIR="$TEST_ROOT/tmp"
 export PATH="$TEST_ROOT/bin:/usr/bin:/bin" OMACHORD_RUNNER_PATH="$RUNNER"
 mkdir -p "$HOME/.config/omarchy" "$HOME/.config/hypr" "$XDG_RUNTIME_DIR" "$TMPDIR" "$TEST_ROOT/bin"
 cleanup() { touch "$TEST_ROOT/apply.release"; wait || true; rm -rf -- "$TEST_ROOT"; }
 trap cleanup EXIT
+
+# Only explicit fault-injection calls use this disposable plugin fixture.
+python3 "$ROOT/test/fs_test_support.py" "$ROOT" "$TEST_ROOT/instrumented" >/dev/null
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 wait_for_path() { for _ in {1..1000}; do [[ -e $1 ]] && return 0; sleep 0.01; done; fail "timeout waiting for $1"; }
 cat >"$TEST_ROOT/bin/omarchy" <<'STUB'
@@ -45,7 +49,7 @@ reviewed=$(revision)
 B=$(jq -c '.routines[0].actions[0].args=["B"]' <<<"$A")
 printf '%s\n' "$B" | env OMACHORD_FS_TEST_MATCH="$CONFIG_PATH" OMACHORD_FS_TEST_PAUSE=before-publish \
   OMACHORD_FS_TEST_READY="$TEST_ROOT/apply.ready" OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/apply.release" \
-  "$RUNNER" config apply "$reviewed" >"$TEST_ROOT/apply.json" & applying=$!
+  "$INSTRUMENTED_RUNNER" config apply "$reviewed" >"$TEST_ROOT/apply.json" & applying=$!
 wait_for_path "$TEST_ROOT/apply.ready"
 env TEST_LOCK_READY="$TEST_ROOT/run.lock-ready" "$RUNNER" run alpha test "$reviewed" >"$TEST_ROOT/run.json" & queued=$!
 wait_for_path "$TEST_ROOT/run.lock-ready"

@@ -1059,9 +1059,6 @@ connection_collision() {
 }
 
 hypr_errors() {
-  if [[ ${OMACHORD_SKIP_HYPR_RELOAD:-0} == 1 ]]; then
-    return 0
-  fi
   command -v hyprctl >/dev/null 2>&1 || {
     printf '%s' 'hyprctl is unavailable'
     return 1
@@ -1083,9 +1080,6 @@ require_clean_hyprland() {
 
 reload_hyprland() {
   local errors
-  if [[ ${OMACHORD_SKIP_HYPR_RELOAD:-0} == 1 ]]; then
-    return 0
-  fi
   if ! control_capture hyprctl reload >/dev/null 2>&1; then
     LAST_ERROR="Hyprland reload failed"
     return 1

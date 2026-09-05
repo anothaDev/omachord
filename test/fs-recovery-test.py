@@ -12,9 +12,16 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = (ROOT / "bin/omachord-fs").read_text()
 SYNC = "sub sync_handle {\n  my ($handle, $label) = @_;\n"
-EXCHANGE = '  pause_for_test($destination, "after-exchange");\n'
+# Inject immediately after the actual successful cas-write exchange, before
+# its displaced-file inspection. This anchor contains only production operations.
+EXCHANGE = """  if (!exchange_entries($directory, $temporary, $directory, $name, $destination)) {
+    close $stage;
+    unlink_entry($directory, $temporary, $destination);
+    abort_operation("io-error", "Could not atomically exchange $destination");
+  }
+"""
 assert SOURCE.count(SYNC) == 1, "sync injection anchor changed"
-assert SOURCE.count(EXCHANGE) == 2, "CAS injection anchors changed"
+assert SOURCE.count(EXCHANGE) == 1, "CAS injection anchor changed"
 
 
 def perl_literal(value):

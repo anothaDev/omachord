@@ -10,6 +10,7 @@ unset BASH_ENV ENV
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 RUNNER="$ROOT/bin/omachord"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/omachord-authorization.XXXXXX")
+INSTRUMENTED_RUNNER="$TEST_ROOT/instrumented/bin/omachord"
 export TEST_ROOT
 export HOME="$TEST_ROOT/home" XDG_CONFIG_HOME="$TEST_ROOT/home/.config"
 export XDG_STATE_HOME="$TEST_ROOT/state" XDG_DATA_HOME="$TEST_ROOT/data"
@@ -24,6 +25,9 @@ cleanup() {
   rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT
+
+# Only explicit fault-injection calls use this disposable plugin fixture.
+python3 "$ROOT/test/fs_test_support.py" "$ROOT" "$TEST_ROOT/instrumented" >/dev/null
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 pass() { printf 'PASS: %s\n' "$*"; }
 wait_for_path() {
@@ -100,7 +104,7 @@ icon_test() {
   legacy_icon
   env OMACHORD_FS_TEST_MATCH="$ICON_PATH" OMACHORD_FS_TEST_PAUSE=before-publish \
     OMACHORD_FS_TEST_READY="$TEST_ROOT/icon.ready" OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/icon.release" \
-    "$RUNNER" connect >"$TEST_ROOT/result" & upgrade=$!
+    "$INSTRUMENTED_RUNNER" connect >"$TEST_ROOT/result" & upgrade=$!
   wait_for_path "$TEST_ROOT/icon.ready"
   printf 'late unowned icon\n' >"$ICON_PATH"
   touch "$TEST_ROOT/icon.release"
@@ -114,7 +118,7 @@ off_test() {
   env OMACHORD_FS_TEST_MATCH="$STATE_DIR/connection.disabled.json" \
     OMACHORD_FS_TEST_PAUSE=before-publish OMACHORD_FS_TEST_READY="$TEST_ROOT/disconnect.ready" \
     OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/disconnect.release" \
-    "$RUNNER" disconnect >"$TEST_ROOT/disconnect.json" & local disconnect=$!
+    "$INSTRUMENTED_RUNNER" disconnect >"$TEST_ROOT/disconnect.json" & local disconnect=$!
   wait_for_path "$TEST_ROOT/disconnect.ready"
   env AUTO_LOCK_READY="$TEST_ROOT/autostart.lock-ready" "$RUNNER" autostart >"$TEST_ROOT/autostart.json" & local autostart=$!
   wait_for_path "$TEST_ROOT/autostart.lock-ready"
@@ -130,7 +134,7 @@ off_test() {
   rm "$ICON_PATH"
   env OMACHORD_FS_TEST_MATCH="$ICON_PATH" OMACHORD_FS_TEST_PAUSE=before-publish \
     OMACHORD_FS_TEST_READY="$TEST_ROOT/auto.ready" OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/auto.release" \
-    "$RUNNER" autostart >"$TEST_ROOT/autostart.json" & autostart=$!
+    "$INSTRUMENTED_RUNNER" autostart >"$TEST_ROOT/autostart.json" & autostart=$!
   wait_for_path "$TEST_ROOT/auto.ready"
   env AUTO_LOCK_READY="$TEST_ROOT/disconnect.lock-ready" "$RUNNER" disconnect >"$TEST_ROOT/disconnect.json" & disconnect=$!
   wait_for_path "$TEST_ROOT/disconnect.lock-ready"
@@ -314,7 +318,7 @@ completed_plan_test() {
   "$RUNNER" connect >/dev/null
   "$RUNNER" activate lifecycle >/dev/null
   if env OMACHORD_FS_TEST_MATCH="$snapshot" OMACHORD_FS_TEST_FAIL_REMOVE=1 \
-    "$RUNNER" deactivate lifecycle >"$TEST_ROOT/result"; then fail 'failed completed-record removal was ignored'; fi
+    "$INSTRUMENTED_RUNNER" deactivate lifecycle >"$TEST_ROOT/result"; then fail 'failed completed-record removal was ignored'; fi
   jq -e '.endActionIndex == 1' "$snapshot" >/dev/null
   changed=$(jq -c --arg program "$TEST_ROOT/bin/effect-fail" '.routines[0].onEnd.actions |= [{type:"exec",program:$program,args:[]}] + .' <<<"$original")
   if apply "$changed"; then fail 'fully consumed plan was edited before record removal'; fi
@@ -331,7 +335,7 @@ completed_plan_test() {
   # Explicit skip is durable even when final record removal fails.
   inspected=$("$RUNNER" recovery inspect lifecycle | jq -er '.revision')
   if env OMACHORD_FS_TEST_MATCH="$snapshot" OMACHORD_FS_TEST_FAIL_REMOVE=1 \
-    "$RUNNER" recovery restore lifecycle "$inspected" --skip-end-actions >"$TEST_ROOT/result"; then fail 'failed recovery removal reported success'; fi
+    "$INSTRUMENTED_RUNNER" recovery restore lifecycle "$inspected" --skip-end-actions >"$TEST_ROOT/result"; then fail 'failed recovery removal reported success'; fi
   jq -e '.onEndMode == "restore"' "$snapshot" >/dev/null
   "$RUNNER" deactivate lifecycle >/dev/null
   [[ ! -e $TEST_ROOT/effects && ! -e $snapshot ]] || fail 'completed recovery replayed work'
@@ -345,7 +349,7 @@ recovery_cas_test() {
   inspected=$("$RUNNER" recovery inspect lifecycle | jq -er '.revision')
   env OMACHORD_FS_TEST_MATCH="$snapshot" OMACHORD_FS_TEST_PAUSE=before-publish \
     OMACHORD_FS_TEST_READY="$TEST_ROOT/recovery.ready" OMACHORD_FS_TEST_RELEASE="$TEST_ROOT/recovery.release" \
-    "$RUNNER" recovery restore lifecycle "$inspected" --skip-end-actions >"$TEST_ROOT/result" & pid=$!
+    "$INSTRUMENTED_RUNNER" recovery restore lifecycle "$inspected" --skip-end-actions >"$TEST_ROOT/result" & pid=$!
   wait_for_path "$TEST_ROOT/recovery.ready"
   jq '.activatedAt += " "' "$snapshot" >"$TEST_ROOT/concurrent-snapshot.json"
   cp "$TEST_ROOT/concurrent-snapshot.json" "$snapshot"
