@@ -79,7 +79,7 @@ The window follows the Omarchy theme live: colors crossfade when `omarchy theme 
 
 ## Bar widget
 
-A 󰘮 icon appears in the bar's center section while a routine is on. Left or right click opens a popup listing what is on, when it started, when it ends, and what it restores, with an end button per routine and a switch for Omachord itself; j/k, Enter, x, and Esc work as in other Omarchy panels, and `o` opens the window. Middle click opens the window directly. Two settings live on the bar entry in `shell.json`:
+The transparent Omachord ring/keycap mark appears in the bar's center section while a routine is on. The bar and popup use the monochrome artwork in their own theme foreground colors, with no background tile. Left or right click opens a popup listing what is on, when it started, when it ends, and what it restores, with an end button per routine and a switch for Omachord itself; j/k, Enter, x, and Esc work as in other Omarchy panels, and `o` opens the window. Middle click opens the window directly. Two settings live on the bar entry in `shell.json`:
 
 ```bash
 omarchy bar set anothadev.omachord alwaysShow true --json   # keep the icon while nothing is on

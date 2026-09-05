@@ -17,6 +17,7 @@ rm -f -- "$OUT/routines.png" "$OUT/shortcuts.png" "$OUT/activity.png" \
 
 ln -s /usr/share/omarchy/shell/Commons "$WORK/Commons"
 ln -s /usr/share/omarchy/shell/Ui "$WORK/Ui"
+ln -s "$ROOT/assets" "$WORK/assets"
 for file in "$ROOT"/*.qml "$ROOT"/*.js; do
   ln -s "$file" "$WORK/$(basename -- "$file")"
 done

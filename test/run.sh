@@ -10,6 +10,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 "$ROOT/test/runner-test.sh"
 "$ROOT/test/runner-speed-test.sh"
 "$ROOT/test/qml-runtime-test.sh"
+bash "$ROOT/test/qml-bar-test.sh"
 "$ROOT/test/qml-service-test.sh"
 "$ROOT/test/qml-panel-enable-test.sh"
 node "$ROOT/test/model-test.mjs"
@@ -32,6 +33,7 @@ qmllint -I /usr/share/omarchy/shell \
   "$ROOT/Service.qml" \
   "$ROOT/ShortcutRecorder.qml" \
   "$ROOT/BarWidget.qml" \
+  "$ROOT/BrandIcon.qml" \
   "$ROOT/RoutinePopup.qml" \
   "$ROOT/ThemePalette.qml" \
   "$ROOT/KeyCap.qml" \
