@@ -22,7 +22,7 @@ jobs:
           bash -n bin/omachord test/*.sh
           perl -c bin/omachord-fs
           perl -c bin/omachord-action-supervisor
-          jq -e '.schemaVersion == 1 and .id == "anothadev.omachord" and .version == "0.3.3"' manifest.json >/dev/null
+          jq -e '.schemaVersion == 1 and .id == "anothadev.omachord" and .version == "0.4.0"' manifest.json >/dev/null
           if [[ ${GITHUB_REF_TYPE:-} == tag ]]; then
             test "$GITHUB_REF_NAME" = "v$(jq -r .version manifest.json)"
           fi

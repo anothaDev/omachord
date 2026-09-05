@@ -20,4 +20,4 @@ quickshell_version=$(quickshell --version 2>/dev/null | awk 'NR == 1 {print $2}'
 [[ $quickshell_version == 0.3.1 ]] \
   || fail "expected Quickshell 0.3.1, found ${quickshell_version:-unknown}"
 
-printf 'Dependency versions match the v0.3 release target.\n'
+printf 'Dependency versions match the v0.4 release target.\n'
