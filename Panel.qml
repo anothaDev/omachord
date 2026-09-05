@@ -73,6 +73,17 @@ Item {
   property bool actionStarted: false
   property bool revisionRefreshPending: false
   property bool revisionStarted: false
+  property string revisionRefreshPurpose: ""
+  // Saved-routine enable switches are optimistic. The intent map always holds
+  // the latest value a person asked for, including values changed again while
+  // an older batch is being written. `enableSubmitted` is the immutable slice
+  // owned by the one apply currently in flight.
+  property var enableIntents: ({})
+  property var enableSubmitted: ({})
+  property var enableCommittedConfig: null
+  property var enableSubmittedConfig: null
+  property var enableWarnings: []
+  property var enableDeactivated: []
   property string runningRoutineId: ""
   property date displayNow: new Date()
 
@@ -372,6 +383,7 @@ Item {
       refreshSupplemental()
       revisionRefreshPending = true
       revisionStarted = false
+      revisionRefreshPurpose = "draft"
       mutating = true
       requestRefreshProcess(revisionProc)
       return
@@ -452,6 +464,37 @@ Item {
     for (var i = 0; i < config.routines.length; i++)
       if (config.routines[i].id === id) return config.routines[i]
     return null
+  }
+
+  function mapOwns(map, key) {
+    return !!map && Object.prototype.hasOwnProperty.call(map, String(key))
+  }
+
+  function hasEnableIntents() {
+    return Object.keys(enableIntents || {}).length > 0
+  }
+
+  function routineEnablePending(id) {
+    return mapOwns(enableIntents, id)
+  }
+
+  // Applies intent values to a fresh clone, making the optimistic view and
+  // every submitted full-document payload derive from an explicit base.
+  function configWithEnableIntents(base, intents) {
+    var next = Model.clone(base)
+    if (!next || !Array.isArray(next.routines)) return next
+    for (var i = 0; i < next.routines.length; i++) {
+      var id = String(next.routines[i].id || "")
+      if (mapOwns(intents, id)) next.routines[i].enabled = intents[id] === true
+    }
+    return next
+  }
+
+  function syncSelectedRoutineFromConfig() {
+    if (!editorPersisted || !selectedRoutineId || routineEditor.dirty) return
+    var selected = routineById(selectedRoutineId)
+    if (selected) editorRoutine = Model.clone(selected)
+    else ensureRoutineSelection()
   }
 
   function selectRoutineNow(id, showEditor) {
@@ -563,6 +606,10 @@ Item {
   }
 
   function handleApplyResult(text, errorText, exitCode) {
+    if (mutationOperation === "enable-apply") {
+      handleEnableApplyResult(text, errorText, exitCode)
+      return
+    }
     if (!mutating || mutationOperation !== "apply") return
     var fallback = errorText || (exitCode === 0
       ? "The runner returned invalid JSON"
@@ -584,11 +631,12 @@ Item {
       pendingAfterApply = ""
       // Someone else saved first. Pick up the new revision and list without
       // touching the open draft, so the next Save applies it to the new base.
-      if (result.code === "stale-config") {
+      if (result.code === "stale-config" || result.code === "concurrent-edit") {
         showNotice("The configuration changed elsewhere. Refreshing the list and revision...", true)
         mutating = true
         revisionRefreshPending = true
         revisionStarted = false
+        revisionRefreshPurpose = "apply"
         requestRefreshProcess(revisionProc)
         routineEditor.externalError = noticeText
         return
@@ -628,6 +676,7 @@ Item {
   }
 
   function requestSetRoutineEnabled(id, enabled) {
+    if (!configLoaded || (mutating && mutationOperation !== "enable-apply")) return
     if (routineEditor.dirty) {
       pendingUiAction = "enabled"
       pendingUiValue = ({ id: id, enabled: enabled === true })
@@ -640,13 +689,159 @@ Item {
     setRoutineEnabled(id, enabled)
   }
 
-  // The list switch saves immediately once no open draft is at risk.
+  // List switches update the displayed config immediately. A short debounce
+  // folds nearby clicks into one full-document CAS apply; later clicks remain
+  // intents even if an older slice is already in flight.
   function setRoutineEnabled(id, enabled) {
     var routine = routineById(id)
-    if (!routine || mutating || !configLoaded) return
-    var next = Model.clone(routine)
-    next.enabled = enabled === true
-    applyConfig(Model.replaceRoutine(config, next), "", "")
+    if (!routine || !configLoaded || (mutating && mutationOperation !== "enable-apply")) return
+    if (mutationOperation !== "enable-apply") {
+      enableCommittedConfig = Model.clone(config)
+      enableWarnings = []
+      enableDeactivated = []
+      mutationOperation = "enable-apply"
+      mutating = true
+    }
+    var intents = Object.assign({}, enableIntents)
+    intents[String(id)] = enabled === true
+    enableIntents = intents
+    config = configWithEnableIntents(config, intents)
+    syncSelectedRoutineFromConfig()
+    enableApplyDebounce.restart()
+  }
+
+  function submitEnableBatch() {
+    if (!mutating || mutationOperation !== "enable-apply" || !configLoaded
+        || revisionRefreshPending || applyProc.running || enableSubmittedConfig !== null)
+      return
+    if (!hasEnableIntents()) {
+      finishEnableBatchSuccess()
+      return
+    }
+    enableSubmitted = Object.assign({}, enableIntents)
+    enableSubmittedConfig = Model.clone(config)
+    pendingPayload = JSON.stringify(enableSubmittedConfig)
+    applyStarted = false
+    clearNotice()
+    applyProc.command = [runnerPath, "config", "apply", configRevision]
+    startProcess(applyProc)
+  }
+
+  function clearSubmittedEnableIntents(base) {
+    var remaining = ({})
+    var current = enableIntents || {}
+    var submitted = enableSubmitted || {}
+    var routines = base && Array.isArray(base.routines) ? base.routines : []
+    var existing = ({})
+    for (var r = 0; r < routines.length; r++) existing[String(routines[r].id || "")] = true
+    for (var id in current) {
+      if (!mapOwns(current, id) || !mapOwns(existing, id)) continue
+      // An in-flight value is acknowledged only when it is still the latest
+      // request. A newer value for this same row must survive and be rebased.
+      if (mapOwns(submitted, id) && current[id] === submitted[id]) continue
+      remaining[id] = current[id] === true
+    }
+    enableIntents = remaining
+  }
+
+  function appendEnableResults(result) {
+    if (Array.isArray(result.warnings) && result.warnings.length)
+      enableWarnings = enableWarnings.concat(result.warnings)
+    if (Array.isArray(result.deactivated) && result.deactivated.length)
+      enableDeactivated = enableDeactivated.concat(result.deactivated)
+  }
+
+  function handleEnableApplyResult(text, errorText, exitCode) {
+    if (!mutating || mutationOperation !== "enable-apply") return
+    var fallback = errorText || (exitCode === 0
+      ? "The runner returned invalid JSON"
+      : "The runner could not save the routine switches")
+    var parsed = parseJson(text, null)
+    var result = exitCode === 0
+      ? (parsed || { ok: false, error: fallback })
+      : (parsed && parsed.ok === false ? parsed : { ok: false, error: fallback })
+    if (result.ok && typeof result.revision !== "string")
+      result = { ok: false, error: "The runner returned an invalid revision" }
+
+    pendingPayload = ""
+    if (!result.ok) {
+      enableSubmitted = ({})
+      enableSubmittedConfig = null
+      if (result.code === "stale-config" || result.code === "concurrent-edit") {
+        enableApplyDebounce.stop()
+        revisionRefreshPending = true
+        revisionStarted = false
+        revisionRefreshPurpose = "enable"
+        showNotice("The configuration changed elsewhere. Rebasing the pending routine switches...", false, true)
+        requestRefreshProcess(revisionProc)
+        return
+      }
+      failEnableBatch(result.error || "Could not save the routine switches")
+      return
+    }
+
+    var committed = result.config && result.config.version === 1
+      ? result.config : enableSubmittedConfig
+    appendEnableResults(result)
+    configRevision = result.revision
+    enableCommittedConfig = Model.clone(committed)
+    clearSubmittedEnableIntents(committed)
+    enableSubmitted = ({})
+    enableSubmittedConfig = null
+    config = configWithEnableIntents(committed, enableIntents)
+    syncSelectedRoutineFromConfig()
+    if (hasEnableIntents()) enableApplyDebounce.restart()
+    else finishEnableBatchSuccess()
+  }
+
+  function finishEnableBatchSuccess() {
+    enableApplyDebounce.stop()
+    var endedNames = []
+    var seen = ({})
+    for (var i = 0; i < enableDeactivated.length; i++) {
+      var id = String(enableDeactivated[i])
+      if (mapOwns(seen, id)) continue
+      seen[id] = true
+      endedNames.push(Model.nameFor(config, id))
+    }
+    var message = enableWarnings.length ? enableWarnings.join(" ")
+      : (endedNames.length ? "Saved. Ended " + endedNames.join(", ") + "." : "Saved")
+    enableIntents = ({})
+    enableSubmitted = ({})
+    enableCommittedConfig = null
+    enableSubmittedConfig = null
+    enableWarnings = []
+    enableDeactivated = []
+    pendingPayload = ""
+    mutationOperation = ""
+    mutating = false
+    showNotice(message, false)
+    ensureRoutineSelection()
+    requestRefreshProcess(bindingsProc)
+    requestRefreshProcess(logsProc)
+    requestRefreshProcess(statusProc)
+    if (!serviceLive) requestRefreshProcess(activeProc)
+  }
+
+  function failEnableBatch(message) {
+    enableApplyDebounce.stop()
+    if (enableCommittedConfig) config = Model.clone(enableCommittedConfig)
+    enableIntents = ({})
+    enableSubmitted = ({})
+    enableCommittedConfig = null
+    enableSubmittedConfig = null
+    enableWarnings = []
+    enableDeactivated = []
+    pendingPayload = ""
+    revisionRefreshPending = false
+    revisionStarted = false
+    revisionRefreshPurpose = ""
+    applyStarted = false
+    mutationOperation = ""
+    mutating = false
+    ensureRoutineSelection()
+    showNotice(message || "Could not save the routine switches", true)
+    routineEditor.externalError = noticeText
   }
 
   function duplicateRoutine(id) {
@@ -675,24 +870,53 @@ Item {
   }
 
   function runRoutine(id) {
-    if (actionProc.running || !id || !configLoaded || !editorPersisted) return
-    runningRoutineId = id
+    if (!id || !configLoaded || !editorPersisted || routineActionBlocked(id)) return
     showNotice((activeIds[id] ? "Ending " : "Running ") + Model.nameFor(config, id) + "...", false, true)
+    if (service && (typeof service.testRoutine === "function"
+        || typeof service.toggleRoutine === "function")) {
+      var queued = typeof service.testRoutine === "function"
+        ? service.testRoutine(id) : service.toggleRoutine(id)
+      if (!queued) showNotice("The routine queue is full", true)
+      return
+    }
+    runningRoutineId = id
     actionProc.command = [runnerPath, "run", id, "test"]
     actionStarted = false
     startProcess(actionProc)
   }
 
+  function serviceRoutineBusy(id) {
+    if (!service) return false
+    if (typeof service.routineBusy === "function") return service.routineBusy(id)
+    return service.manualBusy === true
+  }
+
+  function serviceConnectionBusy() {
+    if (!service) return false
+    if (service.connectionBusy !== undefined) return service.connectionBusy === true
+    return service.manualBusy === true
+  }
+
+  function routineActionBusy(id) {
+    return serviceRoutineBusy(id)
+      || (actionProc.running && runningRoutineId === String(id || ""))
+  }
+
+  function routineActionBlocked(id) {
+    if (actionProc.running && runningRoutineId === String(id || "")) return true
+    if (service) return serviceConnectionBusy() || serviceRoutineBusy(id)
+    return actionProc.running
+  }
+
   // Ending from the Activity list goes through the service when it is loaded
   // (the same path the bar widget uses); otherwise the runner directly.
   function endRoutine(id) {
-    if (!id || !activeIds[id]) return
+    if (!id || !activeIds[id] || routineActionBlocked(id)) return
     if (service && typeof service.endRoutine === "function") {
       showNotice("Ending " + Model.nameFor(config, id) + "...", false, true)
-      service.endRoutine(id)
+      if (!service.endRoutine(id)) showNotice("The routine queue is full", true)
       return
     }
-    if (actionProc.running) return
     runningRoutineId = id
     showNotice("Ending " + Model.nameFor(config, id) + "...", false, true)
     actionProc.command = [runnerPath, "deactivate", id, "manual"]
@@ -811,10 +1035,35 @@ Item {
 
   function handleRevisionResult(text, errorText, exitCode) {
     if (!revisionRefreshPending) return
+    var purpose = revisionRefreshPurpose
     revisionRefreshPending = false
     revisionStarted = false
-    mutating = false
+    revisionRefreshPurpose = ""
     var parsed = exitCode === 0 ? parseJson(text, null) : null
+    if (purpose === "enable") {
+      if (parsed && parsed.ok && parsed.committed === true && parsed.config
+          && parsed.config.version === 1 && typeof parsed.revision === "string") {
+        enableCommittedConfig = Model.clone(parsed.config)
+        configRevision = parsed.revision
+        // Drop intents for routines removed elsewhere; every surviving latest
+        // value is overlaid onto the newly committed full-document base.
+        var rebased = ({})
+        for (var i = 0; i < parsed.config.routines.length; i++) {
+          var id = String(parsed.config.routines[i].id || "")
+          if (mapOwns(enableIntents, id)) rebased[id] = enableIntents[id] === true
+        }
+        enableIntents = rebased
+        config = configWithEnableIntents(parsed.config, enableIntents)
+        syncSelectedRoutineFromConfig()
+        if (hasEnableIntents()) enableApplyDebounce.restart()
+        else finishEnableBatchSuccess()
+      } else {
+        failEnableBatch("The configuration changed elsewhere, but its latest revision could not be loaded. Pending routine switches were rolled back."
+          + (errorText ? " " + errorText : ""))
+      }
+      return
+    }
+    mutating = false
     if (parsed && parsed.ok && parsed.committed === true && parsed.config
         && parsed.config.version === 1 && typeof parsed.revision === "string") {
       var changed = parsed.revision !== configRevision
@@ -862,6 +1111,13 @@ Item {
     interval: 4000
     repeat: false
     onTriggered: if (!root.noticeError) root.noticeText = ""
+  }
+
+  Timer {
+    id: enableApplyDebounce
+    interval: 75
+    repeat: false
+    onTriggered: root.submitEnableBatch()
   }
 
   Timer {
@@ -1073,7 +1329,9 @@ Item {
     }
     onRunningChanged: {
       if (!running) stdinEnabled = true
-      if (!running && root.mutating && root.mutationOperation === "apply" && !root.applyStarted)
+      if (!running && root.mutating
+          && (root.mutationOperation === "apply" || root.mutationOperation === "enable-apply")
+          && !root.applyStarted)
         Qt.callLater(function() {
           root.handleApplyResult("", "Could not start the Omachord runner", -1)
         })
@@ -1773,6 +2031,7 @@ Item {
                           readonly property bool isSelected: modelData.id === root.selectedRoutineId
                           readonly property bool isOn: !!root.activeIds[modelData.id]
                           readonly property bool isDirty: isSelected && routineEditor.dirty
+                          readonly property bool enablePending: root.routineEnablePending(modelData.id)
                           readonly property bool hot: ListView.isCurrentItem && ListView.view.activeFocus
                           readonly property var lastRun: root.lastRunFor(modelData.id)
                           width: routineList.width
@@ -1851,7 +2110,8 @@ Item {
                                 textFormat: Text.PlainText
                                 width: parent.width
                                 visible: text !== ""
-                                text: routineRow.isDirty ? "UNSAVED"
+                                text: routineRow.enablePending ? "SAVING"
+                                  : (routineRow.isDirty ? "UNSAVED"
                                   : (routineRow.isOn ? "ON" + (root.activeIds[routineRow.modelData.id].expiresAt
                                       ? " · UNTIL " + Conditions.clockTime(root.activeIds[routineRow.modelData.id].expiresAt) : "")
                                     : (Model.isStateful(routineRow.routine) ? "MODE" : "")
@@ -1859,8 +2119,8 @@ Item {
                                         ? (Model.isStateful(routineRow.routine) ? " · " : "")
                                           + (routineRow.lastRun.status === "failed" ? "FAILED " : "RAN ")
                                           + Conditions.relativeTime(routineRow.lastRun.timestamp, root.displayNow).toUpperCase()
-                                        : ""))
-                                color: routineRow.isDirty ? root.accent
+                                        : "")))
+                                color: routineRow.enablePending || routineRow.isDirty ? root.accent
                                   : (routineRow.isOn ? root.enabledGreen
                                     : (routineRow.lastRun && routineRow.lastRun.status === "failed" ? root.urgent : root.subtle))
                                 font.family: Style.font.family
@@ -1875,20 +2135,25 @@ Item {
                               id: enabledSwitch
                               anchors.verticalCenter: parent.verticalCenter
                               checked: routineRow.modelData.enabled
-                              interactive: root.configLoaded && !root.mutating
+                              // `busy` would swallow a second click. Keep the switch
+                              // live so the same row can supersede its in-flight value;
+                              // the row's SAVING label carries the pending state.
+                              interactive: root.configLoaded && (!root.mutating || root.mutationOperation === "enable-apply")
                               foreground: root.fg
                               accent: root.accent
                               cursorRing: false
                               onToggled: root.requestSetRoutineEnabled(routineRow.modelData.id, !checked)
                               Accessible.role: Accessible.CheckBox
                               Accessible.name: (checked ? "Turn off " : "Turn on ") + routineRow.modelData.name
+                              Accessible.description: routineRow.enablePending ? "Saving latest choice" : ""
                               Accessible.checkable: true
                               Accessible.checked: checked
                               Accessible.onPressAction: root.requestSetRoutineEnabled(routineRow.modelData.id, !checked)
                               PanelToolTip {
                                 visible: parent.containsMouse
-                                text: parent.checked ? "Enabled: shortcuts, events, and conditions may start it"
-                                  : "Disabled: nothing starts it until you turn it on"
+                                text: (routineRow.enablePending ? "Saving latest choice. " : "")
+                                  + (parent.checked ? "Enabled: shortcuts, events, and conditions may start it"
+                                    : "Disabled: nothing starts it until you turn it on")
                               }
                             }
                           }
@@ -1931,8 +2196,8 @@ Item {
                       activeRecord: root.editorRoutine ? (root.activeIds[root.editorRoutine.id] || null) : null
                       serviceState: root.editorRoutine ? root.serviceRoutineState(root.editorRoutine.id) : null
                       targetWindow: window
-                      busy: root.uiLocked
-                      running: actionProc.running
+                      busy: root.uiLocked || root.serviceConnectionBusy()
+                      running: root.editorRoutine ? root.routineActionBusy(root.editorRoutine.id) : false
                       persisted: root.editorPersisted
                       showBack: root.compact
                       foreground: root.fg
@@ -2083,7 +2348,7 @@ Item {
                             focusable: true
                             foreground: root.fg
                             accent: root.accent
-                            enabled: !root.mutating && !(root.service && root.service.manualBusy) && !actionProc.running
+                            enabled: !root.mutating && !root.routineActionBlocked(activeRow.modelData.id)
                             opacity: enabled ? 1 : 0.6
                             onClicked: root.endRoutine(activeRow.modelData.id)
                             Accessible.role: Accessible.Button

@@ -920,6 +920,31 @@ sub secure_file {
   return $file;
 }
 
+sub prepare_state {
+  my ($path, $include_runtime) = @_;
+  walk_directory($path, 1, "private", 1);
+
+  for my $name (qw(
+      config.lock
+      log.lock
+      runs.jsonl
+      connection.json
+      connection.disabled.json
+      config.commit.json
+      bar-widget.json
+  )) {
+    secure_file("$path/$name", "600", 1, 0);
+  }
+
+  my @directories = qw(backups conflicts retired active);
+  push @directories, "runtime" if $include_runtime;
+  for my $name (@directories) {
+    my $directory = "$path/$name";
+    next unless lstat($directory);
+    walk_directory($directory, 0, "private", 1);
+  }
+}
+
 sub unique_write {
   my ($directory_path, $prefix, $mode_text) = @_;
   local $ACTIVE_SYNC_PATH = $directory_path;
@@ -1031,6 +1056,16 @@ if ($command eq "prepare-dir") {
   my $path = shift // abort_operation("usage", "Missing directory path");
   abort_operation("usage", "Unexpected arguments") if @ARGV;
   walk_directory($path, 1, "private", 1);
+  exit 0;
+}
+
+if ($command eq "prepare-state") {
+  my $path = shift // abort_operation("usage", "Missing state directory path");
+  my $runtime = shift;
+  abort_operation("usage", "Invalid prepare-state option")
+    if defined($runtime) && $runtime ne "fallback-runtime";
+  abort_operation("usage", "Unexpected arguments") if @ARGV;
+  prepare_state($path, defined($runtime));
   exit 0;
 }
 

@@ -59,13 +59,22 @@ Item {
   property var lastResult: null
   property real lastTick: Date.now()
   property real lastReconcile: 0
-  // Manual start/end requests from the panel or bar widget. They run through
-  // their own process so a person's request never waits behind, or reorders,
-  // the condition queue; the runner's locks arbitrate the rest.
+  // Manual start/end requests from the panel or bar widget use a small keyed
+  // worker pool. Different routines can overlap, while requests for the same
+  // routine remain ordered and connection changes form a global barrier.
   property var manualQueue: []
+  property var manualInFlight: ({})
+  // A completed routine stays keyed until an authoritative active-state probe
+  // has observed it. This prevents a queued toggle or condition transition
+  // from making a decision against the pre-action snapshot.
+  property var manualSettling: ({})
   property var manualJob: null
   property var lastManualResult: null
-  readonly property bool manualBusy: manualJob !== null || manualQueue.length > 0
+  readonly property int maxManualWorkers: 4
+  readonly property var manualPendingIds: buildManualPendingIds(manualQueue, manualInFlight, manualSettling)
+  readonly property var routinePendingIds: buildRoutinePendingIds(manualPendingIds, currentJob)
+  readonly property bool connectionBusy: manualJob !== null || connectionQueued(manualQueue)
+  readonly property bool manualBusy: connectionBusy || Object.keys(manualPendingIds).length > 0
   readonly property var activeList: buildActiveList(active, routineMeta)
   readonly property int activeCount: activeList.length
 
@@ -166,6 +175,7 @@ Item {
     process.startPending = false
     if (kind === "status") applyStatus(null)
     else if (kind === "config") applyConfig(null)
+    else if (kind === "active") settleManualActive(process.generation + 1)
     finishRefresh(process)
     scheduleEvaluate()
   }
@@ -329,6 +339,7 @@ Item {
     awaitingDeactivation = waiting
     active = next
     activeLoaded = true
+    settleManualActive(generation)
   }
 
   function applyToggles(names) {
@@ -462,7 +473,12 @@ Item {
       pending = []
       return
     }
+    // A connection change rewrites global integration files and must not race
+    // routine execution. Manual work for the same routine also has priority:
+    // it represents a person's newer, explicit request.
+    if (connectionBusy) return
     var job = pending[0]
+    if (manualPendingIds[job.id]) return
     pending = pending.slice(1)
     if (job.revision !== configRevision) {
       logEvent("runner-discard", job.op + " " + job.id + " stale revision")
@@ -513,6 +529,7 @@ Item {
       if (parsed && parsed.code === "stale-config") refresh(configProc)
     }
     refresh(activeProc)
+    runNextManual()
   }
 
   // ------------------------------------------------------- manual requests
@@ -542,51 +559,180 @@ Item {
     return /^[a-z0-9]+(-[a-z0-9]+)*$/.test(String(id || ""))
   }
 
+  function connectionQueued(queue) {
+    var jobs = queue || []
+    for (var i = 0; i < jobs.length; i++)
+      if (jobs[i] && jobs[i].id === "") return true
+    return false
+  }
+
+  function buildManualPendingIds(queue, inFlight, settling) {
+    var result = Object.create(null)
+    var jobs = queue || []
+    for (var i = 0; i < jobs.length; i++) {
+      var id = jobs[i] ? String(jobs[i].id || "") : ""
+      if (id) result[id] = true
+    }
+    var running = inFlight || ({})
+    for (var id in running) result[id] = true
+    var awaitingProbe = settling || ({})
+    for (var pendingId in awaitingProbe) result[pendingId] = true
+    return result
+  }
+
+  function settleManualActive(generation) {
+    var next = Object.assign({}, manualSettling)
+    var changed = false
+    for (var id in next) {
+      if (Number(next[id]) > generation) continue
+      delete next[id]
+      changed = true
+    }
+    if (!changed) return
+    manualSettling = next
+    runNextManual()
+  }
+
+  function buildRoutinePendingIds(manualIds, conditionJob) {
+    var result = Object.assign(Object.create(null), manualIds || ({}))
+    if (conditionJob && conditionJob.id) result[String(conditionJob.id)] = true
+    return result
+  }
+
+  function routineBusy(id) {
+    var routineId = String(id || "")
+    return !!routineId && routinePendingIds[routineId] === true
+  }
+
+  function manualWorkers() {
+    return [manualWorker0, manualWorker1, manualWorker2, manualWorker3].slice(0, maxManualWorkers)
+  }
+
+  function idleManualWorker() {
+    var workers = manualWorkers()
+    for (var i = 0; i < workers.length; i++)
+      if (!workers[i].job && !workers[i].running) return workers[i]
+    return null
+  }
+
+  function startManualRoutine(worker, job) {
+    worker.job = job
+    var next = Object.assign({}, manualInFlight)
+    next[job.id] = job
+    manualInFlight = next
+    logEvent("manual-start", job.op + " " + job.id)
+    worker.command = [root.runnerPath, job.op, job.id, job.source || "manual"]
+    worker.startPending = true
+    worker.running = true
+  }
+
   function endRoutine(id) { return enqueueManual("deactivate", id) }
   function startRoutine(id) { return enqueueManual("activate", id) }
   function toggleRoutine(id) { return enqueueManual("run", id) }
+  // The editor's Run button deliberately accepts disabled routines so they
+  // can be tested before their triggers and conditions are enabled.
+  function testRoutine(id) { return enqueueManual("run", id, "test") }
   // The bar switch turns the whole integration on or off; the window keeps
   // its own confirmation for the same call.
   function requestConnect() { return enqueueManual("connect", "") }
   function requestDisconnect() { return enqueueManual("disconnect", "") }
 
-  function enqueueManual(op, id) {
+  function enqueueManual(op, id, requestedSource) {
     var routineId = String(id || "")
     var connection = op === "connect" || op === "disconnect"
+    var source = !connection && op === "run" && requestedSource === "test" ? "test" : "manual"
     if (!connection && !isRoutineId(routineId)) return false
     if (!connection && op !== "deactivate" && op !== "activate" && op !== "run") return false
-    for (var i = 0; i < manualQueue.length; i++)
-      if (manualQueue[i].op === op && manualQueue[i].id === routineId) return true
-    manualQueue = manualQueue.concat([{ op: op, id: routineId }])
+    // Preserve every accepted request. In particular, `run` is a toggle and
+    // start -> end -> start for one id must not lose its final intent merely
+    // because an equal operation is already in flight. Per-id scheduling
+    // below provides ordering; maxPending provides the bound.
+    if (manualQueue.length >= maxPending) return false
+    manualQueue = manualQueue.concat([{ op: op, id: routineId, source: source }])
     runNextManual()
     return true
   }
 
   function runNextManual() {
     if (manualProc.running || manualJob || !manualQueue.length) return
-    manualJob = manualQueue[0]
-    manualQueue = manualQueue.slice(1)
-    logEvent("manual-start", manualJob.op + " " + manualJob.id)
-    manualProc.command = manualJob.id === ""
-      ? [root.runnerPath, manualJob.op]
-      : [root.runnerPath, manualJob.op, manualJob.id, "manual"]
-    manualProc.running = true
+
+    var barrier = -1
+    for (var i = 0; i < manualQueue.length; i++) {
+      if (manualQueue[i].id === "") { barrier = i; break }
+    }
+
+    // Connection mutations run alone. A queued one also prevents condition
+    // work from jumping the barrier via runNext().
+    if (barrier === 0) {
+      if (Object.keys(manualInFlight).length || runnerProc.running || currentJob) return
+      manualJob = manualQueue[0]
+      manualQueue = manualQueue.slice(1)
+      logEvent("manual-start", manualJob.op)
+      manualProc.command = [root.runnerPath, manualJob.op]
+      manualProc.running = true
+      return
+    }
+
+    var prefix = barrier < 0 ? manualQueue.slice() : manualQueue.slice(0, barrier)
+    var suffix = barrier < 0 ? [] : manualQueue.slice(barrier)
+    var kept = []
+    var occupied = Object.create(null)
+    for (var runningId in manualInFlight) occupied[runningId] = true
+    for (var settlingId in manualSettling) occupied[settlingId] = true
+    if (currentJob) occupied[currentJob.id] = true
+
+    for (var p = 0; p < prefix.length; p++) {
+      var job = prefix[p]
+      var worker = occupied[job.id] ? null : idleManualWorker()
+      if (!worker) {
+        kept.push(job)
+        occupied[job.id] = true
+        continue
+      }
+      occupied[job.id] = true
+      startManualRoutine(worker, job)
+    }
+    manualQueue = kept.concat(suffix)
   }
 
-  function finishManual(text, exitCode) {
-    var job = manualJob
-    manualJob = null
+  function manualResult(text, exitCode) {
     var parsed = parseJson(text, null)
-    var result = exitCode === 0 && parsed ? parsed : (parsed && parsed.ok === false ? parsed
+    return exitCode === 0 && parsed ? parsed : (parsed && parsed.ok === false ? parsed
       : { ok: false, error: "runner exited " + exitCode })
+  }
+
+  function reportManualFinished(job, result, exitCode) {
     lastManualResult = result
+    if (!job) return
+    logEvent("manual-exit", job.op + " " + job.id + " " + (result.ok ? "ok" : "failed: " + (result.error || exitCode)))
+    manualFinished(job, result)
+  }
+
+  function finishManualRoutine(worker, text, exitCode) {
+    var job = worker.job
+    worker.job = null
+    worker.startPending = false
     if (job) {
-      logEvent("manual-exit", job.op + " " + job.id + " " + (result.ok ? "ok" : "failed: " + (result.error || exitCode)))
-      manualFinished(job, result)
+      var settling = Object.assign({}, manualSettling)
+      settling[job.id] = activeProc.generation + 1
+      manualSettling = settling
+      var next = Object.assign({}, manualInFlight)
+      delete next[job.id]
+      manualInFlight = next
     }
+    reportManualFinished(job, manualResult(text, exitCode), exitCode)
     refresh(activeProc)
     refresh(logsProc)
-    if (job && job.id === "") refresh(statusProc)
+    runNextManual()
+  }
+
+  function finishManualConnection(text, exitCode) {
+    var job = manualJob
+    manualJob = null
+    reportManualFinished(job, manualResult(text, exitCode), exitCode)
+    refresh(activeProc)
+    refresh(logsProc)
+    refresh(statusProc)
     runNextManual()
   }
 
@@ -620,7 +766,7 @@ Item {
       activeCount: Object.keys(active).length,
       queue: pending.length,
       running: runnerProc.running,
-      manualQueue: manualQueue.length + (manualJob ? 1 : 0),
+      manualQueue: manualQueue.length + Object.keys(manualInFlight).length + (manualJob ? 1 : 0),
       lastEvent: lastEvent,
       lastEventAt: lastEventAt,
       lastResult: lastResult
@@ -684,10 +830,17 @@ Item {
     stdout: StdioCollector { id: activeStdout; waitForEnd: true }
     onExited: function(exitCode) {
       activeProc.startPending = false
+      var applied = false
       if (exitCode === 0) {
         var parsed = root.parseJson(activeStdout.text, null)
-        if (Array.isArray(parsed)) root.applyActive(parsed, activeProc.generation)
+        if (Array.isArray(parsed)) {
+          root.applyActive(parsed, activeProc.generation)
+          applied = true
+        }
       }
+      // Never leave a row permanently busy if the follow-up probe itself
+      // fails; the periodic reconciliation will make another attempt.
+      if (!applied) root.settleManualActive(activeProc.generation)
       root.finishRefresh(activeProc)
       root.scheduleEvaluate()
     }
@@ -756,15 +909,79 @@ Item {
     id: manualProc
     stdout: StdioCollector { id: manualStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      root.finishManual(manualStdout.text, exitCode)
+      root.finishManualConnection(manualStdout.text, exitCode)
     }
     onRunningChanged: {
       if (!running && root.manualJob) {
         Qt.callLater(function() {
-          if (root.manualJob && !manualProc.running) root.finishManual("", -1)
+          if (root.manualJob && !manualProc.running) root.finishManualConnection("", -1)
         })
       }
     }
+  }
+
+  Process {
+    id: manualWorker0
+    property var job: null
+    property bool startPending: false
+    stdout: StdioCollector { id: manualWorkerStdout0; waitForEnd: true }
+    onStarted: startPending = false
+    onExited: function(exitCode) {
+      root.finishManualRoutine(manualWorker0, manualWorkerStdout0.text, exitCode)
+    }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (manualWorker0.startPending && !manualWorker0.running)
+          root.finishManualRoutine(manualWorker0, "", -1)
+      })
+  }
+
+  Process {
+    id: manualWorker1
+    property var job: null
+    property bool startPending: false
+    stdout: StdioCollector { id: manualWorkerStdout1; waitForEnd: true }
+    onStarted: startPending = false
+    onExited: function(exitCode) {
+      root.finishManualRoutine(manualWorker1, manualWorkerStdout1.text, exitCode)
+    }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (manualWorker1.startPending && !manualWorker1.running)
+          root.finishManualRoutine(manualWorker1, "", -1)
+      })
+  }
+
+  Process {
+    id: manualWorker2
+    property var job: null
+    property bool startPending: false
+    stdout: StdioCollector { id: manualWorkerStdout2; waitForEnd: true }
+    onStarted: startPending = false
+    onExited: function(exitCode) {
+      root.finishManualRoutine(manualWorker2, manualWorkerStdout2.text, exitCode)
+    }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (manualWorker2.startPending && !manualWorker2.running)
+          root.finishManualRoutine(manualWorker2, "", -1)
+      })
+  }
+
+  Process {
+    id: manualWorker3
+    property var job: null
+    property bool startPending: false
+    stdout: StdioCollector { id: manualWorkerStdout3; waitForEnd: true }
+    onStarted: startPending = false
+    onExited: function(exitCode) {
+      root.finishManualRoutine(manualWorker3, manualWorkerStdout3.text, exitCode)
+    }
+    onRunningChanged: if (!running && startPending)
+      Qt.callLater(function() {
+        if (manualWorker3.startPending && !manualWorker3.running)
+          root.finishManualRoutine(manualWorker3, "", -1)
+      })
   }
 
   Process {
