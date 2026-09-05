@@ -20,6 +20,7 @@ use JSON::PP qw(encode_json);
 our $ACTIVE_SYNC_PATH = "";
 our $SYNC_COUNT = 0;
 our $FINGERPRINT_COUNT = 0;
+our @RECOVERY_ENTRIES;
 
 sub abort_operation {
   die Omachord::FsError->new(@_);
@@ -338,7 +339,7 @@ sub file_open_state {
 
 sub archive_entry {
   my ($source_directory, $source_name, $destination, $kind, $archive_root, $stable,
-      $open_state) = @_;
+      $open_state, $progress) = @_;
   my $source = component_path($source_directory, $source_name);
   if ($kind eq "retired" && defined($stable)) {
     my $current = eval { fingerprint_entry($source_directory, $source_name, $destination, 0) };
@@ -387,12 +388,25 @@ sub archive_entry {
     $target = component_path($archive, $target_name);
     return $source_display unless link($source, $target);
   }
+  # Publish the surviving locator before any fallible sync or source removal.
+  # The hard link preserves the inode, including later writes through held FDs.
+  # Callers retain this progress even if the source-directory sync throws.
+  if ($progress) {
+    my @identity = lstat($target);
+    $progress->{path} = "$archive_display/$target_name";
+    $progress->{device} = "$identity[0]" if @identity;
+    $progress->{inode} = "$identity[1]" if @identity;
+  }
   my $target_file = open_regular_entry($archive, $target_name,
     "$archive_display/$target_name", 0);
   sync_handle($target_file, "archived file $archive_display/$target_name");
+  $progress->{archiveFileSynced} = JSON::PP::true if $progress;
   sync_handle($archive, "archive directory $archive_display");
+  $progress->{archiveDirectorySynced} = JSON::PP::true if $progress;
   unlink_entry($source_directory, $source_name, $destination);
+  $progress->{sourceRemoved} = JSON::PP::true if $progress;
   sync_handle($source_directory, "directory containing $destination");
+  $progress->{sourceDirectorySynced} = JSON::PP::true if $progress;
   return "$archive_display/$target_name";
 }
 
@@ -507,14 +521,28 @@ sub entry_display_path {
 
 sub preserve_entry {
   my ($directory, $name, $destination, $archive_root) = @_;
-  return unless lstat(component_path($directory, $name));
-  my $preserved = entry_display_path($destination, $name);
-  eval {
-    my $archived = archive_entry($directory, $name, $destination, "conflicts",
-      "$archive_root/conflicts", undef);
-    $preserved = $archived if defined $archived;
+  my @identity = lstat(component_path($directory, $name));
+  return unless @identity;
+  my $progress = {
+    path => entry_display_path($destination, $name),
+    device => "$identity[0]", inode => "$identity[1]",
+    archiveFileSynced => JSON::PP::false, archiveDirectorySynced => JSON::PP::false,
+    sourceRemoved => JSON::PP::false, sourceDirectorySynced => JSON::PP::false,
   };
-  return $preserved;
+  my $ok = eval {
+    archive_entry($directory, $name, $destination, "conflicts",
+      "$archive_root/conflicts", undef, undef, $progress);
+    1;
+  };
+  if (!$ok) {
+    my $error = $@;
+    $progress->{warning} = ref($error) eq "Omachord::FsError"
+      ? $error->{error} : "Conflict archive cleanup failed";
+  }
+  # Retain every preserved version, including callers whose primary return
+  # value describes a different rollback object. Keep `preserved` compatible.
+  push @RECOVERY_ENTRIES, $progress;
+  return $progress->{path};
 }
 
 sub entry_matches_stage {
@@ -780,9 +808,8 @@ sub publish_cas {
     abort_operation("parent-changed", "The parent directory changed while publishing $destination", $preserved);
   }
   # Publication is committed after the verified file and directory sync above.
-  # Retirement is best-effort: on any cleanup error the old inode remains at
-  # its descriptor-relative transaction name instead of making the outcome
-  # ambiguous to the caller.
+  # Retirement is best-effort: on cleanup error the old inode remains at its
+  # transaction or archive name without making the committed outcome ambiguous.
   close $stage;
   eval {
     archive_entry($directory, $temporary, $destination, "retired",
@@ -1074,12 +1101,17 @@ sub list_toggles {
 }
 
 sub run_json_operation {
+  local @RECOVERY_ENTRIES;
   my ($operation) = @_;
   my $result;
   my $ok = eval { $result = $operation->(); 1 };
   if (!$ok) {
     my $error = $@;
     if (ref($error) eq "Omachord::FsError") {
+      if (@RECOVERY_ENTRIES) {
+        $error->{recovery} = [@RECOVERY_ENTRIES];
+        $error->{preserved} //= $RECOVERY_ENTRIES[0]->{path};
+      }
       print encode_json({ ok => JSON::PP::false, %$error }), "\n";
     } else {
       print encode_json({ ok => JSON::PP::false, code => "io-error",

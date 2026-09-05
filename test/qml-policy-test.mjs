@@ -39,10 +39,10 @@ assert.match(panel, /\[runnerPath, operation, configRevision\]/,
   "Connect and Repair must send the loaded config revision")
 assert.match(panel, /parsed\.committed === true/,
   "the panel must not treat uncommitted snapshots as persisted")
-assert.match(panel, /enabled: \(root\.configLoaded \|\| root\.configUncommitted\) && !root\.loading && !root\.mutating/,
-  "Connect and Repair must stay available when the configuration is valid but not yet committed")
-assert.match(panel, /!\(configLoaded \|\| configUncommitted\)/,
-  "mutateConnection must accept an uncommitted configuration so Repair can commit it")
+assert.match(panel, /enabled: root\.configLoaded && !root\.loading && !root\.mutating/,
+  "Repair must remain unavailable for unseen uncommitted executable content")
+assert.match(panel, /operation === "connect" && !configLoaded/,
+  "the connection boundary must reject approval of unreviewed config")
 assert.match(panel, /The list and revision were refreshed; save again to apply this draft/,
   "stale-save recovery must confirm revision refresh before inviting another save")
 assert.match(panel, /latest revision could not be loaded\. Use Refresh before saving again/,
@@ -63,15 +63,15 @@ assert.match(panel, /id: navigationCopy[\s\S]*?x: root\.compact[\s\S]*?navigatio
   "sidebar copy must use explicit compact positioning instead of swapping anchors after launch")
 assert.match(panel, /function requestSetRoutineEnabled[\s\S]*?routineEditor\.dirty[\s\S]*?showConfirmation/,
   "list switches must confirm before replacing an unsaved routine draft")
-assert.match(panel, /property var enableIntents: \(\{\}\)[\s\S]*?property var enableSubmitted: \(\{\}\)/,
+assert.match(panel, /property var enableIntents: Object\.create\(null\)[\s\S]*?property var enableSubmitted: Object\.create\(null\)/,
   "saved-routine switches must retain latest intents separately from the in-flight batch")
 assert.match(panel, /id: enableApplyDebounce\s*\n\s*interval: 75[\s\S]*?onTriggered: root\.submitEnableBatch\(\)/,
   "saved-routine switches must use a short deterministic batching window")
 assert.match(panel, /function setRoutineEnabled[\s\S]*?enableIntents = intents[\s\S]*?config = configWithEnableIntents\(config, intents\)[\s\S]*?enableApplyDebounce\.restart\(\)/,
   "a saved-routine switch must update optimistically before scheduling persistence")
-assert.match(panel, /function submitEnableBatch[\s\S]*?applyProc\.running \|\| enableSubmittedConfig !== null[\s\S]*?enableSubmitted = Object\.assign\(\{\}, enableIntents\)[\s\S]*?startProcess\(applyProc\)/,
+assert.match(panel, /function submitEnableBatch[\s\S]*?applyProc\.running \|\| enableSubmittedConfig !== null[\s\S]*?enableSubmitted = Object\.assign\(Object\.create\(null\), enableIntents\)[\s\S]*?startProcess\(applyProc\)/,
   "enable batching must snapshot latest intents and keep exactly one config apply in flight")
-assert.match(panel, /mapOwns\(submitted, id\) && current\[id\] === submitted\[id\]\) continue/,
+assert.match(panel, /mapOwns\(submitted, id\) && current\[id\]\.enabled === submitted\[id\]\.enabled[\s\S]*?current\[id\]\.definition === submitted\[id\]\.definition\) continue/,
   "an enable apply must acknowledge only submitted values that are still current")
 assert.match(panel, /enableCommittedConfig = Model\.clone\(committed\)[\s\S]*?clearSubmittedEnableIntents\(committed\)[\s\S]*?config = configWithEnableIntents\(committed, enableIntents\)/,
   "newer switch intents must rebase on each successfully committed batch")
@@ -79,7 +79,7 @@ assert.match(panel, /result\.code === "stale-config"[\s\S]*?revisionRefreshPurpo
   "stale enable batches must refresh their base before retrying")
 assert.match(panel, /purpose === "enable"[\s\S]*?enableCommittedConfig = Model\.clone\(parsed\.config\)[\s\S]*?configWithEnableIntents\(parsed\.config, enableIntents\)[\s\S]*?enableApplyDebounce\.restart\(\)/,
   "stale enable intents must be rebased on the refreshed config and revision")
-assert.match(panel, /function failEnableBatch[\s\S]*?config = Model\.clone\(enableCommittedConfig\)[\s\S]*?enableIntents = \(\{\}\)/,
+assert.match(panel, /function failEnableBatch[\s\S]*?config = Model\.clone\(enableCommittedConfig\)[\s\S]*?enableIntents = Object\.create\(null\)/,
   "a hard enable-save failure must roll back optimistic values")
 assert.match(panel, /interactive: root\.configLoaded && \(!root\.mutating \|\| root\.mutationOperation === "enable-apply"\)/,
   "unrelated enable switches must remain available while a serialized batch is in flight")
