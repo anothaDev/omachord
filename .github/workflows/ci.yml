@@ -80,6 +80,7 @@ jobs:
         run: |
           runuser -u test-runner -- test/runner-test.sh
           runuser -u test-runner -- test/authorization-test.sh
+          runuser -u test-runner -- test/manual-revision-test.sh
           runuser -u test-runner -- python3 test/automatic-trigger-test.py
           runuser -u test-runner -- python3 test/runner-parsing-staging-test.py
           runuser -u test-runner -- python3 test/panel-capture-test.py

@@ -242,8 +242,8 @@ The status names every active routine and, for each condition routine, one `deta
 | `omachord config snapshot` | Read configuration with its compare-and-swap revision |
 | `omachord config validate` | Validate candidate JSON from stdin without saving |
 | `omachord config apply <revision>` | Apply candidate JSON from stdin only if the loaded revision still matches |
-| `omachord run <id> [manual\|shortcut\|test]` | Run a routine; toggles a stateful routine |
-| `omachord activate <id> [manual\|shortcut\|test]` | Activate without toggling; already-active routines report `alreadyActive` |
+| `omachord run <id> [source [revision]]` | Run a routine; toggles a stateful routine; an optional reviewed revision must still match |
+| `omachord activate <id> [source [revision]]` | Activate without toggling; manual/test callers may bind a reviewed revision |
 | `omachord deactivate <id> [manual\|shortcut\|test]` | End a routine from its activation record |
 | `omachord active` | List activation records |
 | `omachord recovery inspect <id>` | Inspect an activation record and its recovery revision |
@@ -287,6 +287,7 @@ Routines are trusted local configuration and are not sandboxed.
 - A theme setter makes Omarchy fire its `theme-set` hook, which re-enters the runner. The per-routine lock reports the originating routine as busy, so a routine cannot recurse into itself.
 - Saves use revision-based compare-and-swap, so a stale panel cannot overwrite a newer configuration.
 - A queued routine switch is bound to the complete definition reviewed when it was requested. A retry cancels that switch if the definition changed or disappeared; independent switches remain available.
+- Run now, Save & Run, and service-backed live starts retain the configuration revision reviewed when queued. If any save overtakes the request, including a save to another routine, the start reports that the configuration changed and requires a fresh retry. The runner checks and executes the same captured snapshot. Explicit runner CLI calls without a revision keep selecting the latest committed configuration.
 - Condition-service jobs carry the revision they evaluated; the runner rejects stale jobs and post-Disconnect activations before any routine action runs.
 - Events and shortcuts already waiting for the configuration lock are also rejected after a completed Disconnect; removing their on-disk dispatchers is not the only revocation check.
 - Readers require the canonical configuration to match a post-reload commit record. A candidate cannot execute before its integration transaction commits, and an interrupted candidate fails closed.
