@@ -5,6 +5,7 @@ umask 077
 
 PLUGIN_ID="anothadev.omachord"
 SELF_PATH=$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")
+PLUGIN_ROOT=${SELF_PATH%/bin/omachord}
 FS_HELPER="${SELF_PATH%/*}/omachord-fs"
 ACTION_SUPERVISOR="${SELF_PATH%/*}/omachord-action-supervisor"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -19,6 +20,8 @@ BINDINGS_FILE="$HYPR_DIR/bindings.lua"
 GENERATED_LUA="$HYPR_DIR/omachord.lua"
 HOOK_ROOT="${OMACHORD_HOOK_ROOT:-$OMARCHY_CONFIG_DIR/hooks}"
 DESKTOP_FILE="${OMACHORD_DESKTOP_FILE:-$DATA_HOME/applications/$PLUGIN_ID.desktop}"
+ICON_SOURCE="$PLUGIN_ROOT/assets/omachord-icon.svg"
+ICON_FILE="${OMACHORD_ICON_FILE:-$DATA_HOME/icons/hicolor/scalable/apps/$PLUGIN_ID.svg}"
 RUNNER_PATH="${OMACHORD_RUNNER_PATH:-$OMARCHY_CONFIG_DIR/plugins/$PLUGIN_ID/bin/omachord}"
 LOCK_FILE="$STATE_DIR/config.lock"
 LOG_FILE="$STATE_DIR/runs.jsonl"
@@ -784,7 +787,16 @@ connected() {
 
 owned_connection() {
   [[ -f $OWNERSHIP_FILE && ! -L $OWNERSHIP_FILE ]] \
-    && jq -e --arg id "$PLUGIN_ID" '.version == 1 and .pluginId == $id and .loaderCreated == true' "$OWNERSHIP_FILE" >/dev/null 2>&1
+    && jq -e --arg id "$PLUGIN_ID" '
+      (.version == 1 or .version == 2)
+      and .pluginId == $id
+      and .loaderCreated == true
+    ' "$OWNERSHIP_FILE" >/dev/null 2>&1
+}
+
+icon_owned() {
+  owned_connection \
+    && jq -e '.version == 2 and .iconCreated == true' "$OWNERSHIP_FILE" >/dev/null 2>&1
 }
 
 connection_disabled() {
@@ -829,7 +841,7 @@ write_ownership() {
   local source
   source=$(mktemp) || return 1
   if ! jq -cn --arg id "$PLUGIN_ID" --arg connectedAt "$(date --iso-8601=seconds)" \
-    '{version:1,pluginId:$id,loaderCreated:true,connectedAt:$connectedAt}' >"$source" \
+    '{version:2,pluginId:$id,loaderCreated:true,iconCreated:true,connectedAt:$connectedAt}' >"$source" \
     || ! transaction_write_atomic "$source" "$OWNERSHIP_FILE" 600; then
     rm -f -- "$source"
     return 1
@@ -850,6 +862,11 @@ desktop_entry_matches() {
     || sed 's/^Name=Omachord$/Name=Oma Chord/' "$expected" | cmp -s - "$current"
 }
 
+icon_matches() {
+  [[ -f $ICON_SOURCE && ! -L $ICON_SOURCE && -f $ICON_FILE && ! -L $ICON_FILE ]] \
+    && cmp -s -- "$ICON_SOURCE" "$ICON_FILE"
+}
+
 integration_branding_current() {
   local config expected
   config=$(mktemp) || return 1
@@ -862,7 +879,8 @@ integration_branding_current() {
     || ! generate_lua "$config" >"$expected" \
     || ! cmp -s -- "$expected" "$GENERATED_LUA" \
     || ! generate_desktop_entry >"$expected" \
-    || ! cmp -s -- "$expected" "$DESKTOP_FILE"; then
+    || ! cmp -s -- "$expected" "$DESKTOP_FILE" \
+    || ! icon_matches; then
     rm -f -- "$config" "$expected"
     return 1
   fi
@@ -872,11 +890,14 @@ integration_branding_current() {
 integration_complete() {
   local event config expected revision
   connected && owned_connection || return 1
+  icon_owned || return 1
   config_file_secure || return 1
   [[ -f $GENERATED_LUA && ! -L $GENERATED_LUA ]] || return 1
   [[ -f $DESKTOP_FILE && ! -L $DESKTOP_FILE ]] || return 1
+  [[ -f $ICON_FILE && ! -L $ICON_FILE ]] || return 1
   [[ $(stat -c %a "$GENERATED_LUA") == 600 ]] || return 1
   [[ $(stat -c %a "$DESKTOP_FILE") == 644 ]] || return 1
+  [[ $(stat -c %a "$ICON_FILE") == 644 ]] || return 1
   [[ $(stat -c %a "$OWNERSHIP_FILE") == 600 ]] || return 1
 
   config=$(mktemp) || return 1
@@ -891,7 +912,8 @@ integration_complete() {
     || ! generate_lua "$config" >"$expected" \
     || ! generated_lua_matches "$expected" "$GENERATED_LUA" \
     || ! generate_desktop_entry >"$expected" \
-    || ! desktop_entry_matches "$expected" "$DESKTOP_FILE"; then
+    || ! desktop_entry_matches "$expected" "$DESKTOP_FILE" \
+    || ! icon_matches; then
     rm -f -- "$config" "$expected"
     return 1
   fi
@@ -932,7 +954,7 @@ backup_bindings() {
 
 connection_collision() {
   local event path
-  for path in "$GENERATED_LUA" "$DESKTOP_FILE"; do
+  for path in "$GENERATED_LUA" "$DESKTOP_FILE" "$ICON_FILE"; do
     if [[ -e $path ]]; then
       LAST_ERROR="Refusing to replace an unowned file: $path"
       return 0
@@ -1058,6 +1080,7 @@ snapshot_owned_files() {
   if ((include_bindings)); then snapshot_file "$BINDINGS_FILE" bindings || return 1; fi
   snapshot_file "$GENERATED_LUA" generated || return 1
   snapshot_file "$DESKTOP_FILE" desktop || return 1
+  if icon_owned; then snapshot_file "$ICON_FILE" icon || return 1; fi
   snapshot_file "$OWNERSHIP_FILE" ownership || return 1
   snapshot_file "$DISABLED_FILE" disabled || return 1
   for event in "${HOOK_EVENTS[@]}"; do
@@ -1067,8 +1090,8 @@ snapshot_owned_files() {
 
 snapshot_missing_artifacts() {
   local event path key index
-  local -a paths=("$GENERATED_LUA" "$DESKTOP_FILE" "$OWNERSHIP_FILE")
-  local -a keys=(generated desktop ownership)
+  local -a paths=("$GENERATED_LUA" "$DESKTOP_FILE" "$ICON_FILE" "$OWNERSHIP_FILE")
+  local -a keys=(generated desktop icon ownership)
   for event in "${HOOK_EVENTS[@]}"; do
     paths+=("$(hook_wrapper_path "$event")")
     keys+=("hook-$event")
@@ -1082,6 +1105,10 @@ snapshot_missing_artifacts() {
       return 1
     fi
   done
+}
+
+remove_owned_icon() {
+  if icon_owned; then transaction_remove "$ICON_FILE"; fi
 }
 
 file_fingerprint() {
@@ -1449,12 +1476,20 @@ Type=Application
 Name=Omachord
 Comment=Compose keyboard shortcuts and Omarchy automations
 Exec=omarchy-shell shell summon $PLUGIN_ID {}
-Icon=preferences-desktop-keyboard-shortcuts
+Icon=$PLUGIN_ID
 Terminal=false
 Categories=Settings;
 Keywords=shortcuts;keyboard;automation;omarchy;
 StartupNotify=false
 EOF
+}
+
+install_icon() {
+  if [[ ! -f $ICON_SOURCE || -L $ICON_SOURCE ]]; then
+    LAST_ERROR="The Omachord application icon is unavailable"
+    return 1
+  fi
+  transaction_write_atomic "$ICON_SOURCE" "$ICON_FILE" 644
 }
 
 install_desktop_entry() {
@@ -1710,6 +1745,9 @@ command_connect() {
   if ! owned_connection && connection_collision; then
     fail "$LAST_ERROR" ownership-conflict
   fi
+  if [[ $repairing == true ]] && ! icon_owned && [[ -e $ICON_FILE || -L $ICON_FILE ]]; then
+    fail "Refusing to replace an unowned file: $ICON_FILE" ownership-conflict
+  fi
   if [[ $already_connected != true && $repairing != true ]]; then
     require_clean_hyprland || fail "$LAST_ERROR" hyprland-errors
   fi
@@ -1764,6 +1802,7 @@ command_connect() {
   if [[ $repairing == true ]]; then
     if ! snapshot_file "$GENERATED_LUA" generated \
       || ! snapshot_file "$DESKTOP_FILE" desktop \
+      || ! snapshot_file "$ICON_FILE" icon \
       || ! snapshot_file "$OWNERSHIP_FILE" ownership; then
       snapshot_end
       rm -f -- "$candidate"
@@ -1794,6 +1833,7 @@ command_connect() {
     || ! append_loader "$repairing" \
     || ! sync_generated_lua "$candidate" \
     || ! install_hook_wrappers \
+    || ! install_icon \
     || ! install_desktop_entry; then
     mutation_error=${LAST_ERROR:-"Could not install Omachord integration"}
     if rollback_transaction "$mutation_error" 0; then code=connect-rolled-back; else code=rollback-failed; fi
@@ -1866,7 +1906,8 @@ command_disconnect() {
 
   if ! remove_loader \
     || ! transaction_remove "$GENERATED_LUA" \
-    || ! transaction_remove "$DESKTOP_FILE"; then
+    || ! transaction_remove "$DESKTOP_FILE" \
+    || ! remove_owned_icon; then
     mutation_error=${LAST_ERROR:-"Could not remove Omachord integration"}
   else
     mutation_error=""
