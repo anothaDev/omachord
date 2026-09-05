@@ -43,6 +43,7 @@ Item {
   property string disabledReason: "starting"
   property bool configLoaded: false
   property string configRevision: ""
+  readonly property bool manualRevisionBinding: true
   property var routines: []
   // Every routine in the committed configuration, keyed by id, so the bar
   // widget can name an activation record without reading the config itself.
@@ -672,16 +673,18 @@ Item {
     manualInFlight = next
     logEvent("manual-start", job.op + " " + job.id)
     worker.command = [root.runnerPath, job.op, job.id, job.source || "manual"]
+    if (job.op === "activate" || job.op === "run")
+      worker.command = worker.command.concat([String(job.revision || "")])
     worker.startPending = true
     worker.running = true
   }
 
   function endRoutine(id) { return enqueueManual("deactivate", id) }
-  function startRoutine(id) { return enqueueManual("activate", id) }
-  function toggleRoutine(id) { return enqueueManual("run", id) }
+  function startRoutine(id, expectedRevision) { return enqueueManual("activate", id, undefined, expectedRevision) }
+  function toggleRoutine(id, expectedRevision) { return enqueueManual("run", id, undefined, expectedRevision) }
   // The editor's Run button deliberately accepts disabled routines so they
   // can be tested before their triggers and conditions are enabled.
-  function testRoutine(id) { return enqueueManual("run", id, "test") }
+  function testRoutine(id, expectedRevision) { return enqueueManual("run", id, "test", expectedRevision) }
   // The bar switch turns the whole integration on or off; the window keeps
   // its own confirmation for the same call and can pin the revision it showed.
   // Omitting the revision preserves the bar's two-element runner command.
@@ -703,6 +706,13 @@ Item {
     if (connection) connectionEpoch++
     var job = { op: op, id: routineId, source: source }
     if (op === "connect" && typeof expectedRevision === "string") job.revision = expectedRevision
+    if (op === "activate" || op === "run") {
+      // Capture the click's revision once. Neither a watcher nor a connection
+      // barrier may silently update the authority of a queued request.
+      var reviewed = expectedRevision === undefined ? configRevision : expectedRevision
+      if (typeof reviewed !== "string" || !reviewed) return false
+      job.revision = String(reviewed)
+    }
     manualQueue = manualQueue.concat([job])
     runNextManual()
     return true

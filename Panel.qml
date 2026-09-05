@@ -46,6 +46,9 @@ Item {
   property string activeView: "routines"
   property string selectedRoutineId: ""
   property var editorRoutine: null
+  // The editor can intentionally retain a draft while the list/base revision
+  // refreshes. Only a displayed-definition update may advance this revision.
+  property string editorRevision: ""
   property bool editorPersisted: false
   property bool configLoaded: false
   property bool configUncommitted: false
@@ -559,8 +562,10 @@ Item {
   function syncSelectedRoutineFromConfig() {
     if (!editorPersisted || !selectedRoutineId || routineEditor.dirty) return
     var selected = routineById(selectedRoutineId)
-    if (selected) editorRoutine = Model.clone(selected)
-    else ensureRoutineSelection()
+    if (selected) {
+      editorRoutine = Model.clone(selected)
+      editorRevision = configRevision
+    } else ensureRoutineSelection()
   }
 
   function selectRoutineNow(id, showEditor) {
@@ -568,6 +573,7 @@ Item {
     selectedRoutineId = routine ? id : ""
     editorPersisted = !!routine
     editorRoutine = routine ? Model.clone(routine) : null
+    editorRevision = routine ? configRevision : ""
     if (showEditor !== false && routine) compactEditorOpen = true
     setActiveView("routines")
   }
@@ -576,6 +582,7 @@ Item {
     selectedRoutineId = routine.id
     editorPersisted = false
     editorRoutine = Model.clone(routine)
+    editorRevision = ""
     compactEditorOpen = true
     setActiveView("routines")
   }
@@ -618,6 +625,7 @@ Item {
       selectedRoutineId = ""
       editorPersisted = false
       editorRoutine = null
+      editorRevision = ""
       compactEditorOpen = false
     }
   }
@@ -645,6 +653,7 @@ Item {
       if (selected) {
         editorPersisted = true
         editorRoutine = Model.clone(selected)
+        editorRevision = configRevision
         return
       }
     }
@@ -653,6 +662,7 @@ Item {
       selectedRoutineId = ""
       editorPersisted = false
       editorRoutine = null
+      editorRevision = ""
       compactEditorOpen = false
     }
   }
@@ -729,7 +739,7 @@ Item {
     requestRefreshProcess(logsProc)
     requestRefreshProcess(statusProc)
     if (!serviceLive) requestRefreshProcess(activeProc)
-    if (pendingAfterApply === "run" && selectId) runRoutine(selectId)
+    if (pendingAfterApply === "run" && selectId) runRoutine(selectId, result.revision)
     pendingAfterApply = ""
   }
 
@@ -951,18 +961,23 @@ Item {
     applyConfig(next, next.routines.length ? next.routines[0].id : "", "")
   }
 
-  function runRoutine(id) {
+  function runRoutine(id, expectedRevision) {
     if (!id || !configLoaded || !editorPersisted || routineActionBlocked(id)) return
+    var reviewed = expectedRevision === undefined
+      ? (editorRoutine && editorRoutine.id === id ? editorRevision : configRevision) : expectedRevision
+    if (typeof reviewed !== "string" || !reviewed) { showNotice("Refresh the routine before running it", true); return }
     showNotice((activeIds[id] ? "Ending " : "Running ") + Model.nameFor(config, id) + "...", false, true)
-    if (service && (typeof service.testRoutine === "function"
+    // An older cached Service would ignore an extra argument. Use the direct
+    // runner fallback unless the service advertises revision-bound requests.
+    if (service && service.manualRevisionBinding === true && (typeof service.testRoutine === "function"
         || typeof service.toggleRoutine === "function")) {
       var queued = typeof service.testRoutine === "function"
-        ? service.testRoutine(id) : service.toggleRoutine(id)
+        ? service.testRoutine(id, reviewed) : service.toggleRoutine(id, reviewed)
       if (!queued) showNotice("The routine queue is full", true)
       return
     }
     runningRoutineId = id
-    actionProc.command = [runnerPath, "run", id, "test"]
+    actionProc.command = [runnerPath, "run", id, "test", reviewed]
     actionStarted = false
     startProcess(actionProc)
   }
@@ -987,9 +1002,9 @@ Item {
   }
 
   function routineActionBlocked(id) {
-    if (routineActionBusy(id)) return true
+    if (routineActionBusy(id) || actionProc.running) return true
     if (service) return serviceConnectionBusy()
-    return actionProc.running
+    return false
   }
 
   // Ending from the Activity list goes through the service when it is loaded

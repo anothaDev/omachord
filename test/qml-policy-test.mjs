@@ -92,7 +92,7 @@ for (const file of ["Panel.qml", "RoutinePopup.qml", "RoutineEditor.qml", "Actio
 }
 assert.match(panel, /routineRow\.enablePending \? "SAVING"/,
   "enable persistence must expose pending state on the affected row")
-assert.match(panel, /typeof service\.testRoutine === "function"[\s\S]*?service\.testRoutine\(id\)/,
+assert.match(panel, /typeof service\.testRoutine === "function"[\s\S]*?service\.testRoutine\(id, reviewed\)/,
   "live panel actions must use the service's concurrent manual workers when available")
 assert.match(panel, /running: root\.editorRoutine \? root\.routineActionBusy\(root\.editorRoutine\.id\) : false/,
   "routine action progress must be tracked per routine instead of globally")
@@ -122,7 +122,7 @@ assert.match(popup, /property date displayNow:[\s\S]*?Conditions\.minutesLeft\([
 assert.match(popup, /function rowBusy\(id\)[\s\S]*?pendingIds\[String\(id\)\] === true/,
   "the popup must disable only the routine row that is already pending")
 const service = fs.readFileSync(path.join(root, "Service.qml"), "utf8")
-assert.match(service, /function testRoutine\(id\)[\s\S]*?enqueueManual\("run", id, "test"\)/,
+assert.match(service, /function testRoutine\(id, expectedRevision\)[\s\S]*?enqueueManual\("run", id, "test", expectedRevision\)/,
   "the concurrent service path must preserve editor testing of disabled routines")
 assert.match(service, /runnerProc\.command = \[root\.runnerPath, job\.op, job\.id, job\.reason, job\.revision\]/,
   "the service must only ever execute the runner with a literal argv")

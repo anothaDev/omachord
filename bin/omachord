@@ -2999,12 +2999,25 @@ routine_is_stateful() {
 
 RESOLVED_ROUTINE=""
 resolve_routine() {
-  local routine_id=$1 allow_disabled=${2:-0} config_file enabled
+  local routine_id=$1 allow_disabled=${2:-0} expected_revision=${3:-} config_file enabled current_revision
   RESOLVED_ROUTINE=""
   config_file=$(mktemp)
   if ! load_committed_config "$config_file"; then
     rm -f -- "$config_file"
     json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
+    return 1
+  fi
+  # Compare the reviewed revision to this exact immutable copy, then resolve
+  # and execute from the same copy. A separate preflight followed by another
+  # load would leave a review-to-execution gap for non-cooperating writers.
+  current_revision=$(snapshot_revision) || {
+    rm -f -- "$config_file"
+    json_error "Could not identify the routine configuration" invalid-config
+    return 1
+  }
+  if [[ -n $expected_revision && $current_revision != "$expected_revision" ]]; then
+    rm -f -- "$config_file"
+    json_error "Configuration changed since this routine was reviewed; refresh and choose Run again" stale-config
     return 1
   fi
   RESOLVED_ROUTINE=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
@@ -3500,7 +3513,9 @@ deactivate_all() {
 }
 
 command_run() {
-  local routine_id=${1:-} trigger=${2:-manual} allow_disabled=0
+  local routine_id=${1:-} trigger=${2:-manual} expected_revision=${3:-} allow_disabled=0
+  [[ $# -le 3 && ($# -lt 3 || $expected_revision =~ ^sha256:[0-9a-f]{64}$) ]] \
+    || fail "Usage: omachord run <routine-id> [source [expected-revision]]" usage
   [[ -n $routine_id ]] || fail "Usage: omachord run <routine-id> [manual|shortcut|test]" usage
   case $trigger in
     manual|shortcut) ;;
@@ -3511,7 +3526,7 @@ command_run() {
   if [[ $trigger == shortcut ]]; then
     automatic_integration_enabled || fail "$LAST_ERROR" not-connected
   fi
-  resolve_routine "$routine_id" "$allow_disabled" || return 1
+  resolve_routine "$routine_id" "$allow_disabled" "$expected_revision" || return 1
   if routine_is_stateful "$RESOLVED_ROUTINE"; then
     toggle_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
   else
@@ -3528,17 +3543,29 @@ command_activate() {
     test) allow_disabled=1 ;;
     *) fail "Unknown activation source: $trigger" usage ;;
   esac
+  if [[ $# -eq 3 && -z $expected_revision ]]; then
+    fail "A supplied activation revision must not be empty" usage
+  fi
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
   if [[ $trigger == condition || $trigger == service ]]; then
-    service_revision_matches "$expected_revision" || fail "$LAST_ERROR" stale-config
-    integration_complete || fail "Omachord is no longer connected" not-connected
+    [[ $expected_revision =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || fail "A service transition requires a valid configuration revision" stale-config
   elif [[ -n $expected_revision ]]; then
-    fail "Only service activations accept an expected revision" usage
+    [[ $trigger != shortcut && $expected_revision =~ ^sha256:[0-9a-f]{64}$ ]] \
+      || fail "A reviewed manual activation requires a valid configuration revision" usage
+  fi
+  resolve_routine "$routine_id" "$allow_disabled" "$expected_revision" || return 1
+  if [[ $trigger == condition || $trigger == service ]]; then
+    integration_complete || fail "Omachord is no longer connected" not-connected
   fi
   case $trigger in
     shortcut|condition|service) automatic_integration_enabled || fail "$LAST_ERROR" not-connected ;;
   esac
-  activate_routine "$routine_id" "$trigger" "$allow_disabled"
+  if routine_is_stateful "$RESOLVED_ROUTINE"; then
+    activate_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
+  else
+    run_resolved_routine "$RESOLVED_ROUTINE" "$routine_id" "$trigger"
+  fi
 }
 
 command_deactivate() {
@@ -3999,10 +4026,10 @@ Commands:
   bindings
   commands
   toggles               Valid top-level Omarchy toggle flags
-  run <routine-id> [manual|shortcut|test]
+  run <routine-id> [manual|shortcut|test [expected-revision]]
                         Stateful routines toggle between active and inactive
   activate <routine-id> [manual|shortcut|test]
-  activate <routine-id> <condition|service> <expected-revision>
+  activate <routine-id> <manual|test|condition|service> <expected-revision>
   deactivate <routine-id> [manual|shortcut|test]
   deactivate <routine-id> <condition|service|timer> <expected-revision>
   recovery inspect <routine-id>

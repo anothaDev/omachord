@@ -422,7 +422,9 @@ ShellRoot {
       finish(false, component.errorString())
       return
     }
-    service = component.createObject(this, {})
+    // Queue tests start with the fixture's already reviewed revision; startup
+    // loading is covered separately by service.qml.
+    service = component.createObject(this, {configRevision:"sha256:concurrency"})
     if (!service) {
       finish(false, "Service.qml createObject returned null")
       return

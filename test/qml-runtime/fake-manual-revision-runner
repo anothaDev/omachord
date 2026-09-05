@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+dir=${OMACHORD_QML_TEST_DIR:?}
+printf '%s\n' "$*" >>"$dir/calls.log"
+revision_a="sha256:$(printf 'a%.0s' {1..64})"
+revision_c="sha256:$(printf 'c%.0s' {1..64})"
+case "${1:-} ${2:-}" in
+  'config snapshot') jq -cn --arg revision "$revision_a" '{ok:true,committed:true,revision:$revision,config:{version:1,routines:[{id:"alpha",name:"Alpha",enabled:true,triggers:[],actions:[{type:"delay",milliseconds:0}]},{id:"beta",name:"Beta",enabled:true,triggers:[],actions:[]}]}}' ;;
+  'config apply') cat >/dev/null; jq -cn --arg revision "$revision_c" '{ok:true,revision:$revision,warnings:[],deactivated:[]}' ;;
+  'autostart '| 'status ') printf '{"ok":true,"connected":true,"ownedConnection":true,"integrationComplete":true,"connectionEnabled":true}\n' ;;
+  'run '*|'activate '*)
+    if [[ ${4:-} == "$revision_a" ]]; then
+      printf '{"ok":false,"code":"stale-config","error":"Fixture changed config"}\n'; exit 1
+    fi
+    printf '{"ok":true,"state":"activated"}\n' ;;
+  'deactivate '*) printf '{"ok":true,"state":"deactivated"}\n' ;;
+  'theme-palette '*) printf '{"ok":true,"green":"#aabbcc","name":"Fixture Theme"}\n' ;;
+  'themes '*) printf 'Fixture Theme\n' ;;
+  'service-status '*) printf '{"ready":true,"enabled":true,"routines":[]}\n' ;;
+  *) printf '[]\n' ;;
+esac
