@@ -118,12 +118,20 @@ Panel {
       objectName: "omachordBarButton"
       bar: root.bar
       iconComponent: Component {
-        BrandIcon {
-          foreground: button.foreground
+        Item {
+          BrandIcon {
+            anchors.centerIn: parent
+            // The SVG fills its viewBox; font glyphs occupy less of the
+            // optical canvas. Keep the shared slot and match their font size.
+            width: Math.min(parent.width, Math.round(button.fontSize))
+            height: width
+            foreground: button.active ? button.activeColor : button.foreground
+          }
         }
       }
-      dimmed: !root.hasActive
-      useActiveColor: false
+      active: root.hasActive
+      activeColor: Color.accent
+      dimmed: !root.integrationOn && !root.hasActive
       tooltipText: root.summary
       onPressed: function(mouseButton) {
         if (mouseButton === Qt.MiddleButton) root.openOmachord()

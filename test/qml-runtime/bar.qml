@@ -108,9 +108,9 @@ ShellRoot {
         } else if (root.step === 1) {
           var icon = root.checkIcon(widget, host.barForeground)
           root.checkIcon(popup, popup.foreground)
-          root.check(icon.width === button.opticalSize, "icon escaped the bar optical canvas")
-          root.check(icon.width === Style.bar.iconCanvas, "mark should use the normal bar icon size")
-          root.check(button.dimmed && widget.shown, "idle alwaysShow behavior changed")
+          root.check(icon.width <= button.opticalSize, "icon escaped the bar optical canvas")
+          root.check(icon.width === Math.round(button.fontSize), "mark must match the stock glyph's font size")
+          root.check(!button.dimmed && button.opacity === 1 && widget.shown, "On with no running routine must stay bright")
           host.background = "#f4f2f7"
           host.barForeground = "#1a1720"
           popup.foreground = "#c4b5fd"
@@ -142,13 +142,30 @@ ShellRoot {
           host.vertical = true
           host.background = "transparent"
           host.barForeground = "#d3bf9e"
-          service.activeList = [{ id: "focus", name: "Focus" }]
-          widget.settings = { alwaysShow: false }
         } else if (root.step === 3) {
           root.checkIcon(widget, host.barForeground)
-          root.check(widget.shown && !button.dimmed, "active routine indicator changed")
+          root.check(button.dimmed && Math.abs(button.opacity - 0.45) < 0.01, "Off with no running routine must dim")
+          service.activeList = [{ id: "focus", name: "Focus" }]
+          Color.accent = "#44cc88"
+          widget.settings = { alwaysShow: false }
+        } else if (root.step === 4) {
+          root.checkIcon(widget, Color.accent)
+          root.check(widget.shown && !button.dimmed && button.opacity === 1, "running routine must stay bright even while integration is Off")
           root.check(widget.width === host.barSize && widget.height > 0, "vertical layout is broken")
+          Color.accent = "#b48aff"
+        } else if (root.step === 5) {
+          root.checkIcon(widget, Color.accent)
+          service.enabled = true
           service.activeList = []
+          widget.settings = { alwaysShow: true }
+        } else if (root.step === 6) {
+          root.checkIcon(widget, host.barForeground)
+          root.check(!button.dimmed && button.opacity === 1, "ending a routine must return to bright On, not dim Off")
+          service.enabled = false
+        } else if (root.step === 7) {
+          root.checkIcon(widget, host.barForeground)
+          root.check(button.dimmed && Math.abs(button.opacity - 0.45) < 0.01, "returning Off must dim")
+          widget.settings = { alwaysShow: false }
         } else {
           root.check(!widget.shown && widget.implicitHeight === 0, "idle widget no longer collapses")
           console.log("OMACHORD_BAR_TEST_PASS")

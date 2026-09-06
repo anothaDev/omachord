@@ -12,6 +12,17 @@ The panel, the condition service, and a small bar widget run inside the existing
 
 Omachord started with an old microphone automation. While revisiting it, something clicked: composable, restorable routines felt like a missing piece in the OS.
 
+## What's new in 0.4.1
+
+- **Clear bar status:** dimmed when Off, normal theme brightness when On, and the theme accent while a routine is running.
+- **Balanced icon size:** the bar mark matches the stock icon font size while retaining the standard click target. Popup artwork is unchanged.
+
+To place the widget with your right-side status controls while preserving its settings:
+
+```bash
+omarchy bar move anothadev.omachord --section right --after omarchy.tray
+```
+
 ## What's new in 0.4.0
 
 - **More responsive routines:** independent manual routine requests can run concurrently, and busy indicators stay with the affected routine instead of blocking the whole panel.
@@ -163,7 +174,7 @@ The window follows the Omarchy theme live: colors crossfade when `omarchy theme 
 
 ## Bar widget
 
-The transparent Omachord ring/keycap mark appears in the bar's center section while a routine is on. The bar and popup use the monochrome artwork in their own theme foreground colors, with no background tile. Left or right click opens a popup listing what is on, when it started, when it ends, and what it restores, with an end button per routine and a switch for Omachord itself; j/k, Enter, x, and Esc work as in other Omarchy panels, and `o` opens the window. Middle click opens the window directly. Two settings live on the bar entry in `shell.json`:
+The transparent Omachord ring/keycap mark appears in the bar while a routine is running. When kept visible while idle, it is dimmed only when Omachord is Off; On uses normal theme brightness, and a running routine uses the theme accent. The popup keeps its own theme foreground. Neither surface adds a background tile. The initial placement is the center section; use `omarchy bar move` to choose another section without changing your routine configuration. Left or right click opens a popup listing what is on, when it started, when it ends, and what it restores, with an end button per routine and a switch for Omachord itself; j/k, Enter, x, and Esc work as in other Omarchy panels, and `o` opens the window. Middle click opens the window directly. Two settings live on the bar entry in `shell.json`:
 
 ```bash
 omarchy bar set anothadev.omachord alwaysShow true --json   # keep the icon while nothing is on
