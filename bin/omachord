@@ -2527,7 +2527,8 @@ cleanup_active_action() {
 
 process_start_time() {
   local stat rest
-  stat=$(<"/proc/$1/stat") || return 1
+  # Not $(<...): bash 5.2 exits under set -e when that cannot open its file.
+  IFS= read -r stat 2>/dev/null <"/proc/$1/stat" || return 1
   rest=${stat##*) }
   local -a fields=()
   read -r -a fields <<<"$rest"
@@ -4748,7 +4749,7 @@ bulk_cleanup_suppresses_hooks() {
   [[ $BULK_CLEANUP_OWNER =~ ^([0-9]+):([0-9]+)$ ]] || return 1
   pid=${BASH_REMATCH[1]}
   start=${BASH_REMATCH[2]}
-  { stat=$(<"/proc/$pid/stat"); } 2>/dev/null || return 1
+  IFS= read -r stat 2>/dev/null <"/proc/$pid/stat" || return 1
   rest=${stat##*) }
   local -a fields=()
   read -r -a fields <<<"$rest"
