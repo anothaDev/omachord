@@ -393,4 +393,58 @@ jq -e '.ok == false and .deactivated == ["ending"]' <<<"$result" >/dev/null \
 "$RUNNER" disconnect | jq -e '.ok' >/dev/null
 pass "bulk cleanup ordering, failure reporting and hook suppression"
 
+# --- Smaller hygiene regressions
+"$RUNNER" help >"$TEST_ROOT/usage.txt"
+for command in themes service-status theme-palette; do
+  grep -Eq "^  $command( |$)" "$TEST_ROOT/usage.txt" || fail "usage does not list $command"
+done
+
+# `active` treats a record that vanished between listing and reading as
+# inactive instead of failing the whole listing.
+apply_config "$(config_of \
+  "$(routine a-first '[{"type":"exec","program":"mark","args":["a"]}]' '{"keepUntil":{"minutes":5}}')" \
+  "$(routine b-second '[{"type":"exec","program":"mark","args":["b"]}]' '{"keepUntil":{"minutes":5}}')" \
+  "$(routine abort-me '[{"type":"exec","program":"hold","args":["abort"]}]')")" | jq -e '.ok' >/dev/null
+"$RUNNER" activate a-first manual | jq -e '.ok and .state == "activated"' >/dev/null
+"$RUNNER" activate b-second manual | jq -e '.ok and .state == "activated"' >/dev/null
+cat >"$TEST_ROOT/vanish.bash" <<'EOF'
+set -T
+trap '[[ -n ${VANISH_PATH:-} && ${FUNCNAME[0]:-} == command_active && $BASH_COMMAND == "snapshot_state=0" ]] \
+  && { rm -f -- "$VANISH_PATH"; VANISH_PATH=""; }' DEBUG
+EOF
+result=$(BASH_ENV="$TEST_ROOT/vanish.bash" VANISH_PATH="$STATE_DIR/active/a-first.json" "$RUNNER" active) \
+  || fail "a vanished activation record failed the active listing: $result"
+jq -e 'map(.routineId) == ["b-second"]' <<<"$result" >/dev/null \
+  || fail "the active listing did not skip the vanished record: $result"
+"$RUNNER" deactivate b-second manual | jq -e '.ok' >/dev/null
+
+# A signal abort removes the runner's private temporary files.
+mkdir -m 700 "$TEST_ROOT/abort-tmp"
+TMPDIR="$TEST_ROOT/abort-tmp" "$RUNNER" run abort-me manual >/dev/null &
+abort_pid=$!
+wait_for_file "$TEST_ROOT/abort.started" "the abort routine did not start"
+find "$TEST_ROOT/abort-tmp" -mindepth 1 -print -quit | grep -q . \
+  || fail "the running routine had no private temporary files to clean up"
+kill -TERM "$abort_pid"
+if wait "$abort_pid"; then fail "the aborted routine reported success"; fi
+leftover=$(find "$TEST_ROOT/abort-tmp" -mindepth 1 -print)
+[[ -z $leftover ]] || fail "a signal abort left temporary files: $leftover"
+
+# widget ensure/forget serialize on a dedicated lock.
+"$RUNNER" widget forget | jq -e '.ok' >/dev/null
+widget_lock="$XDG_RUNTIME_DIR/omachord/widget.lock"
+[[ -f $widget_lock ]] || fail "widget forget did not use the widget lock"
+flock -x "$widget_lock" sleep 3 &
+holder=$!
+for _ in {1..200}; do
+  if ! flock -n "$widget_lock" true; then break; fi
+  sleep 0.01
+done
+result=$(OMACHORD_LOCK_TIMEOUT=0.3 "$RUNNER" widget forget || true)
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+jq -e '.ok == false and .error == "Timed out locking the bar widget state"' <<<"$result" >/dev/null \
+  || fail "widget forget did not wait for a concurrent widget operation: $result"
+pass "usage, active-listing race, abort cleanup and widget lock"
+
 printf 'Runner lifecycle tests passed.\n'

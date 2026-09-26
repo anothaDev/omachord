@@ -99,7 +99,7 @@ fail() {
 
 control_capture() {
   local output status
-  output=$(mktemp) || return 1
+  output=$(mktemp) || { LAST_ERROR="Could not prepare the command output"; return 1; }
   if run_capture --timeout "$CONTROL_TIMEOUT" --head "$MAX_CONTROL_BYTES" "$output" "$@"; then
     if ! cat -- "$output"; then
       rm -f -- "$output"
@@ -184,7 +184,10 @@ write_config_snapshot() {
     LAST_ERROR="Could not read configuration size: $CONFIG_FILE"
     return 1
   }
-  size=$(stat -c %s -- "$CONFIG_FILE" 2>/dev/null) || return 1
+  size=$(stat -c %s -- "$CONFIG_FILE" 2>/dev/null) || {
+    LAST_ERROR="Could not read configuration size: $CONFIG_FILE"
+    return 1
+  }
   if ((size > MAX_CONFIG_BYTES)); then
     LAST_ERROR="Configuration exceeds the 1 MiB limit"
     return 1
@@ -570,9 +573,9 @@ private_fd_matches_file() {
     LAST_ERROR="A private file changed while it was being opened: $path"
     return 1
   fi
-  expected=$(stat -c '%d:%i:%u:%a' -- "$path" 2>/dev/null) || return 1
-  observed=$(stat -Lc '%d:%i:%u:%a' -- "/proc/self/fd/$fd" 2>/dev/null) || return 1
-  if [[ $observed != "$expected" ]]; then
+  if ! expected=$(stat -c '%d:%i:%u:%a' -- "$path" 2>/dev/null) \
+    || ! observed=$(stat -Lc '%d:%i:%u:%a' -- "/proc/self/fd/$fd" 2>/dev/null) \
+    || [[ $observed != "$expected" ]]; then
     LAST_ERROR="A private file changed while it was being opened: $path"
     return 1
   fi
@@ -582,6 +585,10 @@ safe_open_private_fd() {
   local destination_fd=$1 path=$2 mode=${3:-600} label=${4:-state file}
   local create=${5:-false}
   local error_file opener_job opener_out opener_in opener_pid opener_fd open_ok=true
+  # Report this open's own failure, never a stale error from earlier work;
+  # a successful open leaves the caller's LAST_ERROR as it was.
+  local saved_error=$LAST_ERROR
+  LAST_ERROR=""
   if [[ ! -x $FS_HELPER ]]; then
     LAST_ERROR="The Omachord filesystem helper is unavailable"
     return 1
@@ -629,6 +636,7 @@ safe_open_private_fd() {
     return 1
   fi
   rm -f -- "$error_file"
+  LAST_ERROR=$saved_error
 }
 
 acquire_config_lock() {
@@ -822,7 +830,7 @@ generate_hook_wrapper() {
 write_hook_wrapper() {
   local event=$1 destination source
   destination=$(hook_wrapper_path "$event")
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage a hook wrapper"; return 1; }
   if ! generate_hook_wrapper "$event" >"$source"; then
     rm -f -- "$source"
     return 1
@@ -836,7 +844,7 @@ write_hook_wrapper() {
 
 sync_generated_lua() {
   local file=$1 lua_source
-  lua_source=$(mktemp) || return 1
+  lua_source=$(mktemp) || { LAST_ERROR="Could not stage the generated shortcuts"; return 1; }
   if ! generate_lua "$file" >"$lua_source" || ! transaction_write_atomic "$lua_source" "$GENERATED_LUA" 600; then
     rm -f -- "$lua_source"
     return 1
@@ -927,7 +935,7 @@ remove_connection_disabled() {
 
 write_ownership() {
   local source
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage the ownership record"; return 1; }
   if ! jq -cn --arg id "$PLUGIN_ID" --arg connectedAt "$(date --iso-8601=seconds)" \
     '{version:2,pluginId:$id,loaderCreated:true,iconCreated:true,connectedAt:$connectedAt}' >"$source" \
     || ! transaction_write_atomic "$source" "$OWNERSHIP_FILE" 600; then
@@ -1450,6 +1458,9 @@ snapshot_end() {
 transaction_abort() {
   local status=${1:-$?}
   trap - EXIT HUP INT TERM
+  # A signal may interrupt run_capture (e.g. the reload's hyprctl). Cancel
+  # and reap that action before the recovery reload starts a new capture.
+  cleanup_active_action
   TRANSACTION_CRITICAL=0
   TRANSACTION_PENDING_SIGNAL=0
   if ((TRANSACTION_ARMED)); then
@@ -1734,7 +1745,7 @@ install_icon() {
 
 install_desktop_entry() {
   local source
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage the desktop entry"; return 1; }
   if ! generate_desktop_entry >"$source"; then
     rm -f -- "$source"
     return 1
@@ -1762,7 +1773,7 @@ append_loader() {
     LAST_ERROR="Refusing to claim a loader line created during Connect"
     return 1
   fi
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage the bindings update"; return 1; }
   if [[ -f $BINDINGS_FILE ]]; then
     if ! mode=$(stat -c %a "$BINDINGS_FILE"); then
       rm -f -- "$source"
@@ -1838,7 +1849,7 @@ remove_loader() {
 
 command_config_show() {
   local temporary
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! write_config_snapshot "$temporary" || ! validate_config_file "$temporary"; then
     rm -f -- "$temporary"
     fail "$LAST_ERROR" invalid-config
@@ -1850,7 +1861,7 @@ command_config_show() {
 command_config_snapshot() {
   local temporary revision committed=false
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! require_secure_config_file \
     || ! write_config_snapshot "$temporary" \
     || ! validate_config_file "$temporary"; then
@@ -1870,7 +1881,7 @@ command_config_snapshot() {
 
 command_config_validate() {
   local temporary
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration check" unsafe-state
   if ! read_config_stdin "$temporary" || ! validate_config_file "$temporary"; then
     rm -f -- "$temporary"
     fail "$LAST_ERROR" invalid-config
@@ -2101,7 +2112,7 @@ connect_locked() {
     require_clean_hyprland || fail "$LAST_ERROR" hyprland-errors
   fi
 
-  candidate=$(mktemp)
+  candidate=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! write_config_snapshot "$candidate" || ! validate_config_file "$candidate"; then
     rm -f -- "$candidate"
     fail "$LAST_ERROR" invalid-config
@@ -2338,7 +2349,7 @@ command_status() {
   local errors="" clean=false hyprland_available=false config_valid=true config_error=""
   local temporary disabled_state=0 connection_enabled=true
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! write_config_snapshot "$temporary"; then
     config_valid=false
     config_error=$LAST_ERROR
@@ -2462,6 +2473,8 @@ rotate_log() {
 log_run() {
   local routine_id=$1 trigger=$2 status=$3 duration=$4 error=${5:-}
   local entry
+  # The action error travels in $error; LAST_ERROR now reports log failures.
+  LAST_ERROR=""
   if ! entry=$(jq -cn \
     --arg timestamp "$(date --iso-8601=seconds)" \
     --arg routineId "$routine_id" \
@@ -2522,10 +2535,19 @@ process_start_time() {
   printf '%s\n' "${fields[19]}"
 }
 
+# Private temporary files that live across a routine's actions. A signal
+# abort removes them after the running action is reaped; normal paths remove
+# their own files, so a later rm -f of an already removed name is harmless.
+declare -a ABORT_TEMP_FILES=()
+track_abort_temp() {
+  ABORT_TEMP_FILES+=("$1")
+}
+
 abort_active_routine() {
   local status=$1
   trap - HUP INT TERM
   cleanup_active_action
+  ((${#ABORT_TEMP_FILES[@]} == 0)) || rm -f -- "${ABORT_TEMP_FILES[@]}"
   exit "$status"
 }
 
@@ -2673,7 +2695,8 @@ execute_action() {
   local action=$1 type output sound_path desktop_id route metadata binary binary_path omarchy_executable milliseconds seconds delay_timeout program command setter_value
   local -a args=()
   type=$(jq -r '.type' <<<"$action")
-  output=$(mktemp)
+  output=$(mktemp) || { LAST_ERROR="Could not prepare the action output"; return 1; }
+  track_abort_temp "$output"
 
   case $type in
     nightlight|dnd|stay-awake|theme|brightness)
@@ -3896,6 +3919,7 @@ deactivate_listed_routine() {
   local routine_id=$1 reason=$2 result error code
   local ROUTINE_LOCK_WAIT=1
   result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
+  track_abort_temp "$result"
   if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
     error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
     code=$(jq -r '.code // empty' "$result" 2>/dev/null || true)
@@ -4121,6 +4145,8 @@ command_active() {
     [[ -n $routine_id ]] || continue
     snapshot_state=0
     read_snapshot "$routine_id" || snapshot_state=$?
+    # A routine that ended between listing and reading is simply not active.
+    ((snapshot_state != 1)) || continue
     ((snapshot_state == 0)) || fail "${LAST_ERROR:-Activation snapshot is invalid}" unsafe-state
     rows=$(jq -c --argjson row "$SNAPSHOT_JSON" \
       '. + [$row | {routineId,activatedAt,trigger,keepUntil,expiresAt,onEndMode,setterCount:(.setters | length)}]' <<<"$rows")
@@ -4148,7 +4174,8 @@ command_trigger_hook() {
     ((index += 1))
   done
 
-  config_snapshot=$(mktemp)
+  config_snapshot=$(mktemp) || fail "Could not prepare the hook configuration" unsafe-state
+  track_abort_temp "$config_snapshot"
   if ! load_committed_config "$config_snapshot"; then
     rm -f -- "$config_snapshot"
     json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
@@ -4271,6 +4298,15 @@ read_shell_widget_state() {
 # after omarchy.indicators (else after omarchy.weather, else at the end). The
 # previous file is kept under the state backups first. Sets SHELL_CONFIG_BACKUP.
 SHELL_CONFIG_BACKUP=""
+
+# An unused shell.json backup is a managed state file: remove it through the
+# fs helper like every other managed mutation, preserving the caller's error.
+discard_shell_backup() {
+  local saved_error=$LAST_ERROR
+  remove_file_atomic "$1" || true
+  LAST_ERROR=$saved_error
+}
+
 migrate_shell_widget_entry() {
   local snapshot source backup mode baseline error size
   SHELL_CONFIG_BACKUP=""
@@ -4304,7 +4340,7 @@ migrate_shell_widget_entry() {
   fi
   SHELL_CONFIG_BACKUP=$backup
   source=$(mktemp) || {
-    rm -f -- "$snapshot" "$backup"
+    rm -f -- "$snapshot"; discard_shell_backup "$backup"
     SHELL_CONFIG_BACKUP=""
     LAST_ERROR="Could not prepare the shell config update"
     return 1
@@ -4327,7 +4363,7 @@ migrate_shell_widget_entry() {
             )
         end
     ' "$snapshot" >"$source" 2>/dev/null; then
-    rm -f -- "$snapshot" "$source" "$backup"
+    rm -f -- "$snapshot" "$source"; discard_shell_backup "$backup"
     SHELL_CONFIG_BACKUP=""
     LAST_ERROR="Could not build the Omarchy shell config update: $SHELL_CONFIG_FILE"
     return 1
@@ -4335,7 +4371,7 @@ migrate_shell_widget_entry() {
   rm -f -- "$snapshot"
   size=$(stat -c %s -- "$source" 2>/dev/null) || size=""
   if [[ ! $size =~ ^[0-9]+$ ]] || ((size > MAX_CONFIG_BYTES)); then
-    rm -f -- "$source" "$backup"
+    rm -f -- "$source"; discard_shell_backup "$backup"
     SHELL_CONFIG_BACKUP=""
     LAST_ERROR="The updated Omarchy shell config would exceed the 1 MiB limit: $SHELL_CONFIG_FILE"
     return 1
@@ -4408,6 +4444,18 @@ command_widget() {
     ensure|status|forget) ;;
     *) fail "Usage: omachord widget <ensure|status|forget>" usage ;;
   esac
+  if [[ $subcommand != status ]]; then
+    # Serialize ensure/forget so two concurrent ensures cannot both migrate
+    # or both ask the shell. A runtime-directory lock keeps read-only config
+    # probes (and the watched state directory) out of this critical section.
+    prepare_run_lock_dir || fail "$LAST_ERROR" unsafe-state
+    safe_open_private_fd 6 "$RUN_LOCK_DIR/widget.lock" 600 "bar widget lock" true \
+      || fail "$LAST_ERROR" unsafe-state
+    if ! flock -x -w "$LOCK_TIMEOUT" 6 || ! private_fd_matches_file 6 "$RUN_LOCK_DIR/widget.lock"; then
+      exec 6>&-
+      fail "Timed out locking the bar widget state" unsafe-state
+    fi
+  fi
   widget_marker_written || marker_state=$?
   ((marker_state != 2)) || fail "$LAST_ERROR" unsafe-state
   if [[ $subcommand == status ]]; then
@@ -4499,6 +4547,9 @@ Commands:
   disconnect
   bindings
   commands
+  themes                Installed Omarchy theme names
+  service-status        Status snapshot of the resident condition service
+  theme-palette         Accent color and name of the current Omarchy theme
   toggles               Valid top-level Omarchy toggle flags
   run <routine-id> [manual|shortcut|test [expected-revision]]
                         Stateful routines toggle between active and inactive
