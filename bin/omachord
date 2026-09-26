@@ -52,6 +52,10 @@ MAX_TOGGLE_SCAN_BYTES=524288
 MAX_TOGGLE_ENTRIES=4096
 LOCK_TIMEOUT=${OMACHORD_LOCK_TIMEOUT:-10}
 CONTROL_TIMEOUT=${OMACHORD_CONTROL_TIMEOUT:-5s}
+ACTION_TIMEOUT=${OMACHORD_ACTION_TIMEOUT:-30s}
+# "<pid>:<starttime>" of a runner ending routines in bulk, read once and then
+# removed from the environment (see bulk_cleanup_suppresses_hooks).
+BULK_CLEANUP_OWNER=${OMACHORD_BULK_CLEANUP:-}
 CONFIG_SNAPSHOT_FINGERPRINT=""
 CONFIG_COMMIT_REVISION=""
 CONFIG_LOAD_ERROR_CODE=invalid-config
@@ -67,9 +71,17 @@ default_config() {
   printf '%s\n' '{"version":1,"routines":[]}'
 }
 
+# Once a bulk operation has ended routines, every later failure also reports
+# the ids it ended (`deactivated`): ending a routine is not rolled back.
+REPORT_DEACTIVATED=0
 json_error() {
   local message=$1
   local code=${2:-error}
+  if ((REPORT_DEACTIVATED)); then
+    jq -cn --arg error "$message" --arg code "$code" --argjson deactivated "${DEACTIVATED_IDS:-[]}" \
+      '{ok:false,code:$code,error:$error,deactivated:$deactivated}'
+    return
+  fi
   jq -cn --arg error "$message" --arg code "$code" '{ok:false,code:$code,error:$error}'
 }
 
@@ -87,10 +99,8 @@ fail() {
 
 control_capture() {
   local output status
-  output=$(mktemp) || return 1
-  if OMACHORD_ACTION_TIMEOUT="$CONTROL_TIMEOUT" \
-    OMACHORD_CAPTURE_MODE=head OMACHORD_CAPTURE_LIMIT="$MAX_CONTROL_BYTES" \
-    run_capture "$output" "$@"; then
+  output=$(mktemp) || { LAST_ERROR="Could not prepare the command output"; return 1; }
+  if run_capture --timeout "$CONTROL_TIMEOUT" --head "$MAX_CONTROL_BYTES" "$output" "$@"; then
     if ! cat -- "$output"; then
       rm -f -- "$output"
       LAST_ERROR="Could not write the command output"
@@ -174,7 +184,10 @@ write_config_snapshot() {
     LAST_ERROR="Could not read configuration size: $CONFIG_FILE"
     return 1
   }
-  size=$(stat -c %s -- "$CONFIG_FILE" 2>/dev/null) || return 1
+  size=$(stat -c %s -- "$CONFIG_FILE" 2>/dev/null) || {
+    LAST_ERROR="Could not read configuration size: $CONFIG_FILE"
+    return 1
+  }
   if ((size > MAX_CONFIG_BYTES)); then
     LAST_ERROR="Configuration exceeds the 1 MiB limit"
     return 1
@@ -560,9 +573,9 @@ private_fd_matches_file() {
     LAST_ERROR="A private file changed while it was being opened: $path"
     return 1
   fi
-  expected=$(stat -c '%d:%i:%u:%a' -- "$path" 2>/dev/null) || return 1
-  observed=$(stat -Lc '%d:%i:%u:%a' -- "/proc/self/fd/$fd" 2>/dev/null) || return 1
-  if [[ $observed != "$expected" ]]; then
+  if ! expected=$(stat -c '%d:%i:%u:%a' -- "$path" 2>/dev/null) \
+    || ! observed=$(stat -Lc '%d:%i:%u:%a' -- "/proc/self/fd/$fd" 2>/dev/null) \
+    || [[ $observed != "$expected" ]]; then
     LAST_ERROR="A private file changed while it was being opened: $path"
     return 1
   fi
@@ -572,6 +585,10 @@ safe_open_private_fd() {
   local destination_fd=$1 path=$2 mode=${3:-600} label=${4:-state file}
   local create=${5:-false}
   local error_file opener_job opener_out opener_in opener_pid opener_fd open_ok=true
+  # Report this open's own failure, never a stale error from earlier work;
+  # a successful open leaves the caller's LAST_ERROR as it was.
+  local saved_error=$LAST_ERROR
+  LAST_ERROR=""
   if [[ ! -x $FS_HELPER ]]; then
     LAST_ERROR="The Omachord filesystem helper is unavailable"
     return 1
@@ -619,6 +636,7 @@ safe_open_private_fd() {
     return 1
   fi
   rm -f -- "$error_file"
+  LAST_ERROR=$saved_error
 }
 
 acquire_config_lock() {
@@ -630,6 +648,22 @@ acquire_config_lock() {
     flock -x -w "$LOCK_TIMEOUT" 9 || { exec 9>&-; LAST_ERROR="Timed out locking configuration state"; return 1; }
   fi
   if ! private_fd_matches_file 9 "$LOCK_FILE"; then exec 9>&-; return 1; fi
+}
+
+# A routine command holds the shared config lock (fd 9) only while it resolves
+# its definition from the committed snapshot and, for a stateful activation,
+# until its activation record is claimed (so a bulk writer always sees it).
+# After that the routine lock (fd 7) alone serializes it with writers: config
+# apply and disconnect wait for fd 7 before ending a routine, and every
+# checkpoint write happens under fd 7. Long actions therefore no longer make
+# config apply/connect/disconnect time out on the config lock. A routine
+# records against the end-plan digest it resolved, even if the committed
+# definition changes while it runs.
+CONFIG_LOCK_RELEASABLE=0
+release_config_lock_for_actions() {
+  ((CONFIG_LOCK_RELEASABLE)) || return 0
+  CONFIG_LOCK_RELEASABLE=0
+  exec 9>&-
 }
 
 acquire_log_lock() {
@@ -796,7 +830,7 @@ generate_hook_wrapper() {
 write_hook_wrapper() {
   local event=$1 destination source
   destination=$(hook_wrapper_path "$event")
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage a hook wrapper"; return 1; }
   if ! generate_hook_wrapper "$event" >"$source"; then
     rm -f -- "$source"
     return 1
@@ -810,7 +844,7 @@ write_hook_wrapper() {
 
 sync_generated_lua() {
   local file=$1 lua_source
-  lua_source=$(mktemp) || return 1
+  lua_source=$(mktemp) || { LAST_ERROR="Could not stage the generated shortcuts"; return 1; }
   if ! generate_lua "$file" >"$lua_source" || ! transaction_write_atomic "$lua_source" "$GENERATED_LUA" 600; then
     rm -f -- "$lua_source"
     return 1
@@ -825,9 +859,16 @@ install_hook_wrappers() {
   done
 }
 
+# Reads a user-controlled path without following a final symlink and without
+# blocking: a FIFO swapped in while a lock is held yields an error or EOF
+# instead of hanging. Callers still fingerprint or CAS what they act on.
+read_nonblocking() {
+  dd if="$1" iflag=nofollow,nonblock bs=1M status=none 2>/dev/null
+}
+
 connected() {
   [[ -f $BINDINGS_FILE && ! -L $BINDINGS_FILE ]] \
-    && grep -Fqx -- "$LOADER_LINE" "$BINDINGS_FILE"
+    && grep -Fqx -- "$LOADER_LINE" < <(read_nonblocking "$BINDINGS_FILE")
 }
 
 owned_connection() {
@@ -894,7 +935,7 @@ remove_connection_disabled() {
 
 write_ownership() {
   local source
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage the ownership record"; return 1; }
   if ! jq -cn --arg id "$PLUGIN_ID" --arg connectedAt "$(date --iso-8601=seconds)" \
     '{version:2,pluginId:$id,loaderCreated:true,iconCreated:true,connectedAt:$connectedAt}' >"$source" \
     || ! transaction_write_atomic "$source" "$OWNERSHIP_FILE" 600; then
@@ -906,9 +947,10 @@ write_ownership() {
 
 generated_lua_matches() {
   local expected=$1 current=$2
-  cmp -s -- "$expected" "$current" \
+  [[ -f $current && ! -L $current ]] || return 1
+  cmp -s -- "$expected" <(read_nonblocking "$current") \
     || sed -e '1s/^-- Generated by Omachord/-- Generated by Oma Chord/' \
-      -e 's/"Omachord: /"Oma: /' "$expected" | cmp -s - "$current"
+      -e 's/"Omachord: /"Oma: /' "$expected" | cmp -s - <(read_nonblocking "$current")
 }
 
 generated_lua_fast_path_ready() {
@@ -946,13 +988,14 @@ shortcut_projection_matches() {
 
 desktop_entry_matches() {
   local expected=$1 current=$2
-  cmp -s -- "$expected" "$current" \
-    || sed 's/^Name=Omachord$/Name=Oma Chord/' "$expected" | cmp -s - "$current"
+  [[ -f $current && ! -L $current ]] || return 1
+  cmp -s -- "$expected" <(read_nonblocking "$current") \
+    || sed 's/^Name=Omachord$/Name=Oma Chord/' "$expected" | cmp -s - <(read_nonblocking "$current")
 }
 
 icon_matches() {
   [[ -f $ICON_SOURCE && ! -L $ICON_SOURCE && -f $ICON_FILE && ! -L $ICON_FILE ]] \
-    && cmp -s -- "$ICON_SOURCE" "$ICON_FILE"
+    && cmp -s -- "$ICON_SOURCE" <(read_nonblocking "$ICON_FILE")
 }
 
 integration_branding_current() {
@@ -965,9 +1008,11 @@ integration_branding_current() {
   if ! write_config_snapshot "$config" \
     || ! validate_config_file "$config" \
     || ! generate_lua "$config" >"$expected" \
-    || ! cmp -s -- "$expected" "$GENERATED_LUA" \
+    || [[ ! -f $GENERATED_LUA || -L $GENERATED_LUA ]] \
+    || ! cmp -s -- "$expected" <(read_nonblocking "$GENERATED_LUA") \
     || ! generate_desktop_entry >"$expected" \
-    || ! cmp -s -- "$expected" "$DESKTOP_FILE" \
+    || [[ ! -f $DESKTOP_FILE || -L $DESKTOP_FILE ]] \
+    || ! cmp -s -- "$expected" <(read_nonblocking "$DESKTOP_FILE") \
     || ! icon_matches; then
     rm -f -- "$config" "$expected"
     return 1
@@ -1011,7 +1056,7 @@ integration_complete() {
     path=$(hook_wrapper_path "$event")
     if [[ ! -f $path || -L $path || ! -x $path || $(stat -c %a "$path") != 755 ]] \
       || ! generate_hook_wrapper "$event" >"$expected" \
-      || ! cmp -s -- "$expected" "$path"; then
+      || ! cmp -s -- "$expected" <(read_nonblocking "$path"); then
       rm -f -- "$config" "$expected"
       return 1
     fi
@@ -1038,6 +1083,28 @@ backup_bindings() {
     LAST_ERROR="Could not back up $BINDINGS_FILE"
     return 1
   fi
+  prune_bindings_backups
+}
+
+# Every Connect/Disconnect backs up bindings.lua. Keep the newest
+# BINDINGS_BACKUP_KEEP copies plus the oldest one, which is the user's file
+# from before Omachord first connected. Removal goes through the fs helper;
+# pruning is best-effort and never fails the surrounding transaction.
+BINDINGS_BACKUP_KEEP=10
+prune_bindings_backups() {
+  local directory="$STATE_DIR/backups" saved_error=$LAST_ERROR listing count index
+  local -a names=()
+  [[ -d $directory && ! -L $directory ]] || return 0
+  listing=$(find "$directory" -maxdepth 1 -type f -name 'bindings.lua.*' -printf '%T@ %f\n' 2>/dev/null \
+    | LC_ALL=C sort -n) || return 0
+  mapfile -t names < <(awk '{ print $2 }' <<<"$listing")
+  count=${#names[@]}
+  ((count > BINDINGS_BACKUP_KEEP + 1)) || return 0
+  for ((index = 1; index < count - BINDINGS_BACKUP_KEEP; index++)); do
+    [[ ${names[$index]} =~ ^bindings\.lua\.[0-9a-f]+$ ]] || continue
+    remove_file_atomic "$directory/${names[$index]}" || true
+  done
+  LAST_ERROR=$saved_error
 }
 
 connection_collision() {
@@ -1145,8 +1212,11 @@ snapshot_file() {
   SNAPSHOT_BASELINES+=("$baseline")
   SNAPSHOT_EXPECTED+=("")
   if [[ $baseline == file:* ]]; then
+    local mode=${baseline#file:}
+    mode=${mode%%:*}
     if [[ -L $path || ! -f $path ]] \
-      || ! cp -p -- "$path" "$SNAPSHOT_DIR/$key" \
+      || ! read_nonblocking "$path" >"$SNAPSHOT_DIR/$key" \
+      || ! chmod "$mode" -- "$SNAPSHOT_DIR/$key" \
       || [[ $(fingerprint_path "$path") != "$baseline" ]] \
       || [[ $(fingerprint_for_destination "$SNAPSHOT_DIR/$key" "$path") != "$baseline" ]] \
       || ! touch "$SNAPSHOT_DIR/$key.exists"; then
@@ -1198,7 +1268,18 @@ file_fingerprint() {
   if [[ -L $path ]]; then
     printf 'symlink:%s\n' "$(readlink -- "$path")"
   elif [[ -f $path ]]; then
-    printf 'file:%s:%s\n' "$(stat -c %a "$path")" "$(sha256sum -- "$path" | awk '{print $1}')"
+    # Hash through a nonblocking, no-follow read and confirm the same regular
+    # inode was read; a swapped-in FIFO or link reports unstable, never hangs.
+    local before after hash
+    before=$(stat -c '%d:%i:%a:%F' -- "$path" 2>/dev/null) || before=""
+    hash=$(read_nonblocking "$path" | sha256sum) || hash=""
+    after=$(stat -c '%d:%i:%a:%F' -- "$path" 2>/dev/null) || after=""
+    if [[ -n $before && -n $hash && $after == "$before" && $before == *:regular* ]]; then
+      before=${before%:*}
+      printf 'file:%s:%s\n' "${before##*:}" "${hash%% *}"
+    else
+      printf '%s\n' unstable
+    fi
   elif [[ -e $path ]]; then
     printf 'other:%s\n' "$(stat -c %F "$path")"
   else
@@ -1377,6 +1458,9 @@ snapshot_end() {
 transaction_abort() {
   local status=${1:-$?}
   trap - EXIT HUP INT TERM
+  # A signal may interrupt run_capture (e.g. the reload's hyprctl). Cancel
+  # and reap that action before the recovery reload starts a new capture.
+  cleanup_active_action
   TRANSACTION_CRITICAL=0
   TRANSACTION_PENDING_SIGNAL=0
   if ((TRANSACTION_ARMED)); then
@@ -1661,7 +1745,7 @@ install_icon() {
 
 install_desktop_entry() {
   local source
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage the desktop entry"; return 1; }
   if ! generate_desktop_entry >"$source"; then
     rm -f -- "$source"
     return 1
@@ -1674,7 +1758,7 @@ install_desktop_entry() {
 }
 
 append_loader() {
-  local allow_existing=${1:-true} source mode final_newline
+  local allow_existing=${1:-true} source mode
   if [[ -L $BINDINGS_FILE || (-e $BINDINGS_FILE && ! -f $BINDINGS_FILE) ]]; then
     LAST_ERROR="Refusing to replace a non-regular file: $BINDINGS_FILE"
     return 1
@@ -1682,21 +1766,21 @@ append_loader() {
   if [[ -n $SNAPSHOT_DIR ]]; then
     snapshot_assert_unchanged "$BINDINGS_FILE" || return 1
   fi
-  if [[ -f $BINDINGS_FILE ]] && grep -Fqx -- "$LOADER_LINE" "$BINDINGS_FILE"; then
+  if [[ -f $BINDINGS_FILE ]] && grep -Fqx -- "$LOADER_LINE" < <(read_nonblocking "$BINDINGS_FILE"); then
     if [[ $allow_existing == true ]]; then
       return 0
     fi
     LAST_ERROR="Refusing to claim a loader line created during Connect"
     return 1
   fi
-  source=$(mktemp) || return 1
+  source=$(mktemp) || { LAST_ERROR="Could not stage the bindings update"; return 1; }
   if [[ -f $BINDINGS_FILE ]]; then
     if ! mode=$(stat -c %a "$BINDINGS_FILE"); then
       rm -f -- "$source"
       LAST_ERROR="Could not read the bindings mode"
       return 1
     fi
-    if ! cat "$BINDINGS_FILE" >"$source"; then
+    if ! read_nonblocking "$BINDINGS_FILE" >"$source"; then
       rm -f -- "$source"
       LAST_ERROR="Could not read $BINDINGS_FILE"
       return 1
@@ -1704,16 +1788,10 @@ append_loader() {
   else
     mode=644
   fi
-  if ! final_newline=$(tail -c 1 "$source" | wc -l); then
-    rm -f -- "$source"
-    LAST_ERROR="Could not read the staged bindings"
-    return 1
-  fi
-  if [[ -s $source && $final_newline -eq 0 ]] && ! printf '\n' >>"$source"; then
-    rm -f -- "$source"
-    LAST_ERROR="Could not stage the loader newline"
-    return 1
-  fi
+  # Always append exactly "\n<loader>\n". After a final newline (or in an
+  # empty file) that leaves one blank separator line; after an unterminated
+  # last line it only terminates that line. remove_loader inverts both
+  # layouts, so Connect followed by Disconnect is a byte-identical round trip.
   if ! printf '\n%s\n' "$LOADER_LINE" >>"$source"; then
     rm -f -- "$source"
     LAST_ERROR="Could not stage the loader"
@@ -1727,18 +1805,41 @@ append_loader() {
 }
 
 remove_loader() {
-  local source mode filter_status=0
+  local source current mode
   [[ -f $BINDINGS_FILE ]] || return 0
-  mode=$(stat -c %a "$BINDINGS_FILE") || return 1
-  source=$(mktemp) || return 1
-  grep -Fvx -- "$LOADER_LINE" "$BINDINGS_FILE" >"$source" || filter_status=$?
-  # grep returns 1 for a valid empty result, but 2 (or a signal status) means
-  # the staged file may be partial and must never replace the user's bindings.
-  if ((filter_status > 1)); then
-    rm -f -- "$source"
+  mode=$(stat -c %a "$BINDINGS_FILE") || { LAST_ERROR="Could not read the bindings mode"; return 1; }
+  current=$(mktemp) || { LAST_ERROR="Could not stage loader removal"; return 1; }
+  source=$(mktemp) || { rm -f -- "$current"; LAST_ERROR="Could not stage loader removal"; return 1; }
+  # Drop every loader line. When the loader is the final line (where
+  # append_loader put it), also undo exactly what the append added: the one
+  # blank separator line before it, or the newline that terminated an
+  # unterminated last line. Other user blank lines are never touched, so a
+  # legacy file that accumulated blank lines stops growing but keeps them.
+  if ! read_nonblocking "$BINDINGS_FILE" >"$current" \
+    || ! OMACHORD_LOADER=$LOADER_LINE LC_ALL=C awk '
+      { line[NR] = $0 }
+      END {
+        loader = ENVIRON["OMACHORD_LOADER"]
+        cut = NR
+        unterminated = 0
+        if (NR > 0 && line[NR] == loader) {
+          if (NR >= 2 && line[NR - 1] == "") cut = NR - 2
+          else if (NR >= 2) { cut = NR - 1; unterminated = 1 }
+          else cut = 0
+        }
+        kept = 0
+        for (i = 1; i <= cut; i++) if (line[i] != loader) text[++kept] = line[i]
+        for (i = 1; i <= kept; i++) {
+          if (i == kept && unterminated) printf "%s", text[i]
+          else printf "%s\n", text[i]
+        }
+      }' "$current" >"$source"; then
+    # A partial staged file must never replace the user's bindings.
+    rm -f -- "$current" "$source"
     LAST_ERROR="Could not stage loader removal"
     return 1
   fi
+  rm -f -- "$current"
   if ! transaction_write_atomic "$source" "$BINDINGS_FILE" "$mode"; then
     rm -f -- "$source"
     return 1
@@ -1748,7 +1849,7 @@ remove_loader() {
 
 command_config_show() {
   local temporary
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! write_config_snapshot "$temporary" || ! validate_config_file "$temporary"; then
     rm -f -- "$temporary"
     fail "$LAST_ERROR" invalid-config
@@ -1760,7 +1861,7 @@ command_config_show() {
 command_config_snapshot() {
   local temporary revision committed=false
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! require_secure_config_file \
     || ! write_config_snapshot "$temporary" \
     || ! validate_config_file "$temporary"; then
@@ -1780,7 +1881,7 @@ command_config_snapshot() {
 
 command_config_validate() {
   local temporary
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration check" unsafe-state
   if ! read_config_stdin "$temporary" || ! validate_config_file "$temporary"; then
     rm -f -- "$temporary"
     fail "$LAST_ERROR" invalid-config
@@ -1878,17 +1979,12 @@ command_config_apply() {
 
   if ! active_end_plans_match "$candidate" 1; then
     rm -f -- "$candidate" "$candidate_lua"
-    fail "$LAST_ERROR" active-plan-conflict
+    fail "$LAST_ERROR" "$ACTIVE_PLAN_ERROR_CODE"
   fi
 
-  export OMACHORD_BULK_CLEANUP=1
-  if ! deactivate_orphans config "$candidate"; then
-    unset OMACHORD_BULK_CLEANUP
-    rm -f -- "$candidate" "$candidate_lua"
-    fail "$LAST_ERROR" action-failed
-  fi
-  unset OMACHORD_BULK_CLEANUP
-
+  # Every check that can fail without side effects (snapshots, concurrent-
+  # edit fingerprints) runs before orphaned routines are ended, because
+  # ending a routine runs its restore/end actions and cannot be rolled back.
   if ! snapshot_begin \
     || ! snapshot_file "$CONFIG_FILE" config \
     || ! snapshot_file "$COMMIT_FILE" commit; then
@@ -1913,6 +2009,17 @@ command_config_apply() {
     rm -f -- "$candidate" "$candidate_lua"
     fail "$LAST_ERROR" snapshot-failed
   fi
+
+  begin_bulk_cleanup
+  if ! deactivate_orphans config "$candidate"; then
+    end_bulk_cleanup
+    REPORT_DEACTIVATED=1
+    snapshot_end
+    rm -f -- "$candidate" "$candidate_lua"
+    fail "$LAST_ERROR" "$DEACTIVATION_ERROR_CODE"
+  fi
+  end_bulk_cleanup
+  REPORT_DEACTIVATED=1
   transaction_arm "$([[ $update_generated == true ]] && printf 1 || printf 0)"
 
   mutation_error=""
@@ -2005,7 +2112,7 @@ connect_locked() {
     require_clean_hyprland || fail "$LAST_ERROR" hyprland-errors
   fi
 
-  candidate=$(mktemp)
+  candidate=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! write_config_snapshot "$candidate" || ! validate_config_file "$candidate"; then
     rm -f -- "$candidate"
     fail "$LAST_ERROR" invalid-config
@@ -2029,7 +2136,7 @@ connect_locked() {
   fi
   if ! active_end_plans_match "$candidate"; then
     rm -f -- "$candidate"
-    fail "$LAST_ERROR" active-plan-conflict
+    fail "$LAST_ERROR" "$ACTIVE_PLAN_ERROR_CODE"
   fi
   if [[ $already_connected == true ]]; then
     rm -f -- "$candidate"
@@ -2059,7 +2166,7 @@ connect_locked() {
     fail "Configuration changed before the transaction started" concurrent-edit
   fi
   if [[ $repairing != true && -f $BINDINGS_FILE ]] \
-    && grep -Fqx -- "$LOADER_LINE" "$BINDINGS_FILE"; then
+    && grep -Fqx -- "$LOADER_LINE" < <(read_nonblocking "$BINDINGS_FILE"); then
     snapshot_end
     rm -f -- "$candidate"
     fail "Refusing to claim a loader line created during Connect" ownership-conflict
@@ -2147,12 +2254,14 @@ command_disconnect() {
   acquire_config_lock || fail "$LAST_ERROR" unsafe-state
 
   if ! connected && ! owned_connection; then
-    export OMACHORD_BULK_CLEANUP=1
+    begin_bulk_cleanup
     if ! deactivate_all disconnect; then
-      unset OMACHORD_BULK_CLEANUP
-      fail "$LAST_ERROR" action-failed
+      end_bulk_cleanup
+      REPORT_DEACTIVATED=1
+      fail "$LAST_ERROR" "$DEACTIVATION_ERROR_CODE"
     fi
-    unset OMACHORD_BULK_CLEANUP
+    end_bulk_cleanup
+    REPORT_DEACTIVATED=1
     write_connection_disabled || fail "$LAST_ERROR" unsafe-state
     jq -cn --argjson deactivated "$DEACTIVATED_IDS" \
       '{ok:true,connected:false,alreadyDisconnected:true,deactivated:$deactivated}'
@@ -2161,12 +2270,8 @@ command_disconnect() {
   if ! owned_connection; then
     fail "The Hyprland loader is not owned by this installation; it was left untouched" ownership-conflict
   fi
-  export OMACHORD_BULK_CLEANUP=1
-  if ! deactivate_all disconnect; then
-    unset OMACHORD_BULK_CLEANUP
-    fail "$LAST_ERROR" action-failed
-  fi
-  unset OMACHORD_BULK_CLEANUP
+  # Snapshot and back up first: ending routines is irreversible, so it runs
+  # only after every check that can fail without side effects.
   if ! snapshot_begin || ! snapshot_owned_files 0 1; then
     snapshot_end
     fail "$LAST_ERROR" snapshot-failed
@@ -2175,6 +2280,15 @@ command_disconnect() {
     snapshot_end
     fail "$LAST_ERROR" backup-failed
   fi
+  begin_bulk_cleanup
+  if ! deactivate_all disconnect; then
+    end_bulk_cleanup
+    REPORT_DEACTIVATED=1
+    snapshot_end
+    fail "$LAST_ERROR" "$DEACTIVATION_ERROR_CODE"
+  fi
+  end_bulk_cleanup
+  REPORT_DEACTIVATED=1
   transaction_arm 1
 
   if ! remove_loader \
@@ -2235,7 +2349,7 @@ command_status() {
   local errors="" clean=false hyprland_available=false config_valid=true config_error=""
   local temporary disabled_state=0 connection_enabled=true
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
-  temporary=$(mktemp)
+  temporary=$(mktemp) || fail "Could not prepare the configuration snapshot" unsafe-state
   if ! write_config_snapshot "$temporary"; then
     config_valid=false
     config_error=$LAST_ERROR
@@ -2324,9 +2438,8 @@ command_toggles() {
   local capture error
   [[ $# -eq 0 ]] || fail "Usage: omachord toggles" usage
   capture=$(mktemp) || fail "Could not prepare the toggle scan" toggles-unavailable
-  if ! PATH=/usr/bin:/bin OMACHORD_ACTION_TIMEOUT="$CONTROL_TIMEOUT" \
-      OMACHORD_CAPTURE_MODE=head OMACHORD_CAPTURE_LIMIT="$MAX_TOGGLE_SCAN_BYTES" \
-      run_capture "$capture" "$FS_HELPER" list-toggles "$TOGGLES_DIR" \
+  if ! PATH=/usr/bin:/bin run_capture --timeout "$CONTROL_TIMEOUT" --head "$MAX_TOGGLE_SCAN_BYTES" \
+      "$capture" "$FS_HELPER" list-toggles "$TOGGLES_DIR" \
         "$MAX_TOGGLE_ENTRIES" "$MAX_TOGGLE_SCAN_BYTES"; then
     error=$(/usr/bin/jq -r '.error // empty' "$capture" 2>/dev/null || true)
     [[ -n $error ]] || error=$LAST_ERROR
@@ -2360,6 +2473,8 @@ rotate_log() {
 log_run() {
   local routine_id=$1 trigger=$2 status=$3 duration=$4 error=${5:-}
   local entry
+  # The action error travels in $error; LAST_ERROR now reports log failures.
+  LAST_ERROR=""
   if ! entry=$(jq -cn \
     --arg timestamp "$(date --iso-8601=seconds)" \
     --arg routineId "$routine_id" \
@@ -2420,18 +2535,37 @@ process_start_time() {
   printf '%s\n' "${fields[19]}"
 }
 
+# Private temporary files that live across a routine's actions. A signal
+# abort removes them after the running action is reaped; normal paths remove
+# their own files, so a later rm -f of an already removed name is harmless.
+declare -a ABORT_TEMP_FILES=()
+track_abort_temp() {
+  ABORT_TEMP_FILES+=("$1")
+}
+
 abort_active_routine() {
   local status=$1
   trap - HUP INT TERM
   cleanup_active_action
+  ((${#ABORT_TEMP_FILES[@]} == 0)) || rm -f -- "${ABORT_TEMP_FILES[@]}"
   exit "$status"
 }
 
+# run_capture [--timeout DURATION] [--head LIMIT] OUTPUT COMMAND...
+# Capture settings are explicit arguments, never environment variables, so
+# they cannot leak into the action tree or be injected from the ambient env.
 run_capture() {
+  local capture_mode=tail capture_limit=4096 action_timeout=$ACTION_TIMEOUT outcome=""
+  while (($# > 0)); do
+    case $1 in
+      --timeout) action_timeout=$2; shift 2 ;;
+      --head) capture_mode=head; capture_limit=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
   local output_file=$1
   shift
   local status capture_dir supervisor_pid parent_pid parent_start output_size pipe_in pipe_out
-  local capture_mode=${OMACHORD_CAPTURE_MODE:-tail} capture_limit=${OMACHORD_CAPTURE_LIMIT:-4096}
   LAST_ERROR=""
   capture_dir=$(mktemp -d) || {
     LAST_ERROR="Could not create an action output buffer"
@@ -2453,9 +2587,11 @@ run_capture() {
   # One native owner captures bounded output and retains the timeout leader
   # unreaped through the final group signal. The pipe carries cancellation by
   # EOF, so cleanup needs neither writable markers nor a recyclable job PID.
+  # The supervisor's outcome line in the capture directory is advisory: it
+  # only refines the message (own timeout vs. killed vs. exit status).
   coproc OMACHORD_CAPTURE {
     exec "$ACTION_SUPERVISOR" "$parent_pid" "$parent_start" "$capture_dir" \
-      "${OMACHORD_ACTION_TIMEOUT:-30s}" --capture "$capture_mode" "$capture_limit" "$output_file" -- "$@" \
+      "$action_timeout" --capture "$capture_mode" "$capture_limit" "$output_file" -- "$@" \
       8>&- 9>&- > /dev/null 2>"$capture_dir/error"
   }
   supervisor_pid=$!
@@ -2476,11 +2612,22 @@ run_capture() {
   ACTIVE_CONTROL_FD=""
   ACTIVE_SUPERVISOR_PID=""
   output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
+  [[ ! -f $capture_dir/outcome ]] || IFS= read -r outcome <"$capture_dir/outcome" || true
   if [[ $capture_mode == head ]] && ((output_size > capture_limit)); then
     status=125
     LAST_ERROR="Command output exceeds the $capture_limit byte limit"
-  elif ((status != 0)) && [[ -s $capture_dir/error ]]; then
-    LAST_ERROR=$(tail -c 2000 "$capture_dir/error" | tr '\n' ' ')
+  elif ((status != 0)) && [[ $outcome == timeout ]]; then
+    # Only the supervisor knows whether its deadline fired; exit 124/137
+    # alone is also what an action killed by SIGKILL or exiting 124 returns.
+    LAST_ERROR="Action timed out after $action_timeout"
+  elif ((status != 0)) && [[ $outcome == "signal "* ]]; then
+    LAST_ERROR="Action was killed (signal ${outcome#signal })"
+  elif ((status != 0)) && [[ $outcome == cancelled ]]; then
+    LAST_ERROR="Action was cancelled"
+  elif ((status != 0)) && [[ $outcome == internal || -z $outcome ]] && [[ -s $capture_dir/error ]]; then
+    LAST_ERROR="The action supervisor failed: $(tail -c 2000 "$capture_dir/error" | tr '\n' ' ')"
+  elif ((status != 0)) && [[ $outcome == internal ]]; then
+    LAST_ERROR="The action supervisor failed while capturing output"
   fi
   set -e
   rm -rf -- "$capture_dir"
@@ -2488,9 +2635,7 @@ run_capture() {
   if ((status == 0)); then
     return 0
   fi
-  if ((status == 124 || status == 137)); then
-    LAST_ERROR="Action timed out after ${OMACHORD_ACTION_TIMEOUT:-30s}"
-  elif [[ -z $LAST_ERROR ]]; then
+  if [[ -z $LAST_ERROR ]]; then
     LAST_ERROR=$(tail -c 2000 "$output_file" | tr '\n' ' ')
     [[ -n $LAST_ERROR ]] || LAST_ERROR="Command failed: $1"
   fi
@@ -2550,7 +2695,8 @@ execute_action() {
   local action=$1 type output sound_path desktop_id route metadata binary binary_path omarchy_executable milliseconds seconds delay_timeout program command setter_value
   local -a args=()
   type=$(jq -r '.type' <<<"$action")
-  output=$(mktemp)
+  output=$(mktemp) || { LAST_ERROR="Could not prepare the action output"; return 1; }
+  track_abort_temp "$output"
 
   case $type in
     nightlight|dnd|stay-awake|theme|brightness)
@@ -2622,7 +2768,7 @@ execute_action() {
       milliseconds=$(jq -r '.milliseconds' <<<"$action")
       seconds=$(jq -nr --argjson ms "$milliseconds" '$ms / 1000')
       delay_timeout=$(jq -nr --argjson ms "$milliseconds" '($ms / 1000 + 1 | tostring) + "s"')
-      if ! OMACHORD_ACTION_TIMEOUT="$delay_timeout" run_capture "$output" sleep "$seconds"; then
+      if ! run_capture --timeout "$delay_timeout" "$output" sleep "$seconds"; then
         rm -f -- "$output"
         return 1
       fi
@@ -3149,8 +3295,10 @@ snapshot_end_plan_matches() {
 # Called under the exclusive config lock, before committing any configuration.
 # Apply may end removed/disabled/stateless routines using the old committed
 # config. Connect cannot do that after a direct edit, so it rejects the conflict.
+ACTIVE_PLAN_ERROR_CODE=active-plan-conflict
 active_end_plans_match() {
   local config_file=$1 allow_orphans=${2:-0} routine_id routine state active_ids
+  ACTIVE_PLAN_ERROR_CODE=active-plan-conflict
   if ! active_ids=$(active_routine_ids); then
     LAST_ERROR="Could not inspect active end plans"
     return 1
@@ -3159,6 +3307,19 @@ active_end_plans_match() {
     [[ -n $routine_id ]] || continue
     state=0
     read_snapshot "$routine_id" || state=$?
+    if ((state == 2)); then
+      # A still-running routine may be replacing its checkpoint right now.
+      # Every checkpoint writer holds the routine lock, so re-read under it.
+      local ROUTINE_LOCK_WAIT=1
+      if ! lock_routine "$routine_id"; then
+        [[ $LOCK_ERROR_CODE != routine-running ]] || ACTIVE_PLAN_ERROR_CODE=routine-running
+        return 1
+      fi
+      state=0
+      read_snapshot "$routine_id" || state=$?
+      exec 7>&-
+      ROUTINE_LOCK_WAIT=0
+    fi
     ((state != 2)) || return 1
     ((state == 0)) || continue
     if ! routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file"); then
@@ -3190,7 +3351,10 @@ RESOLVED_ROUTINE=""
 resolve_routine() {
   local routine_id=$1 allow_disabled=${2:-0} expected_revision=${3:-} config_file enabled current_revision
   RESOLVED_ROUTINE=""
-  config_file=$(mktemp)
+  config_file=$(mktemp) || {
+    json_error "Could not stage the routine configuration" unsafe-state
+    return 1
+  }
   if ! load_committed_config "$config_file"; then
     rm -f -- "$config_file"
     json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
@@ -3223,6 +3387,9 @@ resolve_routine() {
 }
 
 LOCK_ERROR_CODE=""
+# Callers that must serialize with a running routine (bulk cleanup under the
+# exclusive config lock) set ROUTINE_LOCK_WAIT=1 as a local to wait for it.
+ROUTINE_LOCK_WAIT=0
 lock_routine() {
   local routine_id=$1
   LOCK_ERROR_CODE=lock-error
@@ -3233,7 +3400,14 @@ lock_routine() {
     exec 7>&-
     return 1
   fi
-  if ! flock -n 7; then
+  if ((ROUTINE_LOCK_WAIT)); then
+    if ! flock -x -w "$LOCK_TIMEOUT" 7; then
+      exec 7>&-
+      LAST_ERROR="Routine is still running: $routine_id; retry when it finishes"
+      LOCK_ERROR_CODE=routine-running
+      return 1
+    fi
+  elif ! flock -n 7; then
     exec 7>&-
     LAST_ERROR="Routine is already running: $routine_id"
     LOCK_ERROR_CODE=busy
@@ -3405,6 +3579,8 @@ run_resolved_routine() {
     json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
     return 1
   fi
+  # A stateless run leaves no record a writer must see; fd 7 suffices now.
+  release_config_lock_for_actions
   arm_routine_traps
   if ! prepare_routine_brightness "$routine"; then
     reject_unavailable_brightness "$routine_id" "$trigger"
@@ -3514,6 +3690,8 @@ activate_resolved_routine() {
     json_error "$LAST_ERROR" "$ACTIVATION_ERROR_CODE"
     return 1
   fi
+  # The claimed record is visible to bulk writers, which wait for fd 7.
+  release_config_lock_for_actions
 
   while IFS= read -r entry; do
     if ! snapshot_still_owned "$routine_id"; then status="failed"; error=$LAST_ERROR; break; fi
@@ -3682,8 +3860,8 @@ deactivate_routine() {
   end_action_index=$(jq -r '.endActionIndex // 0' <<<"$snapshot")
 
   if [[ $on_end_mode == actions ]]; then
-    config_file=$(mktemp)
-    if load_committed_config "$config_file"; then
+    config_file=$(mktemp) || { config_file=""; LAST_ERROR="Could not stage the committed configuration"; }
+    if [[ -n $config_file ]] && load_committed_config "$config_file"; then
       routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
       if [[ -z $routine ]]; then
         status="failed"
@@ -3704,6 +3882,8 @@ deactivate_routine() {
     fi
     rm -f -- "$config_file"
   fi
+  # The ending plan is resolved; the routine lock alone serializes the rest.
+  release_config_lock_for_actions
 
   RESTORED_COUNT=0
   SKIPPED_COUNT=0
@@ -3808,43 +3988,54 @@ toggle_resolved_routine() {
 
 # Ends active routines that the given configuration no longer supports.
 DEACTIVATED_IDS="[]"
+DEACTIVATION_ERROR_CODE=action-failed
+
+# Bulk writers hold the exclusive config lock, but a routine that is still
+# activating or ending holds only its routine lock (fd 7). Wait for that lock
+# (bounded by LOCK_TIMEOUT) so a bulk end never races a running routine; a
+# routine still busy after the wait is reported as retryable routine-running.
+deactivate_listed_routine() {
+  local routine_id=$1 reason=$2 result error code
+  local ROUTINE_LOCK_WAIT=1
+  result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
+  track_abort_temp "$result"
+  if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
+    error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
+    code=$(jq -r '.code // empty' "$result" 2>/dev/null || true)
+    rm -f -- "$result"
+    [[ -z $error ]] || LAST_ERROR=$error
+    [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
+    [[ $code != routine-running ]] || DEACTIVATION_ERROR_CODE=routine-running
+    return 1
+  fi
+  # A routine that finished ending while we waited was not ended by us.
+  if ! jq -e '.alreadyInactive == true' "$result" >/dev/null 2>&1; then
+    DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+  fi
+  rm -f -- "$result"
+}
+
 deactivate_orphans() {
-  local reason=$1 config_file=$2 routine_id routine result error
+  local reason=$1 config_file=$2 routine_id routine
   DEACTIVATED_IDS="[]"
+  DEACTIVATION_ERROR_CODE=action-failed
   while IFS= read -r routine_id; do
     [[ -n $routine_id ]] || continue
     routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
     if [[ -z $routine ]] || [[ $(jq -r '.enabled' <<<"$routine") != true ]] \
       || ! routine_is_stateful "$routine"; then
-      result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
-      if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
-        error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
-        rm -f -- "$result"
-        [[ -z $error ]] || LAST_ERROR=$error
-        [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
-        return 1
-      fi
-      rm -f -- "$result"
-      DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+      deactivate_listed_routine "$routine_id" "$reason" || return 1
     fi
   done < <(active_routine_ids)
 }
 
 deactivate_all() {
-  local reason=$1 routine_id result error
+  local reason=$1 routine_id
   DEACTIVATED_IDS="[]"
+  DEACTIVATION_ERROR_CODE=action-failed
   while IFS= read -r routine_id; do
     [[ -n $routine_id ]] || continue
-    result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
-    if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
-      error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
-      rm -f -- "$result"
-      [[ -z $error ]] || LAST_ERROR=$error
-      [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
-      return 1
-    fi
-    rm -f -- "$result"
-    DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+    deactivate_listed_routine "$routine_id" "$reason" || return 1
   done < <(active_routine_ids)
 }
 
@@ -3859,6 +4050,7 @@ command_run() {
     *) fail "Unknown run source: $trigger" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   if [[ $trigger == shortcut ]]; then
     automatic_integration_enabled || fail "$LAST_ERROR" not-connected
   fi
@@ -3883,6 +4075,7 @@ command_activate() {
     fail "A supplied activation revision must not be empty" usage
   fi
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   if [[ $trigger == condition || $trigger == service ]]; then
     [[ $expected_revision =~ ^sha256:[0-9a-f]{64}$ ]] \
       || fail "A service transition requires a valid configuration revision" stale-config
@@ -3914,6 +4107,7 @@ command_deactivate() {
     *) fail "Unknown deactivation source: $reason" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   if [[ $reason == condition || $reason == service || $reason == timer ]]; then
     service_revision_matches "$expected_revision" || fail "$LAST_ERROR" stale-config
   elif [[ -n $expected_revision ]]; then
@@ -3942,6 +4136,7 @@ command_recovery() {
     *) fail "Usage: omachord recovery <inspect|restore|bind-brightness|accept-brightness>" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   lock_routine "$routine_id" || fail "$LAST_ERROR" "$LOCK_ERROR_CODE"
   read_snapshot "$routine_id" || state=$?
   if ((state != 0)); then
@@ -4077,6 +4272,8 @@ command_active() {
     [[ -n $routine_id ]] || continue
     snapshot_state=0
     read_snapshot "$routine_id" || snapshot_state=$?
+    # A routine that ended between listing and reading is simply not active.
+    ((snapshot_state != 1)) || continue
     ((snapshot_state == 0)) || fail "${LAST_ERROR:-Activation snapshot is invalid}" unsafe-state
     rows=$(jq -c --argjson row "$SNAPSHOT_JSON" \
       '. + [$row | {routineId,activatedAt,trigger,keepUntil,expiresAt,onEndMode,setterCount:(.setters | length)}]' <<<"$rows")
@@ -4090,7 +4287,7 @@ command_trigger_hook() {
   local valid=0 candidate index=1 failures=0 matched=0 config_snapshot
   for candidate in "${HOOK_EVENTS[@]}"; do [[ $candidate == "$event" ]] && valid=1; done
   ((valid)) || fail "Unsupported hook event: $event" usage
-  if [[ ${OMACHORD_BULK_CLEANUP:-} == 1 ]]; then
+  if bulk_cleanup_suppresses_hooks; then
     jq -cn --arg event "$event" '{ok:true,event:$event,matched:0,suppressed:true}'
     return
   fi
@@ -4104,7 +4301,8 @@ command_trigger_hook() {
     ((index += 1))
   done
 
-  config_snapshot=$(mktemp)
+  config_snapshot=$(mktemp) || fail "Could not prepare the hook configuration" unsafe-state
+  track_abort_temp "$config_snapshot"
   if ! load_committed_config "$config_snapshot"; then
     rm -f -- "$config_snapshot"
     json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
@@ -4122,6 +4320,9 @@ command_trigger_hook() {
   # conditions, its keep-until timer, or an explicit deactivation.
   for candidate in "${routine_ids[@]}"; do
     ((matched += 1))
+    # Earlier routines resolve and claim under the shared lock; only the last
+    # one may release it before its actions (see release_config_lock_for_actions).
+    ((matched < ${#routine_ids[@]})) || CONFIG_LOCK_RELEASABLE=1
     if ! activate_routine "$candidate" "hook:$event" 0 >/dev/null; then
       ((failures += 1))
     fi
@@ -4205,7 +4406,7 @@ read_shell_widget_state() {
     | supported_shell_config
     | normalize_shell_config
     | "\(bar_entries | any(entry_matches($id))) \(.plugins | any(entry_matches($id)))"
-  ' "$SHELL_CONFIG_FILE" 2>/dev/null) || {
+  ' < <(read_nonblocking "$SHELL_CONFIG_FILE") 2>/dev/null) || {
     LAST_ERROR="The Omarchy shell config is not valid JSON: $SHELL_CONFIG_FILE"
     return 1
   }
@@ -4224,6 +4425,15 @@ read_shell_widget_state() {
 # after omarchy.indicators (else after omarchy.weather, else at the end). The
 # previous file is kept under the state backups first. Sets SHELL_CONFIG_BACKUP.
 SHELL_CONFIG_BACKUP=""
+
+# An unused shell.json backup is a managed state file: remove it through the
+# fs helper like every other managed mutation, preserving the caller's error.
+discard_shell_backup() {
+  local saved_error=$LAST_ERROR
+  remove_file_atomic "$1" || true
+  LAST_ERROR=$saved_error
+}
+
 migrate_shell_widget_entry() {
   local snapshot source backup mode baseline error size
   SHELL_CONFIG_BACKUP=""
@@ -4240,7 +4450,8 @@ migrate_shell_widget_entry() {
     LAST_ERROR="Could not prepare the shell config snapshot"
     return 1
   }
-  if ! cp --preserve=mode -- "$SHELL_CONFIG_FILE" "$snapshot" \
+  if ! read_nonblocking "$SHELL_CONFIG_FILE" >"$snapshot" \
+      || ! chmod "$(stat -c %a -- "$SHELL_CONFIG_FILE")" -- "$snapshot" \
       || [[ $(config_file_fingerprint "$snapshot") != "$baseline" ]] \
       || [[ $(config_file_fingerprint "$SHELL_CONFIG_FILE") != "$baseline" ]]; then
     rm -f -- "$snapshot"
@@ -4256,7 +4467,7 @@ migrate_shell_widget_entry() {
   fi
   SHELL_CONFIG_BACKUP=$backup
   source=$(mktemp) || {
-    rm -f -- "$snapshot" "$backup"
+    rm -f -- "$snapshot"; discard_shell_backup "$backup"
     SHELL_CONFIG_BACKUP=""
     LAST_ERROR="Could not prepare the shell config update"
     return 1
@@ -4279,7 +4490,7 @@ migrate_shell_widget_entry() {
             )
         end
     ' "$snapshot" >"$source" 2>/dev/null; then
-    rm -f -- "$snapshot" "$source" "$backup"
+    rm -f -- "$snapshot" "$source"; discard_shell_backup "$backup"
     SHELL_CONFIG_BACKUP=""
     LAST_ERROR="Could not build the Omarchy shell config update: $SHELL_CONFIG_FILE"
     return 1
@@ -4287,7 +4498,7 @@ migrate_shell_widget_entry() {
   rm -f -- "$snapshot"
   size=$(stat -c %s -- "$source" 2>/dev/null) || size=""
   if [[ ! $size =~ ^[0-9]+$ ]] || ((size > MAX_CONFIG_BYTES)); then
-    rm -f -- "$source" "$backup"
+    rm -f -- "$source"; discard_shell_backup "$backup"
     SHELL_CONFIG_BACKUP=""
     LAST_ERROR="The updated Omarchy shell config would exceed the 1 MiB limit: $SHELL_CONFIG_FILE"
     return 1
@@ -4360,6 +4571,18 @@ command_widget() {
     ensure|status|forget) ;;
     *) fail "Usage: omachord widget <ensure|status|forget>" usage ;;
   esac
+  if [[ $subcommand != status ]]; then
+    # Serialize ensure/forget so two concurrent ensures cannot both migrate
+    # or both ask the shell. A runtime-directory lock keeps read-only config
+    # probes (and the watched state directory) out of this critical section.
+    prepare_run_lock_dir || fail "$LAST_ERROR" unsafe-state
+    safe_open_private_fd 6 "$RUN_LOCK_DIR/widget.lock" 600 "bar widget lock" true \
+      || fail "$LAST_ERROR" unsafe-state
+    if ! flock -x -w "$LOCK_TIMEOUT" 6 || ! private_fd_matches_file 6 "$RUN_LOCK_DIR/widget.lock"; then
+      exec 6>&-
+      fail "Timed out locking the bar widget state" unsafe-state
+    fi
+  fi
   widget_marker_written || marker_state=$?
   ((marker_state != 2)) || fail "$LAST_ERROR" unsafe-state
   if [[ $subcommand == status ]]; then
@@ -4451,6 +4674,9 @@ Commands:
   disconnect
   bindings
   commands
+  themes                Installed Omarchy theme names
+  service-status        Status snapshot of the resident condition service
+  theme-palette         Accent color and name of the current Omarchy theme
   toggles               Valid top-level Omarchy toggle flags
   run <routine-id> [manual|shortcut|test [expected-revision]]
                         Stateful routines toggle between active and inactive
@@ -4490,10 +4716,50 @@ require_prepared_state() {
   prepare_state_dir || fail "$LAST_ERROR" unsafe-state
 }
 
+# Internal knobs are never honored from the ambient environment, and the
+# documented timeout overrides must be durations the supervisor accepts.
+sanitize_environment() {
+  unset OMACHORD_CAPTURE_MODE OMACHORD_CAPTURE_LIMIT OMACHORD_BULK_CLEANUP
+  local name value
+  for name in OMACHORD_ACTION_TIMEOUT OMACHORD_CONTROL_TIMEOUT; do
+    value=${!name-}
+    [[ -z ${!name+set} ]] || [[ $value =~ ^[0-9]*\.?[0-9]+[smhd]?$ && $value =~ [1-9] ]] \
+      || fail "$name must be a positive duration such as 30s or 2m" invalid-environment
+  done
+  [[ -z ${OMACHORD_LOCK_TIMEOUT+set} || $OMACHORD_LOCK_TIMEOUT =~ ^[0-9]*\.?[0-9]+$ ]] \
+    || fail "OMACHORD_LOCK_TIMEOUT must be a number of seconds" invalid-environment
+}
+
+# Bulk cleanup (config apply, disconnect) suppresses hook routines that its
+# own end actions trigger. The marker names the live runner that set it, so a
+# descendant detached from a finished runner never suppresses hooks forever.
+begin_bulk_cleanup() {
+  local pid=$BASHPID start
+  start=$(process_start_time "$pid") || start=""
+  export OMACHORD_BULK_CLEANUP="$pid:$start"
+}
+
+end_bulk_cleanup() {
+  unset OMACHORD_BULK_CLEANUP
+}
+
+bulk_cleanup_suppresses_hooks() {
+  local pid start stat rest
+  [[ $BULK_CLEANUP_OWNER =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+  pid=${BASH_REMATCH[1]}
+  start=${BASH_REMATCH[2]}
+  { stat=$(<"/proc/$pid/stat"); } 2>/dev/null || return 1
+  rest=${stat##*) }
+  local -a fields=()
+  read -r -a fields <<<"$rest"
+  ((${#fields[@]} >= 20)) && [[ ${fields[0]} != Z && ${fields[19]} == "$start" ]]
+}
+
 main() {
   local command=${1:-}
   shift || true
   clear_trigger_context
+  sanitize_environment
   case $command in
     status) require_prepared_state; command_status "$@" ;;
     config)

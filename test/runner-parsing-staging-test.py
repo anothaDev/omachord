@@ -24,6 +24,12 @@ if name == "grep":
         resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
         signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
     os.execv("/usr/bin/grep", ["grep", *args])
+if name == "awk":
+    # The loader-removal filter is the only awk program that reads the loader.
+    if any("OMACHORD_LOADER" in arg for arg in args) and os.environ.get("FAIL_FILTER") == "1":
+        resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+    os.execv("/usr/bin/awk", ["awk", *args])
 if name == "tail":
     if args[:2] == ["-n", "200"] and os.environ.get("FAIL_ROTATION") == "1":
         resource.setrlimit(resource.RLIMIT_FSIZE, (4096, 4096))
@@ -85,7 +91,7 @@ class Fixture:
         stub = root / "stub.py"
         stub.write_text(STUB)
         stub.chmod(0o700)
-        for name in ("hyprctl", "omarchy", "omarchy-shell", "grep", "jq", "tail", "cat"):
+        for name in ("hyprctl", "omarchy", "omarchy-shell", "grep", "awk", "jq", "tail", "cat"):
             (root / "bin" / name).symlink_to(stub)
         self.env = {"HOME": str(root / "home"), "XDG_CONFIG_HOME": str(root / "home/.config"),
                     "XDG_STATE_HOME": str(root / "state"), "XDG_DATA_HOME": str(root / "data"),
