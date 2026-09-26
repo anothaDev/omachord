@@ -151,6 +151,17 @@ ShellRoot {
       check(component.status === Component.Ready, component.errorString())
       panel = component.createObject(root, { service: service })
       check(!!panel, "could not create panel")
+      panel.loading = false
+      panel.configUncommitted = true
+      panel.configRevision = "sha256:" + "d".repeat(64)
+      panel.requestIntegrationToggle()
+      check(service.connectRequests === 0 && !panel.mutating,
+        "an uncommitted configuration must never be approved from the switch")
+      check(panel.noticeError && panel.noticeText.indexOf("not committed") !== -1
+        && panel.noticeText.indexOf("omachord connect sha256:" + "d".repeat(64)) !== -1,
+        "the switch must explain why an uncommitted configuration cannot be turned on")
+      panel.configUncommitted = false
+      panel.clearNotice()
       panel.configLoaded = true
       panel.loading = false
       panel.configRevision = "sha256:base"

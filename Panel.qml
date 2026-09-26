@@ -460,11 +460,17 @@ Item {
       // evidence of review; Enable/Repair must not approve an unseen file.
       if (typeof parsed.revision === "string") configRevision = parsed.revision
       configUncommitted = true
-      failConfigLoad("The routine configuration is not committed and was not loaded. Inspect it with "
-        + "omachord config snapshot, review every routine, then approve that snapshot using omachord connect "
-        + configRevision + ". Refresh this panel afterward.")
+      failConfigLoad(uncommittedConfigNotice())
     } else if (parsed && parsed.error) failConfigLoad(parsed.error)
     else failConfigLoad("The runner returned invalid configuration JSON")
+  }
+
+  // Shared by the load failure and the switch, so the switch never fails
+  // silently; the common prefix lets a later successful load clear either.
+  function uncommittedConfigNotice() {
+    return "The routine configuration is not committed and was not loaded. Inspect it with "
+      + "omachord config snapshot, review every routine, then approve that snapshot using omachord connect "
+      + configRevision + ". Refresh this panel afterward."
   }
 
   function refreshApps() {
@@ -1035,7 +1041,11 @@ Item {
 
   function mutateConnection(operation) {
     if (mutating || loading || integrationBusy || !(configLoaded || configUncommitted)) return
-    if (operation === "connect" && !configLoaded) return
+    if (operation === "connect" && !configLoaded) {
+      // Turning on from here would approve content nobody reviewed here.
+      showNotice(uncommittedConfigNotice(), true)
+      return
+    }
     connectionEpoch++
     mutationOperation = operation
     mutating = true
