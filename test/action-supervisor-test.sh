@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 SUPERVISOR="$ROOT/bin/omachord-action-supervisor"
-if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
+TEST_TMP=${TMPDIR:-/tmp}
 TEST_ROOT=$(mktemp -d "$TEST_TMP/omachord-supervisor-test.XXXXXX")
 
 cleanup() {
