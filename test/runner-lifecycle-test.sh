@@ -347,15 +347,15 @@ grep -Fqx hooked "$TEST_ROOT/marks.log" || fail "the hook routine did not run"
 # short-lived subshell, not this shell, so its start time would not match.
 sleep 60 & owner_pid=$!
 owner_start=$(awk '{print $22}' "/proc/$owner_pid/stat")
-self_start=$owner_start
 live_result=$(OMACHORD_BULK_CLEANUP="$owner_pid:$owner_start" "$RUNNER" trigger hook theme-set x)
 kill "$owner_pid" 2>/dev/null || true
 wait "$owner_pid" 2>/dev/null || true
-jq -e '.suppressed == true' <<<"$live_result" >/dev/null || fail "a live bulk-cleanup owner did not suppress hooks"
-sleep 0 & dead_pid=$!
-wait "$dead_pid"
-OMACHORD_BULK_CLEANUP="$dead_pid:$self_start" "$RUNNER" trigger hook theme-set x \
-  | jq -e '.matched == 1 and (.suppressed | not)' >/dev/null || fail "a finished runner still suppressed hooks"
+jq -e '.suppressed == true' <<<"$live_result" >/dev/null \
+  || fail "a live bulk-cleanup owner did not suppress hooks: $live_result"
+# The same owner identity after that process has exited.
+dead_result=$(OMACHORD_BULK_CLEANUP="$owner_pid:$owner_start" "$RUNNER" trigger hook theme-set x)
+jq -e '.matched == 1 and (.suppressed | not)' <<<"$dead_result" >/dev/null \
+  || fail "a finished runner still suppressed hooks: $dead_result"
 
 "$RUNNER" activate ending manual | jq -e '.ok and .state == "activated"' >/dev/null
 : >"$TEST_ROOT/theme-hook.log"
