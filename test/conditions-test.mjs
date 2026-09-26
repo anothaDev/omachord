@@ -149,6 +149,41 @@ jobs = plain(conditions.reconcileJobs(
   { dark: { at: 900, op: "activate", revision } }, 1000, 300000, 256))
 assert.equal(jobs.length, 1, "an activation failure does not suppress deactivation")
 
+const blocked = { at: 900, op: "activate", revision, blocked: true }
+const queuedAfterFailure = (op, failure, currentRevision = revision, now = 900000) =>
+  plain(conditions.reconcileJobs([{ id: "dark", op, reason: "condition" }], null,
+    currentRevision, { dark: failure }, now, 300000, 256))
+assert.deepEqual(queuedAfterFailure("activate", blocked, revision, 900 + 59999), [],
+  "a blocked activation waits for its first backoff step")
+assert.equal(queuedAfterFailure("activate", blocked, revision, 900 + 60000).length, 1,
+  "a blocked activation retries after one minute, not only after a false edge")
+for (const [attempts, delay] of [[1, 60000], [2, 120000], [3, 300000], [4, 600000], [9, 600000]]) {
+  const repeated = { ...blocked, attempts }
+  assert.deepEqual(queuedAfterFailure("activate", repeated, revision, 900 + delay - 1), [],
+    `attempt ${attempts} waits ${delay} ms`)
+  assert.equal(queuedAfterFailure("activate", repeated, revision, 900 + delay).length, 1,
+    `attempt ${attempts} retries at ${delay} ms`)
+}
+for (const attempts of [0, -1, "x", null, undefined, NaN]) {
+  assert.equal(conditions.failureRetryMs({ ...blocked, attempts }, 300000), 60000,
+    `malformed attempt count ${attempts} uses the first backoff step`)
+}
+assert.equal(conditions.failureRetryMs({ ...blocked, op: "deactivate" }, 300000), 300000,
+  "deactivation never uses the capability backoff")
+assert.equal(conditions.failureRetryMs({ ...blocked, blocked: false }, 300000), 300000)
+assert.equal(queuedAfterFailure("activate", blocked, "new-revision").length, 1,
+  "a blocked activation is scoped to its config revision")
+assert.equal(queuedAfterFailure("deactivate", blocked).length, 1,
+  "a blocked activation never suppresses recovery")
+assert.equal(queuedAfterFailure("deactivate", { ...blocked, op: "deactivate" }).length, 1,
+  "even an unexpected blocked flag cannot abandon deactivation retries")
+assert.deepEqual(queuedAfterFailure("deactivate", { ...blocked, op: "deactivate" }, revision, 1000), [],
+  "deactivation still respects its normal retry window")
+assert.equal(queuedAfterFailure("activate", { ...blocked, blocked: false }).length, 1,
+  "ordinary activation failures still retry")
+assert.equal(queuedAfterFailure("activate", { ...blocked, blocked: "true" }).length, 1,
+  "only a boolean blocked flag suppresses activation")
+
 assert.deepEqual(plain(conditions.expiredIds(activeTimed, at(31, 12, 4))), [])
 assert.deepEqual(plain(conditions.expiredIds(activeTimed, at(31, 12, 5))), ["dark"])
 assert.equal(conditions.nextExpiryMs(activeTimed, at(31, 12, 3)), 2 * 60000)
@@ -185,6 +220,13 @@ assert.deepEqual(plain(conditions.seedLatches(routines, [
 assert.deepEqual(plain(conditions.seedLatches(routines, [
   { timestamp: iso(31, 22, 50), routineId: "dark", trigger: "condition", status: "deactivated" }
 ], at(31, 23, 0))), {}, "a deactivation the service made itself does not latch")
+assert.deepEqual(plain(conditions.seedLatches(routines, [
+  { timestamp: iso(31, 22, 50), routineId: "dark", trigger: "service", status: "deactivated" }
+], at(31, 23, 0))), {}, "a legacy service-trigger deactivation does not latch either")
+assert.deepEqual(plain(conditions.seedLatches(routines, [
+  { timestamp: iso(31, 10, 30), routineId: "work", trigger: "service", status: "success" },
+  { timestamp: iso(31, 15, 50), routineId: "dark", trigger: "service", status: "failed" }
+], at(31, 16, 0))), { work: true, dark: true }, "a legacy service-trigger run in the current period latches")
 assert.deepEqual(plain(conditions.seedLatches(routines, [
   { timestamp: "garbage", routineId: "dark", trigger: "shortcut", status: "deactivated" }
 ], at(31, 23, 0))), {}, "unparseable timestamps are ignored")
@@ -242,6 +284,15 @@ assert.deepEqual(plain(conditions.describeCondition(null, env())),
   { type: "", matched: false, summary: "", state: "" })
 
 const failure = { at: 1000, op: "activate", revision, error: "activate: shell not running" }
+assert.deepEqual(plain(conditions.describeFailure({ ...failure, blocked: true }, 300000)),
+  { op: "activate", at: 1000, error: failure.error, blocked: true, retryAt: 61000 },
+  "blocked activations expose their backoff retry timestamp")
+assert.deepEqual(plain(conditions.describeFailure({ ...failure, blocked: true, attempts: 3 }, 300000)),
+  { op: "activate", at: 1000, error: failure.error, blocked: true, retryAt: 301000 },
+  "repeated blocked activations back off further")
+assert.deepEqual(plain(conditions.describeFailure({ ...failure, op: "deactivate", blocked: true }, 300000)),
+  { op: "deactivate", at: 1000, error: failure.error, blocked: false, retryAt: 301000 },
+  "deactivation failures are always described as retryable")
 let detailed = plain(conditions.routineSummary(routines[1],
   env({ now: at(31, 10, 0), ssid: "Home" }), {}, {}, { work: failure }, 300000))
 assert.deepEqual(detailed, {
@@ -250,13 +301,13 @@ assert.deepEqual(detailed, {
     { type: "time", matched: true, summary: "09:00–17:00 on Mon, Tue, Wed, Thu, Fri", state: "now 10:00" },
     { type: "wifi", matched: false, summary: "Wi-Fi Office, Office-5G", state: "connected to Home" }
   ],
-  failure: { op: "activate", at: 1000, error: "activate: shell not running", retryAt: 301000 }
+  failure: { op: "activate", at: 1000, error: "activate: shell not running", blocked: false, retryAt: 301000 }
 }, "details follow routine order and the failure carries its retry moment")
 assert.equal(plain(conditions.routineSummary(routines[0], env(), {}, {}, { work: failure }, 300000)).failure, null,
   "another routine's failure is not reported")
 assert.deepEqual(plain(conditions.routineSummary(routines[0], env(), {}, {},
   { dark: { at: 5, op: "deactivate", revision } }, 10)).failure,
-  { op: "deactivate", at: 5, error: "", retryAt: 15 }, "a failure without an error text is still reported")
+  { op: "deactivate", at: 5, error: "", blocked: false, retryAt: 15 }, "a failure without an error text is still reported")
 assert.equal(plain(conditions.routineSummary(routines[0], env(), {}, {},
   { dark: { at: "garbage", op: "activate", revision } }, 10)).failure, null, "an unreadable failure time is dropped")
 assert.deepEqual(plain(conditions.routineSummary(routines[3], env(), {}, {})).details, [],
@@ -290,6 +341,25 @@ assert.equal(conditions.relativeTime(new Date().toISOString()), "just now", "the
 assert.equal(conditions.clockTime(iso(31, 9, 5)), "09:05")
 assert.equal(conditions.clockTime(iso(31, 23, 59)), "23:59")
 assert.equal(conditions.clockTime(iso(31, 0, 0)), "00:00")
+for (const bad of [NaN, Infinity, -Infinity, 1e20, -8.64e15 - 1, "not a time"])
+  assert.equal(conditions.clockTime(bad), "", "an unusable or out-of-range retry time renders as nothing instead of throwing")
+assert.equal(conditions.clockTime(8.64e15) !== "", true, "the last representable Date still renders")
+
+// Only activations the service will end itself promise to follow conditions.
+const ownedRow = { trigger: "condition", keepUntil: "conditions", conditions: 1 }
+assert.equal(conditions.endsWithConditions(ownedRow), true)
+assert.equal(conditions.conditionHoldText(ownedRow), "while its conditions hold")
+assert.equal(conditions.endsWithConditions(Object.assign({}, ownedRow, { trigger: "service" })), true, "legacy service trigger")
+for (const row of [
+  Object.assign({}, ownedRow, { trigger: "manual" }),
+  Object.assign({}, ownedRow, { trigger: "shortcut" }),
+  Object.assign({}, ownedRow, { keepUntil: { minutes: 30 } }),
+  Object.assign({}, ownedRow, { conditions: 0 }),
+  null
+]) {
+  assert.equal(conditions.endsWithConditions(row), false, JSON.stringify(row))
+  assert.equal(conditions.conditionHoldText(row), "")
+}
 assert.equal(conditions.clockTime(at(31, 14, 7)), "14:07", "a Date is accepted")
 assert.equal(conditions.clockTime("garbage"), "")
 assert.equal(conditions.clockTime(""), "")

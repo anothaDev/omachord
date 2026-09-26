@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 HELPER="$ROOT/bin/omachord-fs"
-if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
+TEST_TMP=${TMPDIR:-/tmp}
 TEST_ROOT=$(mktemp -d "$TEST_TMP/omachord-fs-test.XXXXXX")
 INSTRUMENTED_HELPER="$TEST_ROOT/instrumented/bin/omachord-fs"
 
@@ -587,5 +587,55 @@ if find "$unique" -maxdepth 1 -type f -name 'backup.*' -print -quit | grep -q .;
   fail "failed unique write leaked an unreported backup"
 fi
 printf 'PASS: unique-write failure cleanup\n'
+
+# Disposable helper copies whose mv models coreutils without renameat2 support
+# (pre-9.5 rejects --exchange and --update=none-fail) or a failing mv.
+legacy="$TEST_ROOT/legacy-coreutils"
+mkdir -p -m 700 "$legacy/bin" "$legacy/data" "$legacy/tmp"
+cat >"$legacy/bin/mv-old" <<'STUB'
+#!/bin/bash
+for argument in "$@"; do
+  case $argument in
+    --exchange) echo "mv: unrecognized option '--exchange'" >&2; exit 1 ;;
+    --update=none-fail) echo "mv: invalid argument 'none-fail' for '--update'" >&2; exit 1 ;;
+  esac
+done
+exec /usr/bin/mv "$@"
+STUB
+cat >"$legacy/bin/mv-broken-publish" <<'STUB'
+#!/bin/bash
+for argument in "$@"; do
+  [[ $argument != --update=none-fail ]] || exit 1
+done
+exec /usr/bin/mv "$@"
+STUB
+chmod 700 "$legacy/bin"/mv-*
+for variant in mv-old mv-broken-publish; do
+  sed "s|\"/usr/bin/mv\"|\"$legacy/bin/$variant\"|g" "$HELPER" >"$legacy/bin/fs-$variant"
+  chmod 700 "$legacy/bin/fs-$variant"
+  [[ $(grep -c "$legacy/bin/$variant" "$legacy/bin/fs-$variant") == 2 ]] \
+    || fail "legacy-coreutils fixture did not replace both mv invocations"
+done
+if TMPDIR="$legacy/tmp" "$legacy/bin/fs-mv-old" prepare-state "$legacy/state" 2>"$legacy/error"; then
+  fail "prepare-state accepted coreutils without mv --exchange"
+fi
+grep -Fqx 'Omachord requires GNU coreutils 9.5 or newer (mv --exchange)' "$legacy/error" \
+  || fail "missing mv --exchange was not reported clearly: $(cat "$legacy/error")"
+if find "$legacy/state" "$legacy/tmp" -mindepth 1 -print -quit | grep -q .; then
+  fail "the coreutils probe left scratch files in the state directory"
+fi
+TMPDIR="$legacy/tmp" "$HELPER" prepare-state "$legacy/state" || fail "prepare-state rejected a supported coreutils"
+if find "$legacy/state" "$legacy/tmp" -mindepth 1 -print -quit | grep -q .; then
+  fail "a successful coreutils probe left scratch files in the state directory"
+fi
+if printf '%s' value | "$legacy/bin/fs-mv-broken-publish" atomic-write \
+    "$legacy/data/value" 600 private "$legacy/archive" >"$legacy/result"; then
+  fail "atomic-write reported success although mv could not publish"
+fi
+jq -e '.code == "io-error" and (.error | test("destination was unchanged"))' "$legacy/result" >/dev/null \
+  || fail "an mv failure was misreported as a concurrent writer: $(cat "$legacy/result")"
+[[ ! -e $legacy/data/value ]] || fail "failed publication left a destination"
+assert_no_transaction_files "$legacy/data"
+printf 'PASS: coreutils capability probe and mv failure attribution\n'
 
 printf 'Filesystem helper tests passed.\n'

@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import "Runner.js" as Runner
 
 // The parts of the active Omarchy theme the shell does not expose: its name
 // and its success green. Foreground, background, accent, and urgent already
@@ -12,11 +13,9 @@ import qs.Commons
 Item {
   id: root
 
-  readonly property string home: Quickshell.env("HOME")
-  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-  property string runnerPath: configuredRunnerPath.indexOf("/") === 0
-    ? configuredRunnerPath
-    : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord"
+  readonly property string defaultRunnerPath: Runner.runnerPath(Quickshell.env("OMACHORD_RUNNER_PATH"), null,
+    Runner.omarchyConfigDir(Quickshell.env("HOME"), Quickshell.env("OMACHORD_OMARCHY_CONFIG_DIR")))
+  property string runnerPath: defaultRunnerPath
   property bool active: visible
   property bool readQueued: false
 
@@ -85,6 +84,9 @@ Item {
     onTriggered: root.readPalette()
   }
 
+  // A theme read is a bounded probe; never let a hung one stop the refreshes.
+  ProcessWatchdog { process: paletteProc; label: "theme-palette"; deadlineMs: 30000 }
+
   Process {
     id: paletteProc
     property bool startPending: false
@@ -93,11 +95,7 @@ Item {
     onStarted: startPending = false
     onExited: function(exitCode) {
       startPending = false
-      var result = null
-      if (exitCode === 0) {
-        try { result = JSON.parse(paletteOutput.text) } catch (e) {}
-      }
-      root.finishRead(result)
+      root.finishRead(exitCode === 0 ? Runner.parseJson(paletteOutput.text, null) : null)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {

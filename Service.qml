@@ -4,6 +4,7 @@ import Quickshell.Io
 import Quickshell.Networking
 import Quickshell.Services.UPower
 import "Conditions.js" as Conditions
+import "Runner.js" as Runner
 
 // Headless condition watcher loaded by omarchy-shell as the plugin's
 // "service" kind. It only decides *when* a routine should start or end;
@@ -21,19 +22,23 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || (home + "/.local/state")
   readonly property string stateDir: Quickshell.env("OMACHORD_STATE_DIR") || (stateHome + "/omarchy/omachord")
-  readonly property string configPath: Quickshell.env("OMACHORD_CONFIG_FILE") || (home + "/.config/omarchy/omachord.json")
+  readonly property string omarchyConfigDir: Runner.omarchyConfigDir(home, Quickshell.env("OMACHORD_OMARCHY_CONFIG_DIR"))
+  readonly property string configPath: Runner.configPath(Quickshell.env("OMACHORD_CONFIG_FILE"), omarchyConfigDir)
   readonly property string togglesDir: stateHome + "/omarchy/toggles"
-  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-  readonly property string runnerPath: configuredRunnerPath.indexOf("/") === 0
-    ? configuredRunnerPath
-    : (manifest && manifest.__sourceDir
-      ? String(manifest.__sourceDir) + "/bin/omachord"
-      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
+  readonly property string runnerPath: Runner.runnerPath(Quickshell.env("OMACHORD_RUNNER_PATH"), manifest, omarchyConfigDir)
 
   readonly property int safetyMs: 60000
   readonly property int reconcileMs: 300000
   readonly property int failureRetryMs: 300000
   readonly property int maxPending: 256
+  // A runner that never exits is stopped after these deadlines, so it cannot
+  // wedge a queue or the connection barrier. Routine work and disconnect
+  // share a 10-minute aggregate limit per request, even for valid longer
+  // action lists. Per-action timeout overrides do not extend this budget.
+  property int probeDeadlineMs: 30000
+  property int connectionDeadlineMs: 60000
+  property int routineDeadlineMs: 600000
+  property int watchdogGraceMs: 5000
 
   property bool enabled: false
   // Latest accepted full status, with authoritative connection-command flags
@@ -140,9 +145,7 @@ Item {
     console.log("omachord " + lastEventAt + " " + lastEvent)
   }
 
-  function parseJson(text, fallback) {
-    try { return JSON.parse(String(text || "")) } catch (e) { return fallback }
-  }
+  function parseJson(text, fallback) { return Runner.parseJson(text, fallback) }
 
   function currentEnv(now) {
     return {
@@ -205,7 +208,8 @@ Item {
   }
 
   function finishWidget(text, exitCode) {
-    var parsed = exitCode === 0 ? parseJson(text, null) : parseJson(text, null)
+    // A refusal is reported as JSON on a non-zero exit, so parse either way.
+    var parsed = parseJson(text, null)
     if (parsed && parsed.ok === true) {
       widgetEnsured = true
       logEvent("bar-widget", parsed.placed === true ? "placed" : "already recorded")
@@ -370,10 +374,13 @@ Item {
         if (Conditions.evaluateAll(routines[r].conditions, currentEnv(new Date())) === true) latch(routineId)
         break
       }
+    } else if ((status === "activated" || status === "success") && trigger !== "condition" && trigger !== "service") {
+      reconcileBlockedActivation(routineId)
     } else if (status === "failed" && trigger !== "condition" && trigger !== "service"
         && String(entry.error || "").indexOf("activate:") === 0
         && String(entry.error || "").indexOf("recovery record kept") === -1) {
-      unlatch(routineId)
+      var failure = Conditions.mapValue(failures, routineId)
+      if (!failure || failure.op !== "activate" || failure.blocked !== true) unlatch(routineId)
     }
   }
 
@@ -439,10 +446,13 @@ Item {
     }
     var retainedFailures = Object.assign(Object.create(null), failures)
     for (var failed in retainedFailures) {
-      if (retainedFailures[failed].op !== "deactivate") continue
+      var backoff = retainedFailures[failed].op === "activate" && retainedFailures[failed].blocked === true
+      // A backoff record outlives its latch only while that activation is
+      // still wanted; otherwise it would outlast the true period it counts.
+      if (retainedFailures[failed].op !== "deactivate" && (!backoff || Conditions.mapValue(latched, failed))) continue
       var stillDesired = false
       for (var d = 0; d < desired.length; d++) {
-        if (desired[d].id === failed && desired[d].op === "deactivate") {
+        if (desired[d].id === failed && desired[d].op === retainedFailures[failed].op) {
           stillDesired = true
           break
         }
@@ -484,7 +494,13 @@ Item {
     var expiredFailures = Object.assign(Object.create(null), failures)
     var changed = false
     for (var id in expiredFailures) {
-      if (now - Number(expiredFailures[id].at) < failureRetryMs) continue
+      if (now - Number(expiredFailures[id].at) < Conditions.failureRetryMs(expiredFailures[id], failureRetryMs)) continue
+      if (expiredFailures[id].op === "activate" && expiredFailures[id].blocked === true) {
+        // Keep the record so a repeated capability failure backs off further;
+        // releasing the latch lets evaluate() retry it as a condition start.
+        unlatch(id)
+        continue
+      }
       var operation = expiredFailures[id].op
       delete expiredFailures[id]
       if (operation === "activate") unlatch(id)
@@ -514,6 +530,33 @@ Item {
     var next = Object.assign(Object.create(null), latched)
     delete next[String(id)]
     latched = next
+  }
+
+  function reconcileBlockedActivation(id) {
+    var failure = Conditions.mapValue(failures, id)
+    if (!failure || failure.op !== "activate" || failure.blocked !== true) return
+    var next = Object.assign(Object.create(null), failures)
+    delete next[String(id)]
+    failures = next
+    // A successful explicit retry satisfies this true period, including a
+    // one-shot run with no active snapshot for evaluate() to observe.
+    latch(id)
+  }
+
+  // "Retry now" for a condition start that failed: forget the failure and
+  // its latch so evaluate() queues a fresh condition-owned activation. Unlike
+  // a manual start, the result still ends when the conditions stop matching.
+  function retryConditionActivation(id) {
+    var routineId = String(id || "")
+    var failure = Conditions.mapValue(failures, routineId)
+    if (!failure || failure.op !== "activate" || failure.revision !== configRevision) return false
+    if (currentJob && currentJob.id === routineId) return false
+    var next = Object.assign(Object.create(null), failures)
+    delete next[routineId]
+    failures = next
+    unlatch(routineId)
+    evaluate()
+    return true
   }
 
   // ------------------------------------------------------- execution
@@ -565,13 +608,20 @@ Item {
     }
     if (!ok) {
       // Do not hammer the runner while the cause persists (a stopped shell, a
-      // restore that could not complete); retry after the failure window or
-      // once the conditions have gone false.
+      // restore that could not complete). A typed activation preflight failure
+      // backs off 1, 2, 5, then 10 minutes and is also cleared by a false edge,
+      // a config edit, or a successful retry; other failures keep the window.
       var next = Object.assign(Object.create(null), failures)
       if (job.revision === configRevision) {
         if (job.op === "activate") latch(job.id)
+        var blocked = job.op === "activate" && !!parsed && parsed.ok === false && parsed.code === "brightness-unavailable"
+        var prior = Conditions.mapValue(failures, job.id)
+        var repeated = blocked && !!prior && prior.op === "activate" && prior.blocked === true
+          && prior.revision === job.revision
         next[job.id] = {
           at: Date.now(), op: job.op, revision: job.revision,
+          blocked: blocked,
+          attempts: repeated ? Math.min((Math.floor(Number(prior.attempts)) || 1) + 1, 100) : 1,
           error: parsed && parsed.error ? String(parsed.error) : "runner exited " + exitCode
         }
         failures = next
@@ -772,6 +822,10 @@ Item {
   function reportManualFinished(job, result, exitCode) {
     lastManualResult = result
     if (!job) return
+    if (result.ok === true && job.revision === configRevision
+        && (job.op === "activate" || job.op === "run")
+        && result.state !== "deactivated" && result.state !== "inactive")
+      reconcileBlockedActivation(job.id)
     logEvent("manual-exit", job.op + " " + job.id + " " + (result.ok ? "ok" : "failed: " + (result.error || exitCode)))
     manualFinished(job, result)
   }
@@ -858,7 +912,7 @@ Item {
     command: [root.runnerPath, "autostart"]
     stdout: StdioCollector { id: autostartStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      root.finishAutostart(autostartStdout.text, exitCode)
+      root.finishAutostart(autostartWatchdog.reply(autostartStdout.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -973,7 +1027,7 @@ Item {
     id: runnerProc
     stdout: StdioCollector { id: runnerStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      root.finishJob(runnerStdout.text, exitCode)
+      root.finishJob(runnerWatchdog.reply(runnerStdout.text), exitCode)
     }
     onRunningChanged: {
       if (!running && root.currentJob) {
@@ -990,7 +1044,7 @@ Item {
     stdout: StdioCollector { id: manualStdout; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualConnection(manualStdout.text, exitCode)
+      root.finishManualConnection(manualWatchdog.reply(manualStdout.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1005,7 +1059,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout0; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker0, manualWorkerStdout0.text, exitCode)
+      root.finishManualRoutine(manualWorker0, manualWorkerWatchdog0.reply(manualWorkerStdout0.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1021,7 +1075,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout1; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker1, manualWorkerStdout1.text, exitCode)
+      root.finishManualRoutine(manualWorker1, manualWorkerWatchdog1.reply(manualWorkerStdout1.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1037,7 +1091,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout2; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker2, manualWorkerStdout2.text, exitCode)
+      root.finishManualRoutine(manualWorker2, manualWorkerWatchdog2.reply(manualWorkerStdout2.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1053,7 +1107,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout3; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker3, manualWorkerStdout3.text, exitCode)
+      root.finishManualRoutine(manualWorker3, manualWorkerWatchdog3.reply(manualWorkerStdout3.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1070,6 +1124,26 @@ Item {
       root.finishWidget(widgetStdout.text, exitCode)
     }
   }
+
+  ProcessWatchdog { id: autostartWatchdog; process: autostartProc; label: "autostart"; deadlineMs: root.connectionDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: statusProc; label: "status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: configProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: activeProc; label: "active"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: logsProc; label: "logs"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: togglesProbe; label: "toggles"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: runnerWatchdog; process: runnerProc; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog {
+    id: manualWatchdog
+    process: manualProc
+    label: root.manualJob ? String(root.manualJob.op) : "connection"
+    deadlineMs: root.manualJob && root.manualJob.op === "disconnect" ? root.routineDeadlineMs : root.connectionDeadlineMs
+    graceMs: root.watchdogGraceMs
+  }
+  ProcessWatchdog { id: manualWorkerWatchdog0; process: manualWorker0; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: manualWorkerWatchdog1; process: manualWorker1; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: manualWorkerWatchdog2; process: manualWorker2; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: manualWorkerWatchdog3; process: manualWorker3; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: widgetProc; label: "widget ensure"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
 
   Connections {
     target: root.pluginRegistry

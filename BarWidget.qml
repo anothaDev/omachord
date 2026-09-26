@@ -38,12 +38,14 @@ Panel {
   property bool cursorActive: false
   property bool cursorOnFooter: false
 
+  // Only the popup uses the theme's success green, so poll the theme files
+  // while it is open rather than whenever the bar icon is visible.
   ThemePalette {
     id: palette
-    active: root.visible
-    runnerPath: configuredRunnerPath.indexOf("/") === 0 ? configuredRunnerPath
-      : root.service && root.service.runnerPath ? root.service.runnerPath
-      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord"
+    active: root.opened
+    // The service resolves the same absolute override first, and also knows
+    // the loaded plugin's own directory.
+    runnerPath: root.service && root.service.runnerPath ? String(root.service.runnerPath) : palette.defaultRunnerPath
   }
 
   function endRoutine(id) {

@@ -7,6 +7,7 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 import "Conditions.js" as Conditions
+import "Runner.js" as Runner
 
 Item {
   id: root
@@ -57,6 +58,10 @@ Item {
   property bool compactEditorOpen: false
   property string noticeText: ""
   property bool noticeError: false
+  // Routine whose last end failed on a held brightness record, offering the
+  // explicit "keep current brightness" decision next to that error.
+  property string heldBrightnessId: ""
+  property string heldBrightnessStage: ""
   property string shownNotice: ""
   property string shortcutQuery: ""
   property string shortcutFilter: "all"
@@ -96,15 +101,20 @@ Item {
   // completion settles. Other routines need not wait for that probe.
   property var actionSettling: Object.create(null)
   property date displayNow: new Date()
+  // Deadlines after which a runner that never exits is stopped, so loading,
+  // saving and connection locks always recover (see ProcessWatchdog.qml).
+  // Routine work, recovery, apply and disconnect share a 10-minute aggregate
+  // limit per request, including every routine ended by a bulk operation.
+  // Per-action timeout overrides do not extend it; reads are bounded probes.
+  property int probeDeadlineMs: 30000
+  property int connectionDeadlineMs: 60000
+  property int routineDeadlineMs: 600000
+  property int watchdogGraceMs: 5000
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: (manifest && manifest.id) || "anothadev.omachord"
-  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-  readonly property string runnerPath: configuredRunnerPath.indexOf("/") === 0
-    ? configuredRunnerPath
-    : (manifest && manifest.__sourceDir
-      ? String(manifest.__sourceDir) + "/bin/omachord"
-      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
+  readonly property string runnerPath: Runner.runnerPath(Quickshell.env("OMACHORD_RUNNER_PATH"), manifest,
+    Runner.omarchyConfigDir(home, Quickshell.env("OMACHORD_OMARCHY_CONFIG_DIR")))
   readonly property var filteredBindings: Model.filterBindings(bindings, shortcutQuery, shortcutFilter)
   readonly property bool compact: window.width < Style.space(920)
   readonly property bool uiLocked: loading || mutating || revisionRefreshPending || !configLoaded
@@ -177,9 +187,7 @@ Item {
     else window.visible = false
   }
 
-  function parseJson(text, fallback) {
-    try { return JSON.parse(String(text || "")) } catch (e) { return fallback }
-  }
+  function parseJson(text, fallback) { return Runner.parseJson(text, fallback) }
 
   function setActiveView(view) {
     if (activeView === view) return
@@ -343,9 +351,13 @@ Item {
       return { label: "Not evaluated", detail: "Conditions are evaluated only while Omachord is on.", urgent: false }
     if (!state) return { label: "Not evaluated", detail: "The condition service has not reported yet.", urgent: false }
     if (state.failure && state.failure.op) {
-      var retry = state.failure.retryAt ? Conditions.clockTime(new Date(Number(state.failure.retryAt)).toISOString()) : ""
+      var retry = state.failure.retryAt ? Conditions.clockTime(Number(state.failure.retryAt)) : ""
+      if (state.failure.op === "activate" && state.failure.blocked === true)
+        return { label: "Unavailable", detail: "Could not start: " + (state.failure.error || "brightness unavailable")
+          + (retry ? " · retrying " + retry : "") + ". Retry now, or edit the routine.", urgent: true, retry: true }
       return { label: "Failed", detail: (state.failure.op === "activate" ? "Could not start: " : "Could not end: ")
-        + (state.failure.error || "runner error") + (retry ? " · retrying " + retry : ""), urgent: true }
+        + (state.failure.error || "runner error") + (retry ? " · retrying " + retry : ""), urgent: true,
+        retry: state.failure.op === "activate" }
     }
     if (state.matched === true && state.latched) return { label: "Ended by hand", detail: "Starts again once its conditions have been false at least once.", urgent: false }
     if (state.matched === true) return { label: "Matched", detail: "Starting shortly.", urgent: false }
@@ -368,6 +380,7 @@ Item {
         name: Model.nameFor(currentConfig, id),
         activatedAt: String(record.activatedAt || ""),
         trigger: String(record.trigger || ""),
+        keepUntil: record.keepUntil === undefined ? "conditions" : record.keepUntil,
         expiresAt: record.expiresAt ? String(record.expiresAt) : "",
         onEndMode: String(record.onEndMode || "restore"),
         setterCount: Number(record.setterCount || 0),
@@ -397,7 +410,7 @@ Item {
     if (row.expiresAt) {
       var left = Conditions.minutesLeft(row.expiresAt, displayNow)
       parts.push(left !== null && left >= 0 ? (left < 1 ? "ending now" : left + " min left") : "until " + Conditions.clockTime(row.expiresAt))
-    } else if (row.conditions > 0) parts.push("while its conditions hold")
+    } else if (Conditions.endsWithConditions(row)) parts.push(Conditions.conditionHoldText(row))
     return parts.join(" · ")
   }
 
@@ -456,11 +469,17 @@ Item {
       // evidence of review; Enable/Repair must not approve an unseen file.
       if (typeof parsed.revision === "string") configRevision = parsed.revision
       configUncommitted = true
-      failConfigLoad("The routine configuration is not committed and was not loaded. Inspect it with "
-        + "omachord config snapshot, review every routine, then approve that snapshot using omachord connect "
-        + configRevision + ". Refresh this panel afterward.")
+      failConfigLoad(uncommittedConfigNotice())
     } else if (parsed && parsed.error) failConfigLoad(parsed.error)
     else failConfigLoad("The runner returned invalid configuration JSON")
+  }
+
+  // Shared by the load failure and the switch, so the switch never fails
+  // silently; the common prefix lets a later successful load clear either.
+  function uncommittedConfigNotice() {
+    return "The routine configuration is not committed and was not loaded. Inspect it with "
+      + "omachord config snapshot, review every routine, then approve that snapshot using omachord connect "
+      + configRevision + ". Refresh this panel afterward."
   }
 
   function refreshApps() {
@@ -669,6 +688,12 @@ Item {
 
   function applyConfig(next, selectId, afterApply) {
     if (mutating || loading || !configLoaded || serviceConnectionBusy()) return
+    var limitError = Model.validateConfigLimits(next)
+    if (limitError) {
+      showNotice(limitError, true)
+      routineEditor.externalError = limitError
+      return
+    }
     pendingConfig = Model.clone(next)
     pendingSelectId = selectId || ""
     pendingAfterApply = afterApply || ""
@@ -867,8 +892,9 @@ Item {
       return
     }
 
-    var committed = result.config && result.config.version === 1
-      ? result.config : enableSubmittedConfig
+    // The runner's reply names only the new revision; what it committed is
+    // exactly the submitted document.
+    var committed = enableSubmittedConfig
     appendEnableResults(result)
     configRevision = result.revision
     enableCommittedConfig = Model.clone(committed)
@@ -1007,6 +1033,67 @@ Item {
     return false
   }
 
+  // Retrying a failed condition start goes back through the service, so the
+  // routine stays condition-owned and ends when its conditions stop matching.
+  function retryConditionStart(id) {
+    if (!service || typeof service.retryConditionActivation !== "function") return
+    if (routineActionBlocked(id)) return
+    if (service.retryConditionActivation(id))
+      showNotice("Retrying " + Model.nameFor(config, id) + "...", false)
+    else showNotice("Could not retry " + Model.nameFor(config, id) + " now", true)
+  }
+
+  // A held brightness record: the display shows neither the original nor the
+  // applied value, so the runner will not guess. Keeping the current value is
+  // an explicit decision bound to the recovery revision inspected just before.
+  function requestAcceptBrightness() {
+    if (!heldBrightnessId || heldBrightnessProc.running) return
+    showConfirmation(
+      "accept-brightness",
+      "Keep the display at its current brightness and finish ending \"" + Model.nameFor(config, heldBrightnessId)
+        + "\"? Its original brightness will not be restored.",
+      "Keep brightness")
+  }
+
+  function acceptHeldBrightness() {
+    if (!heldBrightnessId || heldBrightnessProc.running) return
+    heldBrightnessStage = "inspect"
+    heldBrightnessProc.command = [runnerPath, "recovery", "inspect", heldBrightnessId]
+    showNotice("Keeping the current brightness...", false, true)
+    startProcess(heldBrightnessProc)
+  }
+
+  function handleHeldBrightnessResult(text, errorText, exitCode) {
+    var id = heldBrightnessId
+    var stage = heldBrightnessStage
+    heldBrightnessStage = ""
+    if (!id || !stage) return
+    var parsed = parseJson(text, null)
+    if (stage === "inspect") {
+      if (exitCode === 0 && parsed && parsed.ok === true && typeof parsed.revision === "string"
+          && /^sha256:[0-9a-f]{64}$/.test(parsed.revision)) {
+        heldBrightnessStage = "accept"
+        heldBrightnessProc.command = [runnerPath, "recovery", "accept-brightness", id, parsed.revision]
+        Qt.callLater(function() {
+          if (!startProcess(heldBrightnessProc)) root.handleHeldBrightnessResult("", "The recovery runner is busy", -1)
+        })
+        return
+      }
+      heldBrightnessId = ""
+      showNotice((parsed && parsed.error) || errorText || "Could not inspect the recovery record", true)
+      return
+    }
+    heldBrightnessId = ""
+    var ok = exitCode === 0 && parsed && parsed.ok === true
+    if (ok) showNotice(actionNotice(parsed, Model.nameFor(config, id)), false)
+    else {
+      showNotice((parsed && parsed.error) || errorText || "Could not keep the current brightness", true)
+      if (parsed && parsed.code === "brightness-held") heldBrightnessId = id
+    }
+    requestRefreshProcess(logsProc)
+    if (!serviceLive) requestRefreshProcess(activeProc)
+  }
+
   // Ending from the Activity list goes through the service when it is loaded
   // (the same path the bar widget uses); otherwise the runner directly.
   function endRoutine(id) {
@@ -1025,7 +1112,11 @@ Item {
 
   function mutateConnection(operation) {
     if (mutating || loading || integrationBusy || !(configLoaded || configUncommitted)) return
-    if (operation === "connect" && !configLoaded) return
+    if (operation === "connect" && !configLoaded) {
+      // Turning on from here would approve content nobody reviewed here.
+      showNotice(uncommittedConfigNotice(), true)
+      return
+    }
     connectionEpoch++
     mutationOperation = operation
     mutating = true
@@ -1136,8 +1227,10 @@ Item {
     }
     actionStarted = false
     var name = Model.nameFor(config, runningRoutineId)
+    var routineId = runningRoutineId
     runningRoutineId = ""
     showNotice(result.ok ? actionNotice(result, name) : (result.error || "Routine failed"), !result.ok)
+    if (!result.ok && result.code === "brightness-held") heldBrightnessId = routineId
     requestRefreshProcess(logsProc)
     if (!serviceLive) requestRefreshProcess(activeProc)
   }
@@ -1222,6 +1315,7 @@ Item {
 
   // Info notices fade out on their own; errors stay until the next change.
   function showNotice(text, isError, sticky) {
+    if (!heldBrightnessStage) heldBrightnessId = ""
     noticeError = isError === true
     noticeText = String(text || "")
     noticeExpiry.stop()
@@ -1229,6 +1323,7 @@ Item {
   }
 
   function clearNotice() {
+    if (!heldBrightnessStage) heldBrightnessId = ""
     noticeExpiry.stop()
     noticeText = ""
     noticeError = false
@@ -1298,6 +1393,7 @@ Item {
       var name = Model.nameFor(root.config, job.id)
       if (result && result.ok) root.showNotice(root.actionNotice(result, name), false)
       else root.showNotice((result && result.error) || (name + " could not be ended"), true)
+      if (result && result.ok === false && result.code === "brightness-held") root.heldBrightnessId = job.id
       root.requestRefreshProcess(logsProc)
     }
     function onConfigRevisionChanged() {
@@ -1347,7 +1443,7 @@ Item {
     stderr: StdioCollector { id: configStderr; waitForEnd: true }
     onStarted: root.configStarted = true
     onExited: function(exitCode) {
-      root.handleConfigResult(configStdout.text, configStderr.text.trim(), exitCode)
+      root.handleConfigResult(configWatchdog.reply(configStdout.text), configStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && root.loading && !root.configStarted && !root.configHandled)
@@ -1396,7 +1492,7 @@ Item {
     stderr: StdioCollector { id: revisionStderr; waitForEnd: true }
     onStarted: root.revisionStarted = true
     onExited: function(exitCode) {
-      root.handleRevisionResult(revisionStdout.text, revisionStderr.text.trim(), exitCode)
+      root.handleRevisionResult(revisionWatchdog.reply(revisionStdout.text), revisionStderr.text.trim(), exitCode)
       root.finishRefreshProcess(revisionProc)
     }
     onRunningChanged: {
@@ -1504,7 +1600,7 @@ Item {
     }
     onExited: function(exitCode) {
       stdinEnabled = true
-      root.handleApplyResult(applyStdout.text, applyStderr.text.trim(), exitCode)
+      root.handleApplyResult(applyWatchdog.reply(applyStdout.text), applyStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running) stdinEnabled = true
@@ -1523,7 +1619,7 @@ Item {
     stderr: StdioCollector { id: mutationStderr; waitForEnd: true }
     onStarted: root.mutationStarted = true
     onExited: function(exitCode) {
-      root.handleMutationResult(mutationStdout.text, mutationStderr.text.trim(), exitCode)
+      root.handleMutationResult(mutationWatchdog.reply(mutationStdout.text), mutationStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && root.mutating
@@ -1541,7 +1637,7 @@ Item {
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onStarted: root.actionStarted = true
     onExited: function(exitCode) {
-      root.handleActionResult(actionStdout.text, actionStderr.text.trim(), exitCode)
+      root.handleActionResult(actionWatchdog.reply(actionStdout.text), actionStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && !root.actionStarted && root.runningRoutineId !== "")
@@ -1550,6 +1646,36 @@ Item {
         })
     }
   }
+
+  Process {
+    id: heldBrightnessProc
+    stdout: StdioCollector { id: heldBrightnessStdout; waitForEnd: true }
+    stderr: StdioCollector { id: heldBrightnessStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.handleHeldBrightnessResult(heldBrightnessWatchdog.reply(heldBrightnessStdout.text), heldBrightnessStderr.text.trim(), exitCode)
+    }
+  }
+
+  ProcessWatchdog { process: statusProc; label: "status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: configWatchdog; process: configProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: bindingsProc; label: "bindings"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: commandsProc; label: "commands"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: revisionWatchdog; process: revisionProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: activeProc; label: "active"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: themesProc; label: "themes"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: togglesProc; label: "toggles"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: serviceStatusProc; label: "service-status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: logsProc; label: "logs"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: applyWatchdog; process: applyProc; label: "config apply"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog {
+    id: mutationWatchdog
+    process: mutationProc
+    label: root.mutationOperation || "connection"
+    deadlineMs: root.mutationOperation === "disconnect" ? root.routineDeadlineMs : root.connectionDeadlineMs
+    graceMs: root.watchdogGraceMs
+  }
+  ProcessWatchdog { id: actionWatchdog; process: actionProc; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: heldBrightnessWatchdog; process: heldBrightnessProc; label: "brightness recovery"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
 
   FloatingWindow {
     id: window
@@ -2598,6 +2724,7 @@ Item {
 
                           Column {
                             width: parent.width - conditionState.width - parent.spacing
+                              - (conditionRetry.visible ? conditionRetry.width + parent.spacing : 0)
                             spacing: Style.space(2)
                             anchors.verticalCenter: parent.verticalCenter
                             Text {
@@ -2630,6 +2757,23 @@ Item {
                               font.pixelSize: Style.font.caption
                               wrapMode: Text.WordWrap
                             }
+                          }
+
+                          Button {
+                            id: conditionRetry
+                            visible: !conditionRow.isOn && !!conditionRow.reason && conditionRow.reason.retry === true
+                              && !!root.service && typeof root.service.retryConditionActivation === "function"
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Retry now"
+                            bordered: true
+                            focusable: true
+                            foreground: root.fg
+                            accent: root.accent
+                            enabled: !root.routineActionBlocked(conditionRow.modelData.id)
+                            opacity: enabled ? 1 : 0.6
+                            onClicked: root.retryConditionStart(conditionRow.modelData.id)
+                            Accessible.role: Accessible.Button
+                            Accessible.name: "Retry starting " + conditionRow.modelData.name
                           }
 
                           Text {
@@ -2895,6 +3039,7 @@ Item {
                   Text {
                     textFormat: Text.PlainText
                     width: parent.width - Style.space(20)
+                      - (heldBrightnessButton.visible ? heldBrightnessButton.width + parent.spacing : 0)
                     text: root.noticeText
                     color: root.noticeError ? root.urgent : root.dim
                     font.family: Style.font.family
@@ -2902,6 +3047,19 @@ Item {
                     wrapMode: Text.WordWrap
                     Accessible.role: Accessible.StaticText
                     Accessible.name: root.noticeText
+                  }
+                  Button {
+                    id: heldBrightnessButton
+                    visible: root.noticeError && root.heldBrightnessId !== "" && !heldBrightnessProc.running
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Keep brightness"
+                    bordered: true
+                    focusable: true
+                    foreground: root.fg
+                    accent: root.accent
+                    onClicked: root.requestAcceptBrightness()
+                    Accessible.role: Accessible.Button
+                    Accessible.name: "Keep the current brightness and finish ending the routine"
                   }
                 }
               }
@@ -2934,6 +3092,7 @@ Item {
           root.pendingUiAction = ""
           root.pendingUiValue = null
           if (purpose === "disconnect") root.mutateConnection("disconnect")
+          else if (purpose === "accept-brightness") root.acceptHeldBrightness()
           else if (purpose === "delete") root.deleteSelectedRoutine()
           else if (purpose === "discard") {
             routineEditor.dirty = false

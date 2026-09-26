@@ -12,37 +12,68 @@ The panel, the condition service, and a small bar widget run inside the existing
 
 Omachord started with an old microphone automation. While revisiting it, something clicked: composable, restorable routines felt like a missing piece in the OS.
 
-## What's new in 0.4.1
+Release notes are in [CHANGELOG.md](CHANGELOG.md).
 
-- **Clear bar status:** dimmed when Off, normal theme brightness when On, and the theme accent while a routine is running.
-- **Balanced icon size:** the bar mark matches the stock icon font size while retaining the standard click target. Popup artwork is unchanged.
+## Contents
 
-To place the widget with your right-side status controls while preserving its settings:
+- [Quick start](#quick-start)
+- [Requirements](#requirements)
+- [Install](#install) ([what enabling changes](#what-enabling-omachord-changes), [updating](#updating))
+- [Development](#development)
+- [Integration](#integration)
+- [Panel](#panel) and [Bar widget](#bar-widget)
+- [Routines](#routines) ([runner commands](#runner-commands))
+- [Hook Context](#hook-context)
+- [Security](#security)
+- [Files](#files)
+- [Remove](#remove)
+- [Test](#test)
+- [License](#license)
+
+## Quick start
+
+Read [what enabling Omachord changes](#what-enabling-omachord-changes), then install, enable, and open it:
 
 ```bash
-omarchy bar move anothadev.omachord --section right --after omarchy.tray
+omarchy plugin add https://github.com/anothaDev/omachord.git --enable
+omarchy-shell shell summon anothadev.omachord '{}'
 ```
 
-## What's new in 0.4.0
-
-- **More responsive routines:** independent manual routine requests can run concurrently, and busy indicators stay with the affected routine instead of blocking the whole panel.
-- **Stable loading switches:** pending toggles show a spinner without changing size, and ignore repeat activation until the operation settles. The panel and bar share connection progress.
-- **Faster connection changes:** redundant status probes are avoided, and shortcut processing and inode safety checks are batched while retaining locking, rollback, and durability protections.
-- **Faster saves:** enable/disable edits to different routines are batched, and edits that leave generated shortcuts unchanged avoid an unnecessary Hyprland reload when the existing integration is verified.
-- **Faster shortcut browsing:** the catalogue is parsed in batches and has a styled scrollbar.
-- **Non-blocking microphone cues:** mute/unmute sounds no longer hold routine locks while playing.
-- **Omachord branding:** a branded application launcher icon, plus a transparent ring/keycap mark in the bar and popup that follows their theme foreground colors.
+In **Routines**, choose a starting point from **New routine** (for example **Meeting microphone**), adjust its shortcut and actions, and press **Save** (Ctrl+S). The routine is live as soon as it is saved. Turn the **Omachord** switch off at any time to pause every shortcut, hook, and condition while keeping your routines.
 
 ## Requirements
 
 - Omarchy 4.0.2
 - Hyprland 0.56.2
 - Quickshell 0.3.1
-- Bash, Perl, GNU awk (`gawk`), GNU coreutils 9.5+, `jq`, `flock`, `fuser`, `timeout`, `wpctl`, and `paplay`
 
-These are present in a standard Omarchy installation.
+The runner also uses these commands. The Arch package that provides each is in parentheses; all of them are present in a standard Omarchy installation:
+
+- `bash`, `jq` (`jq`), `flock` (`util-linux`), `fuser` (`psmisc`), `gawk` (`gawk`)
+- GNU coreutils 9.5 or later (`coreutils`), for `mv --exchange` and `--update=none-fail`; the runner checks the version at startup and reports a clear error on an older one
+- `perl` (`perl`), using only core modules: `Digest::SHA`, `Encode`, `Errno`, `Fcntl`, `IO::Handle`, `JSON::PP`, `POSIX`, and `Time::HiRes`
+- `wpctl` (`wireplumber`) and `paplay` (`libpulse`) for the microphone action and sound cues
+- `uwsm-app` (`uwsm`) and `gtk-launch` (`gtk3`) for the application-launch action
+- `hyprctl` (`hyprland`) and `cmp` (`diffutils`)
+- `sound-theme-freedesktop`, whose `/usr/share/sounds/freedesktop/stereo/` sounds are the default microphone and sound-action cues
+
+The test suite additionally needs `lua` (for `luac`), `qt6-declarative` (for `qmllint` and `qmltestrunner`), `desktop-file-utils` (for `desktop-file-validate`), `python`, `nodejs`, and `strace`. See [Test](#test).
 
 ## Install
+
+### What enabling Omachord changes
+
+Enabling the plugin is your consent to the changes below. As soon as the plugin is enabled, and again each time Omarchy Shell starts, its condition service runs `omachord autostart`, which connects Omachord unless you turned it Off earlier. Connecting:
+
+- Appends one marked loader line to `~/.config/hypr/bindings.lua`, after first saving a copy under `~/.local/state/omarchy/omachord/backups/`.
+- Writes the generated shortcuts to `~/.config/hypr/omachord.lua`.
+- Installs six hook dispatchers, one per supported event: `~/.config/omarchy/hooks/<event>.d/anothadev.omachord`.
+- Installs a launcher entry, `~/.local/share/applications/anothadev.omachord.desktop`, and its icon, `~/.local/share/icons/hicolor/scalable/apps/anothadev.omachord.svg`.
+- Reloads Hyprland, verifies the result, and rolls back on failure.
+
+Once per install, on an installation first enabled with 0.2.0 or earlier (before the bar widget existed), Omachord also moves its own entry in `~/.config/omarchy/shell.json` from `plugins[]` onto the bar, keeping the previous file under the same `backups/` directory.
+
+Turning the **Omachord** switch Off, or running `omachord disconnect`, reverses every change above except that one-time `shell.json` move. Nothing else is changed outside Omachord's own configuration file, state directory, and runtime lock directory (see [Files](#files)).
 
 ### With the plugin manager
 
@@ -83,7 +114,7 @@ For either installation method, open the panel with:
 omarchy-shell shell summon anothadev.omachord '{}'
 ```
 
-Omachord enables its Hyprland integration on first use, so the panel opens with the **Omachord** switch on and saved routines are live immediately. Turn that switch off to pause shortcuts, hooks, and conditions while keeping every routine; that choice persists across shell restarts until you turn it on again.
+Omachord connects its Hyprland integration as soon as the plugin is enabled (see [What enabling Omachord changes](#what-enabling-omachord-changes)), so the panel opens with the **Omachord** switch on and saved routines are live immediately. Turn that switch off to pause shortcuts, hooks, and conditions while keeping every routine; that choice persists across shell restarts until you turn it on again.
 
 Once connected, you can also open **Omachord** from the application launcher. If the service is not available after installation, restart the shell with `omarchy restart shell` and try again.
 
@@ -119,7 +150,16 @@ omachord config validate < "$draft" &&
 
 Stop if any command fails. Keep the original revision while editing; if apply reports `stale-config`, take a fresh snapshot and reconcile your edits rather than forcing an overwrite. Only apply routine JSON you trust: it can execute commands as your user. See [Routines](#routines) and [Runner commands](#runner-commands) for execution and restore behavior.
 
-### Updating a manual checkout
+### Updating
+
+For a plugin-manager installation:
+
+```bash
+omarchy plugin update anothadev.omachord
+omarchy restart shell
+```
+
+`omarchy plugin update` fetches the repository's current default branch (`HEAD` of its origin), shows the diff for confirmation, fast-forwards, and validates the result. It does not install a marketplace-verified snapshot or a release tag, so it can include unreleased changes.
 
 For a manual shell-plugin installation:
 
@@ -128,9 +168,9 @@ git -C "$HOME/.config/omarchy/plugins/anothadev.omachord" pull --ff-only
 omarchy restart shell
 ```
 
-For a runner-only installation, use `git -C "$HOME/.local/share/omachord" pull --ff-only` instead, then `omachord connect` to repair or refresh owned integration if needed. These commands follow the repository's default branch, which can include unreleased changes. If you want a published version, select an existing tag from [Releases](https://github.com/anothaDev/omachord/releases) instead. Do not discard local edits to force an update.
+For a runner-only installation, use `git -C "$HOME/.local/share/omachord" pull --ff-only` instead, then `omachord connect` to repair or refresh owned integration if needed. These commands also follow the repository's default branch. If you want a published version, check out an existing tag from [Releases](https://github.com/anothaDev/omachord/releases) instead. Do not discard local edits to force an update.
 
-When upgrading a shell-plugin installation to 0.4.0, restart Omarchy Shell so it discovers the new QML components. Existing routines are retained. If an older installation still has the generic launcher icon, run `~/.config/omarchy/plugins/anothadev.omachord/bin/omachord connect` to migrate the owned launcher integration (or use **Repair** if the panel offers it). Upgrades from 0.2.0 also receive the bar-widget placement described below.
+When upgrading a shell-plugin installation to 0.4.0 or later, restart Omarchy Shell so it discovers the new QML components. Existing routines are retained. If an older installation still has the generic launcher icon, run `~/.config/omarchy/plugins/anothadev.omachord/bin/omachord connect` to migrate the owned launcher integration (or use **Repair** if the panel offers it). Upgrades from 0.2.0 also receive the bar-widget placement described below.
 
 ## Development
 
@@ -149,11 +189,11 @@ To review the panel without opening it on your desktop, `test/render/render.sh` 
 
 ## Integration
 
-On first use, Omachord automatically performs its system-integration transaction:
+When the plugin is enabled and each time Omarchy Shell starts, the condition service runs `omachord autostart`. Unless Omachord was turned Off, that performs its system-integration transaction:
 
 - Refuses a fresh connection if Hyprland already reports configuration errors; an owned broken integration can still be repaired transactionally.
-- Backs up `~/.config/hypr/bindings.lua`.
-- Adds one marked optional-loader line to `bindings.lua`.
+- Backs up `~/.config/hypr/bindings.lua` under `~/.local/state/omarchy/omachord/backups/`, keeping the ten most recent backups plus the original.
+- Adds one marked optional-loader line to `bindings.lua`. Disconnecting removes it again and leaves the file byte-identical to how it was before connecting, apart from any edits you made in the meantime.
 - Generates app-owned shortcut Lua and six guarded hook dispatchers.
 - Installs the Omachord desktop entry and its branded SVG under the user's hicolor icon theme.
 - Reloads Hyprland, verifies the generated configuration, and rolls back on failure.
@@ -198,6 +238,8 @@ A routine can be run manually, by one optional keyboard shortcut, or by any comb
 
 Actions execute in order and stop at the first failure. Supported actions are microphone toggle, application launch, Omarchy command, notification, OSD, sound, delay, direct program execution, and an advanced shell command.
 
+Panel and condition-service requests that execute routine work have a **10-minute total execution limit**. This includes starting, ending, and recovering routines, plus configuration saves and Disconnect when they end routines; a bulk operation shares one budget across all routines. Long sequences can reach this limit even when every action is valid. Per-action timeout overrides do not extend it. For longer work, invoke the runner directly from the CLI, which has no QML watchdog. The limit concerns a running command, not how long an activated routine can remain active. A timeout can leave completed effects and retained recovery records: inspect the active state before retrying.
+
 ### Setters and restore
 
 Five actions set Omarchy state instead of running a program: **night light**, **do not disturb**, **stay awake**, **theme**, and **display brightness**. They go through the Omarchy shell (`omarchy-shell nightlight|idle|notifications`), `omarchy-theme-set`, and `omarchy-brightness-display`, so the bar indicators follow and Omarchy's own hooks still fire. There is no light/dark mode in Omarchy; the theme setter with restore is the equivalent.
@@ -208,9 +250,27 @@ Each setter has a **Return to previous state when routine ends** switch. A routi
 - Its shortcut and manual runs **toggle** it: the first run activates, the next one ends it. Omarchy events only ever activate a stateful routine.
 - Ending it restores the recorded values in reverse order, but only where the live value still equals what the routine applied. A value you changed yourself in the meantime is left alone.
 - Saving a configuration that deletes or disables an active routine ends it first, and so does turning Omachord off.
-- A setter read that returns something unexpected refuses the activation before anything is changed. A failure part-way through rolls back the setters that were already applied.
+- A restoring setter read that returns something unexpected refuses that setter's change. A failure part-way through rolls back the setters that were already applied. Brightness availability is additionally checked before **any** action in a routine that declares a brightness action.
 - A restore that cannot complete (for example while the shell is not running) keeps the activation record and reports the routine as still active, so a later deactivation finishes the job. Records are only discarded once everything they recorded has been dealt with.
 - While a routine is active, another routine cannot claim the same restoring setter type. The second activation reports a conflict; non-restoring setters remain unrestricted.
+
+#### Display brightness availability
+
+A brightness action requires a working software brightness controller. Being wired does not determine support: some external displays support DDC/CI, others do not, and DDC/CI may be disabled in the display's own menu. Omachord does not substitute a dimming overlay or silently omit the brightness action. If the selected display is unsupported, asleep, disconnected, or unreadable at preflight, the **whole routine is blocked before its actions run**, including a brightness action with restore disabled. A readable probe cannot guarantee that a later write will succeed; later failures still use rollback and retained recovery, not a claim that earlier non-restoring effects can be undone.
+
+For condition-driven starts, this appears as **Unavailable** with the time of the next attempt. Because a display that is asleep, busy, or briefly unreadable usually recovers, the condition service retries on a capped backoff (after 1, 2 and 5 minutes, then every 10 minutes) while the conditions stay true; a false edge or a configuration change resets it. **Retry now** on the Unavailable row asks the condition service to try again immediately, so a successful start still ends when the conditions stop matching (a manual start from the editor would be yours to end). An already-active routine with pending recovery is different: restoration keeps its record and retains the normal retry behavior. Do not delete the record to silence a hardware error.
+
+Brightness requirements in both start and end actions are checked at activation. Reads, writes, restoration and end actions use the display chosen then, not whichever display is focused later. Records store the connector name and a digest of the compositor's make/model/serial metadata. A missing or observably replaced display defers restoration; identical/blank hardware metadata, cached DDC bus mappings, the backend's internal-backlight selection, and changes during external tool calls cannot provide a kernel-level physical identity guarantee. Omarchy's Apple HID helper cannot currently bind its device to a named display, so those brightness routines are reported unavailable rather than risking a different display.
+
+On external DDC displays, a requested 0% is recorded as the backend's effective minimum of **1%**, and an original 0% is likewise restored as 1%; internal backlights can use 0%. A successful helper exit is not enough: Omachord reads brightness back on the same target before confirming the setter, re-reading for up to about a second so a slow DDC display can finish applying. A backlight whose hardware steps cannot represent the exact percentage may read one point off; that is accepted only once two reads agree, and the observed value is recorded as what was applied. Dropped writes, other precision/rounding differences, and unreadable confirmation fail rather than claiming success. A value that still reads as the original is only treated as restored once a second read agrees, so a late-landing write is not mistaken for a finished restore. An unconfirmed intermediate value keeps recovery for inspection instead of being mistaken for a manual override. Restoration also records pending/done progress so an uncertain restoring write cannot become a false manual override on retry. Once a manual override is detected, older brightness entries for the same target are not replayed. Checkpoint updates and record removal compare against the expected record; a concurrent change stops further recovery effects instead of overwriting the changed record. **Deactivated** can mean that restoration was intentionally skipped because a value changed; it is not a guarantee that every original value was written back.
+
+#### Resolving a held brightness record
+
+If an unconfirmed or interrupted brightness write leaves the display at a value that is neither the original nor the one the routine applied, Omachord cannot tell whether you changed it or the write half-landed, so it **holds** the record: ending the routine fails with code `brightness-held` and the record is kept. This is most likely after upgrading from 0.4.1 or earlier with a display you adjusted by hand. A held record also stops `omachord disconnect` and saves that delete or disable the routine until it is resolved. To resolve it, choose one:
+
+- Set the display back to either value yourself and end the routine again; Omachord then finishes normally.
+- Keep the display as it is: in the window, the error after **End** offers **Keep brightness**; from a terminal run `omachord recovery inspect <id>` and then `omachord recovery accept-brightness <id> <revision>`. This marks the unresolved brightness entries skipped without writing brightness, and finishes ending the routine (other setters are still restored). The decision is saved only if the record is unchanged since it was inspected.
+- For a legacy record whose display still shows the value the routine applied, `omachord recovery bind-brightness <id> <revision> <monitor> --confirm-if-applied` records that write as confirmed, so a later manual change is kept as an override instead of being held.
 
 ### When a routine ends
 
@@ -241,7 +301,7 @@ The service stays idle while Omachord is off, ignores uncommitted configuration,
 omarchy-shell omachord status
 ```
 
-The status names every active routine and, for each condition routine, one `details` entry per condition (its summary, whether it holds, and the input the service sees) plus the last failed start or end and when it will be retried. The same service accepts `omarchy-shell omachord end <routine-id>` and `start <routine-id>`, which is what the bar widget uses.
+The status names every active routine and, for each condition routine, one `details` entry per condition (its summary, whether it holds, and the input the service sees) plus the last failed start or end and when it will be retried. The same service accepts `omarchy-shell omachord end <routine-id>` and `start <routine-id>`, which is what the bar widget uses. Two more IPC calls are for troubleshooting: `omarchy-shell omachord evaluate` schedules a condition evaluation after a short debounce (it answers `scheduled`), and `omarchy-shell omachord reload` makes the service re-read status, configuration, activation records, and toggles from the runner (it answers `reloading`).
 
 ### Runner commands
 
@@ -249,7 +309,9 @@ The status names every active routine and, for each condition routine, one `deta
 | --- | --- |
 | `omachord status` | Inspect configuration and integration health |
 | `omachord connect [revision]` | Reuse committed configuration; supply the inspected revision to approve changed configuration |
-| `omachord disconnect` | End active routines and remove owned integration, keeping configuration and history |
+| `omachord autostart` | What the service runs at startup: connect with committed configuration (or bootstrap an empty one) unless Omachord was turned Off |
+| `omachord disconnect` | End active routines and remove owned integration, keeping configuration and history; persists Off |
+| `omachord config show` | Print the committed configuration as validated, sorted JSON |
 | `omachord config snapshot` | Read configuration with its compare-and-swap revision |
 | `omachord config validate` | Validate candidate JSON from stdin without saving |
 | `omachord config apply <revision>` | Apply candidate JSON from stdin only if the loaded revision still matches |
@@ -257,16 +319,23 @@ The status names every active routine and, for each condition routine, one `deta
 | `omachord activate <id> [source [revision]]` | Activate without toggling; manual/test callers may bind a reviewed revision |
 | `omachord deactivate <id> [manual\|shortcut\|test]` | End a routine from its activation record |
 | `omachord active` | List activation records |
+| `omachord trigger hook <event> [args...]` | Run the routines attached to one of the six Omarchy events; this is what the hook dispatchers call |
 | `omachord recovery inspect <id>` | Inspect an activation record and its recovery revision |
 | `omachord recovery restore <id> <revision> --skip-end-actions` | Restore recorded setter values without executing remaining end actions, only for the inspected record |
+| `omachord recovery bind-brightness <id> <revision> <monitor> [--confirm-if-applied]` | Explicitly bind an inspected legacy brightness record to its original display; does not change physical brightness. The option confirms the newest legacy write when the display still shows its applied value |
+| `omachord recovery accept-brightness <id> <revision>` | Keep the current brightness for an inspected held record: mark unresolved brightness entries skipped, then finish ending the routine |
+| `omachord bindings` | Print the current shortcut catalogue (from `omarchy menu keybindings --print`) as JSON |
+| `omachord commands` | List Omarchy commands offered as actions, excluding hidden and `requires_sudo` ones |
 | `omachord toggles` | List valid top-level Omarchy toggle flags as bounded JSON |
 | `omachord themes` | List installed themes through a bounded control probe |
 | `omachord service-status` | Read one validated condition-service status object through a bounded probe |
 | `omachord theme-palette` | Read the current theme name and green within fixed file-size limits |
-| `omachord logs [limit]` | Run history; stateful routines log `activated` and `deactivated` entries |
+| `omachord logs [limit]` | Newest-first run history, 50 entries by default and at most 500; stateful routines log `activated` and `deactivated` entries |
 | `omachord widget ensure\|status\|forget` | Place the bar widget once through the Omarchy shell, inspect or clear that record |
 
-In a plugin installation, the runner is at `~/.config/omarchy/plugins/anothadev.omachord/bin/omachord`; use that full path if `omachord` is not on your `PATH`.
+In a plugin installation, the runner is at `~/.config/omarchy/plugins/anothadev.omachord/bin/omachord`; use that full path if `omachord` is not on your `PATH`. `omachord --help` prints the full usage, including the `activate`/`deactivate` forms reserved for the condition service.
+
+Run history is `~/.local/state/omarchy/omachord/runs.jsonl`. When it grows past 256 KiB, the next entry first trims it to its last 200 lines.
 
 The microphone template calls `omarchy audio input mute` first, preserving Omarchy's OSD and hardware LED behavior. It then reads the resulting microphone state and starts the configured mute or live cue asynchronously, so playback does not hold routine/configuration locks or delay completion.
 
@@ -286,34 +355,27 @@ Hook values are exported as data and are not evaluated by the runner. Every chil
 
 ## Security
 
-Routines are trusted local configuration and are not sandboxed.
+- **Routines are trusted code.** Saving a routine authorizes Omachord to run it as your user whenever its shortcut, events, or conditions fire, without sandboxing. Review routine JSON from anyone else before saving or running it.
+- **`exec` and `shell`.** `exec` launches the chosen program with a literal argument list and no shell parsing. `shell` intentionally runs `bash -lc` and can do anything your user can.
+- **No elevation.** Omachord needs no sudo or pkexec and never elevates itself. `exec` and `shell` actions run any program you choose with your user's rights, so a routine can call a privilege-elevation tool, and a recently cached password may let it do so without asking again. Save only routines you would run yourself.
+- **Backups and rollback.** Omachord keeps a copy of `bindings.lua` and `shell.json` before editing them (see [Files](#files)) and rolls back a failed integration or configuration transaction. Ending a routine is not rolled back: if Disconnect, or a save that disables or deletes an active routine, fails after that routine was ended, it stays ended. Other effects of routine actions are not undone, apart from the values a restoring setter puts back.
+- **Reporting.** Report vulnerabilities privately through GitHub private vulnerability reporting (**Report a vulnerability** in the Security tab), not in a public issue.
 
-- `exec` launches the selected program with a literal JSON argument array and no shell parsing.
-- `shell` intentionally runs `bash -lc` and can execute arbitrary commands as your user.
-- `exec` and `shell` can invoke `sudo`; cached credentials may allow a routine to elevate without another password prompt.
-- Omarchy command choices exclude commands marked hidden or `requires_sudo`, but command metadata is not a security boundary; a selected command can still open a privilege prompt internally.
-- Ordinary action capture retains a 4 KiB combined stdout/stderr tail, and foreground program-execution stages have a 30-second default timeout. Built-in control capture rejects output above 1 MiB and defaults to five seconds. One native supervisor owns capture, cancellation, and the unreaped timeout-group leader through its final signal. These are per-stage limits, not a sandbox or a total CPU/output quota for user-authored code. Explicit delays are capped at five minutes.
-- Integration manages the files listed below, including hook dispatchers, the desktop entry, and the launcher icon. It also edits `~/.config/omarchy/shell.json` once when moving this plugin's entry onto the bar on an install upgraded from 0.2.0; the previous file is kept under `~/.local/state/omarchy/omachord/backups/`.
-- Setter writes are argv-literal calls to Omarchy tools. Activation records are validated before use; a record that fails validation stops `run`, `activate`, `deactivate`, and `active` with `unsafe-state` instead of being treated as inactive.
-- A theme setter makes Omarchy fire its `theme-set` hook, which re-enters the runner. The per-routine lock reports the originating routine as busy, so a routine cannot recurse into itself.
-- Saves use revision-based compare-and-swap, so a stale panel cannot overwrite a newer configuration.
-- A queued routine switch is bound to the complete definition reviewed when it was requested. A retry cancels that switch if the definition changed or disappeared; independent switches remain available.
-- Run now, Save & Run, and service-backed live starts retain the configuration revision reviewed when queued. If any save overtakes the request, including a save to another routine, the start reports that the configuration changed and requires a fresh retry. The runner checks and executes the same captured snapshot. Explicit runner CLI calls without a revision keep selecting the latest committed configuration.
-- Condition-service jobs carry the revision they evaluated; the runner rejects stale jobs and post-Disconnect activations before any routine action runs.
-- Events and shortcuts already waiting for the configuration lock are also rejected after a completed Disconnect; removing their on-disk dispatchers is not the only revocation check.
-- Readers require the canonical configuration to match a post-reload commit record. A candidate cannot execute before its integration transaction commits, and an interrupted candidate fails closed.
-- Configuration is exactly one JSON document. Automatic startup checks persistent Off while holding the mutation lock and cannot approve a changed or unmarked configuration. Bare Connect reuses committed content; initially absent configuration and commit records may bootstrap an empty setup.
-- Active routines bind their ending mode and end-action list to an immutable digest. Saves reject changes to a retained active routine's end plan. End the routine before editing that plan; disabling or removing a routine still performs the existing cleanup first.
-- Managed writes and removals pin verified parent-directory descriptors, use descriptor-relative atomic compare-and-swap operations, and check staged producer failures before publication. Successful publication syncs both the file and containing directory. Concurrent versions and open or uncertain inodes are preserved, using private state archives where possible and adjacent private archives when inode identity requires it.
+[SECURITY.md](SECURITY.md) describes the trust model, the supported environment overrides, resource limits, and the transaction and recovery invariants.
 
-Review routine JSON added outside the panel before running it, especially `exec` and `shell` actions.
+### Recovering interrupted state
+
 If an interrupted transaction leaves an uncommitted configuration, the panel refuses to load or run it. Inspect `omachord config snapshot`, review all routines in that snapshot, then use `omachord connect <inspected-revision>` or replace the configuration through revision-bound `config apply`. A revision identifies bytes; it does not replace reviewing them.
 
-Activation records from this version use schema version 2. Older runners intentionally reject them, so finish restoring active routines before downgrading. Legacy records with end actions cannot prove which action list their saved progress referred to and require explicit recovery. Run `omachord recovery inspect <id>`, review the snapshot and recorded setter values, then use `omachord recovery restore <id> <revision> --skip-end-actions` if restoring those values and skipping remaining executable end effects is the intended outcome. The runner records that choice durably before restoring setters. If restoration fails, it keeps the record so recovery can be retried.
+Activation records for stateful routines requiring brightness use schema version 3, including a display identity and, for restoring setters, write-confirmation and restore-progress receipts; other new records remain version 2. Older runners intentionally reject unknown versions, so finish restoring active routines before downgrading. Legacy brightness records do not identify their display: they remain pending rather than guessing from today's focus. Inspect the record with `omachord recovery inspect <id>`, then explicitly bind its original display with `omachord recovery bind-brightness <id> <revision> DP-1` (use the actual original monitor name). The mapping is saved only if the inspected record is unchanged; it does not assert that the legacy write succeeded. Normal deactivation can then retry restoration, retaining ambiguous values for inspection; see [Resolving a held brightness record](#resolving-a-held-brightness-record). Already-bound records cannot be retargeted with this command. A legacy record without brightness setters can be bound only when its recorded end actions (matched against the committed plan) use brightness.
+
+Legacy records with end actions cannot prove which action list their saved progress referred to and require explicit recovery. Run `omachord recovery inspect <id>`, review the snapshot and recorded setter values, then use `omachord recovery restore <id> <revision> --skip-end-actions` if restoring those values and skipping remaining executable end effects is the intended outcome. The runner records that choice durably before restoring setters. If restoration fails, it keeps the record so recovery can be retried. For an unbound legacy brightness record with legacy end actions, explicitly skip those end actions first, then inspect the updated record and bind its display.
 
 Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 
 ## Files
+
+Paths follow the XDG defaults: `~/.local/state` is `$XDG_STATE_HOME` and `~/.local/share` is `$XDG_DATA_HOME` when those are set. The `~/.config` paths are fixed, as in Omarchy, and do not follow `XDG_CONFIG_HOME`.
 
 | Path | Purpose |
 | --- | --- |
@@ -325,11 +387,15 @@ Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
 | `~/.local/share/icons/hicolor/scalable/apps/anothadev.omachord.svg` | Application launcher icon |
 | `~/.local/state/omarchy/omachord/runs.jsonl` | Rolling execution history |
 | `~/.local/state/omarchy/omachord/active/<routine-id>.json` | Activation record of a stateful routine, holding the values to restore |
-| `~/.local/state/omarchy/toggles/<flag>` | Omarchy toggle flags read by the toggle condition |
+| `~/.local/state/omarchy/toggles/<flag>` | Omarchy-owned toggle flags; Omachord only reads them for the toggle condition |
 | `~/.local/state/omarchy/omachord/connection.json` | Integration ownership record |
+| `~/.local/state/omarchy/omachord/connection.disabled.json` | Persisted Off choice; while present, startup does not reconnect |
 | `~/.local/state/omarchy/omachord/bar-widget.json` | Record that the bar widget was placed once |
+| `~/.local/state/omarchy/omachord/backups/bindings.lua.<suffix>` | `bindings.lua` as it was before Omachord edited it; pruned to the ten most recent plus the original |
 | `~/.local/state/omarchy/omachord/backups/shell.json.<suffix>` | `shell.json` as it was before the widget entry was moved |
 | `~/.local/state/omarchy/omachord/config.commit.json` | Last committed configuration revision |
+| `~/.local/state/omarchy/omachord/config.lock`, `log.lock` | Configuration and run-history locks |
+| `$XDG_RUNTIME_DIR/omachord/*.lock` | Per-routine and shared-resource locks (`~/.local/state/omarchy/omachord/runtime/` when `XDG_RUNTIME_DIR` is unset) |
 | `~/.local/state/omarchy/omachord/conflicts/` | Concurrent file versions preserved during a rare transaction conflict |
 | `~/.local/state/omarchy/omachord/retired/` | Replaced inodes retained only when changed after verification or still open elsewhere |
 | `<managed-parent>/.omachord-conflicts/` and `.omachord-retired/` | Private adjacent archives when state-directory storage cannot retain the original inode |
@@ -338,11 +404,14 @@ Recovery archives may contain unique later writes made through an already-open f
 
 ## Remove
 
-For a plugin-manager installation, turn Omachord off before removing the plugin:
+Disconnect before removing the code. Only the runner removes the generated shortcuts and hook dispatchers, so deleting the checkout first leaves them behind.
 
-1. Open Omachord and turn the **Omachord** switch off.
-2. Confirm that the sidebar reports **Off**.
-3. Run `omarchy plugin remove anothadev.omachord`.
+For a **plugin-manager installation**, either turn the **Omachord** switch off in the panel, confirm the sidebar reports **Off**, and run `omarchy plugin remove anothadev.omachord`, or do the same from a terminal:
+
+```bash
+~/.config/omarchy/plugins/anothadev.omachord/bin/omachord disconnect &&
+  omarchy plugin remove anothadev.omachord
+```
 
 For a **manual shell-plugin installation**, disconnect first and unload it without the plugin manager:
 
@@ -355,11 +424,28 @@ Only after disconnect succeeds and the shell replies `ok`, remove the checkout a
 
 For a **runner-only installation**, run `omachord disconnect` before deleting `~/.local/share/omachord`, then remove the exports you added to your shell startup file. If disconnect fails, keep the checkout and activation records so you can finish restoring active routines before removal.
 
-Turning Omachord off removes owned generated integration, including the launcher entry and icon, while preserving routines and run history. If desired, those retained files can then be removed from `~/.config/omarchy/omachord.json` and `~/.local/state/omarchy/omachord/`.
+**Removed while On?** If the plugin was removed without disconnecting first, reinstall it without enabling it, disconnect, and remove it again:
+
+```bash
+omarchy plugin add https://github.com/anothaDev/omachord.git   # answer No to "Enable now?"
+~/.config/omarchy/plugins/anothadev.omachord/bin/omachord disconnect &&
+  omarchy plugin remove anothadev.omachord
+```
+
+`omarchy plugin add --yes` also installs without enabling. Disconnect ends active routines, restoring what they recorded, and removes the loader line, shortcuts, hook dispatchers, launcher entry, and icon.
+
+**What stays behind.** Disconnecting preserves your routines and history and does not remove:
+
+- `~/.config/omarchy/omachord.json` (your routines) and the state directory `~/.local/state/omarchy/omachord/` (history, records, backups, and recovery archives; see [Files](#files)).
+- The `~/.config/omarchy/hooks/<event>.d/` directories, which may now be empty.
+- Any private `.omachord-conflicts/` or `.omachord-retired/` archive directories, or an interrupted private transaction file (`.omachord-*`), beside managed files. These are created only in the rare cases described under [Files](#files).
+- Lock files under `$XDG_RUNTIME_DIR/omachord/`, which the system clears when your last session ends (or under `~/.local/state/omarchy/omachord/runtime/` when `XDG_RUNTIME_DIR` is unset).
+
+`~/.local/state/omarchy/omachord/backups/` holds the only copies of `bindings.lua` and `shell.json` from before Omachord edited them. Compare them with your current files and restore anything you need **before** deleting the state directory. Inspect recovery archives before deleting them, too; they may contain changes that exist nowhere else.
 
 ## Test
 
-The test suite uses temporary HOME and XDG directories and does not touch the live Hyprland configuration:
+The test suite uses temporary HOME and XDG directories under `${TMPDIR:-/tmp}` and does not touch the live Hyprland configuration:
 
 ```bash
 test/run.sh
@@ -373,10 +459,14 @@ It exercises strict and byte-bounded schema validation, bounded toggle discovery
 
 The toggle regressions cover fixed geometry, animated pending states, mouse/keyboard/accessibility activation, shared panel/bar connection progress, stale status replies, and failure recovery. The runner speed suite checks that shortcut processing uses a constant number of `jq` launches as the shortcut count grows; its reported connect/status timings are diagnostic, not desktop latency guarantees.
 
-GitHub Actions runs the required `portable` check on pushes and pull requests. It includes source and manifest validation, required QML/artwork file checks, the filesystem transaction tests, the action-supervisor tests, runner integration and fast-path/audio regressions with mocked desktop commands, and the Node.js model, condition, and QML policy tests. Tag builds also require the tag to match `v` plus the manifest version. The job uses Debian 13 for GNU coreutils 9.5+ (`mv --exchange` and `--update=none-fail`) and explicitly installs GNU awk for Unicode key normalization; the shell test suites run as a non-root user so permission-denial checks remain meaningful. It does not replace the full local gate: run `test/run.sh` before releasing to also check the target desktop versions, plugin validation, runtime QML behavior, and QML linting. See [Releasing](docs/RELEASING.md) for the clean-archive and review requirements.
+Brightness regressions exercise unavailable-controller preflight, pinned target selection, disconnect/replacement, write confirmation, retained recovery, legacy binding, and manual overrides without touching real displays. The additional [Lean verification](docs/BRIGHTNESS_PROOFS.md) is run with `bash test/lean/run.sh` using an installed Lean 4 toolchain (tested with 4.34.0). It proves the stated model properties and compares generated cases against the actual condition functions; it is not a proof of the entire Bash/QML application or external hardware. Lean is a separate local check, not installed or silently skipped by portable CI.
 
-`test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup (including off and pending states) offscreen into `test/render/out/` so a change can be reviewed as images. It reads your real configuration through the runner but never writes.
+GitHub Actions runs the required `portable` check on pull requests and on pushes to `main` and `v*` tags. It includes source and manifest validation, required QML/artwork file checks, the filesystem transaction tests, the action-supervisor tests, runner integration and fast-path/audio regressions with mocked desktop commands, and the Node.js model, condition, and QML policy tests. Tag builds also require the tag to match `v` plus the manifest version. The job uses Debian 13 for GNU coreutils 9.5+ (`mv --exchange` and `--update=none-fail`) explicitly installs GNU awk for Unicode key normalization, and installs `strace` so the write-error injection checks run; the shell test suites run as a non-root user so permission-denial checks remain meaningful. It does not replace the full local gate: run `test/run.sh` before releasing to also check the target desktop versions, plugin validation, runtime QML behavior, and QML linting. See [Releasing](docs/RELEASING.md) for the clean-archive and review requirements.
+
+`test/render/render.sh` is not part of the gate: it renders the panel's views, the compact layout, and the bar popup (including off and pending states) offscreen to PNG files so a change can be reviewed as images. It reads your real configuration through the runner but never writes it. Because the images show your own routines, they go to a new private temporary directory by default (printed when it finishes); pass a directory, such as `test/render/out`, to choose the location.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+Omachord bundles no third-party code or assets. Its runtime dependencies (see [Requirements](#requirements)) are installed separately and remain under their own licenses.

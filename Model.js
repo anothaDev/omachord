@@ -91,8 +91,9 @@ function microphoneTemplate(routines) {
   }
 }
 
-// The Omarchy events a routine can listen to. One list feeds the editor, the
-// Activity view, and the README so their wording cannot drift.
+// The Omarchy events a routine can listen to. One list feeds the editor and
+// the Activity view so their wording cannot drift; the README's event table
+// is maintained by hand and must be kept in step with it.
 var HOOKS = [
   { value: "post-boot", label: "After desktop starts", description: "Runs after the graphical session starts", glyph: "\u{F0425}" },
   { value: "theme-set", label: "Theme changed", description: "Theme slug is argument 1", glyph: "\u{F03D8}" },
@@ -406,7 +407,13 @@ function nameFor(config, id) {
 }
 
 var SETTER_TYPES = ["nightlight", "dnd", "stay-awake", "theme", "brightness"]
-var CONDITION_TYPES = ["time", "wifi", "power", "omarchy-toggle"]
+// The condition kinds the runner schema accepts, as the editor offers them.
+var CONDITION_TYPES = [
+  { value: "time", label: "Time period", description: "Between two times of day, optionally on chosen weekdays" },
+  { value: "wifi", label: "Wi-Fi network", description: "Connected to one of the listed networks" },
+  { value: "power", label: "Power source", description: "Plugged in, on battery, or below a battery level" },
+  { value: "omarchy-toggle", label: "Omarchy toggle", description: "An Omarchy toggle flag is on" }
+]
 var WEEKDAY_KEYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 var END_MODES = ["restore", "none", "actions"]
 
@@ -517,16 +524,49 @@ function isAbsolutePath(value) {
   return isBoundedString(value, 1, 1000) && value.charAt(0) === "/"
 }
 
+// Limits of the runner's configuration schema (validate_config_file in
+// bin/omachord). Saving past them would only fail in the runner.
+var MAX_ROUTINES = 256
+var MAX_ACTIONS = 64
+var MAX_END_ACTIONS = 64
+var MAX_CONDITIONS = 16
+var CONTROL_TEXT_MESSAGE = "Text cannot contain line breaks or NUL characters"
+
+// The runner rejects every configuration string that contains NUL, CR or LF.
+function hasForbiddenControl(value) {
+  return typeof value === "string" && /[\u0000\n\r]/.test(value)
+}
+
+function hasForbiddenText(value) {
+  if (typeof value === "string") return hasForbiddenControl(value)
+  if (Array.isArray(value)) {
+    for (var i = 0; i < value.length; i++) if (hasForbiddenText(value[i])) return true
+    return false
+  }
+  if (value && typeof value === "object") {
+    for (var key in value)
+      if (Object.prototype.hasOwnProperty.call(value, key) && hasForbiddenText(value[key])) return true
+  }
+  return false
+}
+
 function validateArguments(args) {
   if (!Array.isArray(args)) return "Arguments must be a JSON array of strings"
   for (var i = 0; i < args.length; i++) {
     if (typeof args[i] !== "string") return "Every argument must be a string"
     if (codePointLength(args[i]) > 500) return "Arguments cannot exceed 500 characters each"
+    if (hasForbiddenControl(args[i])) return "Arguments cannot contain line breaks or NUL characters"
   }
   return ""
 }
 
 function validateCondition(condition) {
+  var message = validateConditionFields(condition)
+  if (message) return message
+  return hasForbiddenText(condition) ? CONTROL_TEXT_MESSAGE : ""
+}
+
+function validateConditionFields(condition) {
   if (!condition) return "Condition is missing"
   switch (condition.type) {
     case "time":
@@ -554,6 +594,14 @@ function validateCondition(condition) {
 }
 
 function validateAction(action, endList) {
+  var message = validateActionFields(action, endList)
+  if (message) return message
+  if (action.type === "shell" && hasForbiddenControl(action.command))
+    return "A shell command must fit on one line; join commands with ; or &&"
+  return hasForbiddenText(action) ? CONTROL_TEXT_MESSAGE : ""
+}
+
+function validateActionFields(action, endList) {
   if (!action) return "Action is missing"
   if (isSetterAction(action)) {
     if (endList && action.restore === true) return "Actions that run when a routine ends cannot restore"
@@ -638,6 +686,11 @@ function validationByIndex(routine) {
 function validateRoutineDetails(routine) {
   var next = normalizeRoutine(routine)
   var message = ""
+  if (hasForbiddenControl(next.name)) return "Routine name cannot contain line breaks or NUL characters"
+  if (next.conditions.length > MAX_CONDITIONS) return "A routine can have at most " + MAX_CONDITIONS + " conditions"
+  if (next.actions.length > MAX_ACTIONS) return "A routine can have at most " + MAX_ACTIONS + " actions"
+  if (next.onEnd.actions.length > MAX_END_ACTIONS)
+    return "A routine can have at most " + MAX_END_ACTIONS + " end actions"
   for (var c = 0; c < next.conditions.length; c++) {
     message = validateCondition(next.conditions[c])
     if (message) return "Condition " + (c + 1) + ": " + message
@@ -653,6 +706,17 @@ function validateRoutineDetails(routine) {
   if (typeof next.keepUntil === "object"
       && !(next.keepUntil.minutes >= 1 && next.keepUntil.minutes <= 1440 && Math.floor(next.keepUntil.minutes) === next.keepUntil.minutes))
     return "Keep the routine for 1 to 1440 minutes"
+  if (hasForbiddenText(next.triggers)) return "Triggers: " + CONTROL_TEXT_MESSAGE
+  // Anything else the runner would refuse, such as a future field.
+  return hasForbiddenText(next) ? CONTROL_TEXT_MESSAGE : ""
+}
+
+// Whole-document limits checked before a configuration is handed to the
+// runner; per-routine details are covered by validateRoutineDetails.
+function validateConfigLimits(config) {
+  var routines = config && Array.isArray(config.routines) ? config.routines : []
+  if (routines.length > MAX_ROUTINES)
+    return "Omachord can keep at most " + MAX_ROUTINES + " routines. Delete one before adding another."
   return ""
 }
 

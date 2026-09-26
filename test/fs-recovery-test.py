@@ -127,7 +127,7 @@ def run_case(fixture, parent_root, cross_mount, operation, failure):
 
 
 def main():
-    temp_parent = "/tmp/opencode" if Path("/tmp/opencode").is_dir() else "/tmp"
+    temp_parent = os.environ.get("TMPDIR") or "/tmp"
     with tempfile.TemporaryDirectory(prefix="omachord-recovery-test.", dir=temp_parent) as local:
         fixture = Path(local)
         same = fixture / "parents"

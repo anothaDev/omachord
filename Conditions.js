@@ -161,10 +161,13 @@ function seedLatches(routines, logs, now) {
     if (!entry) continue
     var at = Date.parse(String(entry.timestamp || ""))
     if (isNaN(at) || now.getTime() - at > latchHorizonMs(routine, now)) continue
+    // Older runners recorded service transitions as "service"; both mean
+    // the condition service itself, as in conditionOwned().
     var trigger = String(entry.trigger || "")
     var status = String(entry.status || "")
-    if (status === "deactivated" && trigger !== "condition") latched[id] = true
-    else if (trigger === "condition" && (status === "success" || status === "failed")) latched[id] = true
+    var byService = trigger === "condition" || trigger === "service"
+    if (status === "deactivated" && !byService) latched[id] = true
+    else if (byService && (status === "success" || status === "failed")) latched[id] = true
   }
   return latched
 }
@@ -206,6 +209,18 @@ function conditionOwned(snapshot) {
   return (trigger === "condition" || trigger === "service") && snapshot.keepUntil === "conditions"
 }
 
+// Whether the service itself will end this active row once its routine's
+// conditions stop matching: only a condition-owned activation of a routine
+// that still has conditions. Rows carry the routine's condition count.
+function endsWithConditions(row) {
+  return conditionOwned(row) && Number(row && row.conditions || 0) > 0
+}
+
+// The one wording the Activity view and the bar popup use for that promise.
+function conditionHoldText(row) {
+  return endsWithConditions(row) ? "while its conditions hold" : ""
+}
+
 // latched: routine ids that already fired for the current true period, so a
 // routine runs once per edge and a manual deactivation is not undone until
 // its conditions have been false at least once.
@@ -243,6 +258,23 @@ function observedActiveIds(routines, env, active, deactivatingId) {
   return ids
 }
 
+// A typed capability failure (for example brightness that is asleep or busy)
+// is often transient, so it retries on a capped backoff instead of waiting out
+// the whole condition period: 1, 2, 5, then every 10 minutes.
+var BLOCKED_BACKOFF_MS = [60000, 120000, 300000, 600000]
+
+function blockedBackoffMs(attempts) {
+  var count = Math.floor(Number(attempts))
+  if (!(count >= 1)) count = 1
+  return BLOCKED_BACKOFF_MS[Math.min(count, BLOCKED_BACKOFF_MS.length) - 1]
+}
+
+// How long a recorded failure suppresses the same transition.
+function failureRetryMs(failure, retryMs) {
+  if (failure && failure.op === "activate" && failure.blocked === true) return blockedBackoffMs(failure.attempts)
+  return isNaN(Number(retryMs)) ? 0 : Number(retryMs)
+}
+
 // The pending queue is a projection of what is desired now, not an append-only
 // event log. Recomputing it drops transitions invalidated while another job ran.
 function reconcileJobs(transitions, currentJob, revision, failures, nowMs, retryMs, maxPending) {
@@ -256,7 +288,7 @@ function reconcileJobs(transitions, currentJob, revision, failures, nowMs, retry
     if (currentJob && String(currentJob.id) === id && String(currentJob.op) === op) continue
     var failure = mapValue(failures, id)
     if (failure && String(failure.op) === op && String(failure.revision) === String(revision)
-        && nowMs - Number(failure.at) < retryMs) continue
+        && nowMs - Number(failure.at) < failureRetryMs(failure, retryMs)) continue
     if (!jobs[id]) order.push(id)
     jobs[id] = {
       id: id,
@@ -389,11 +421,13 @@ function describeFailure(failure, retryMs) {
   if (!failure || typeof failure !== "object") return null
   var at = Number(failure.at)
   if (isNaN(at)) return null
+  var blocked = failure.op === "activate" && failure.blocked === true
   return {
     op: String(failure.op || ""),
     at: at,
     error: failure.error === undefined || failure.error === null ? "" : String(failure.error),
-    retryAt: at + (isNaN(Number(retryMs)) ? 0 : Number(retryMs))
+    blocked: blocked,
+    retryAt: at + failureRetryMs(failure, retryMs)
   }
 }
 
@@ -426,7 +460,9 @@ function toMs(value) {
   if (typeof value === "number") ms = value
   else if (typeof value === "object" && typeof value.getTime === "function") ms = value.getTime()
   else ms = Date.parse(String(value))
-  return typeof ms === "number" && isFinite(ms) ? ms : null
+  // A Date holds at most 8.64e15 ms either side of the epoch; anything
+  // beyond that is an Invalid Date whose toISOString() throws.
+  return typeof ms === "number" && isFinite(ms) && Math.abs(ms) <= 8.64e15 ? ms : null
 }
 
 function nowMsOf(nowDate) {

@@ -111,7 +111,7 @@ ShellRoot {
     var size = [toggle.width, toggle.height]
     toggle.requestToggle()
     waitStarted("connect", "connect")
-    check(calls().indexOf("connect START connect connect sha256:base") !== -1,
+    check(calls().indexOf("connect START connect connect sha256:" + "0".repeat(64)) !== -1,
       "direct connect must forward the loaded revision")
     check(toggle.busy && !toggle.checked, "pending connect must retain the confirmed off state")
     toggle.requestToggle()
@@ -324,6 +324,7 @@ ShellRoot {
         root.testPerRoutineFreshness()
         root.testRoutineProbeFailures()
         root.check(!root.failure, root.failure)
+        root.check(root.calls().indexOf("UNEXPECTED ") === -1, "the panel sent an argv the runner rejects")
         console.log("OMACHORD_QML_TEST_PASS", "direct Panel connection fallback")
       } catch (error) {
         console.error("OMACHORD_QML_TEST_FAIL", String(error), "calls:\n" + root.calls())

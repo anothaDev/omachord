@@ -649,9 +649,14 @@ sub publish_cas {
 
   if ($expected eq "missing") {
     if (!move_noreplace($directory, $temporary, $directory, $name)) {
+      # A failed no-replace move is only evidence of a concurrent writer when
+      # the destination now exists; otherwise mv itself could not publish.
+      my $appeared = lstat(component_path($directory, $name)) ? 1 : 0;
       unlink_entry($directory, $temporary, $destination);
       sync_handle($directory, "directory containing $destination");
-      abort_operation("compare-mismatch", "A file appeared during the transaction: $destination");
+      abort_operation("compare-mismatch", "A file appeared during the transaction: $destination")
+        if $appeared;
+      abort_operation("io-error", "Could not publish $destination: mv failed while the destination was unchanged");
     }
     my $synced = eval {
       verify_published($directory, $name, $destination, $stage_identity, $expected_new);
@@ -844,12 +849,19 @@ sub cas_remove {
   my $quarantine = unused_name($directory, ".omachord-unlink.");
   if (!move_noreplace($directory, $name, $directory, $quarantine)) {
     close $file;
+    # Distinguish mv's own failure (our placeholder is still in place and
+    # nothing reached the quarantine name) from a concurrent writer.
+    my $unchanged = !lstat(component_path($directory, $quarantine))
+      && entry_matches_stage($directory, $name, $placeholder_identity,
+        $placeholder_fingerprint, $destination);
     my ($rolled_back, $preserved) = recover_remove(
       $directory, $name, $placeholder, undef, $destination,
       $placeholder_identity, $placeholder_fingerprint, $archive_root);
-    abort_operation($rolled_back ? "compare-mismatch" : "rollback-failed",
+    abort_operation($rolled_back ? ($unchanged ? "io-error" : "compare-mismatch") : "rollback-failed",
       $rolled_back
-        ? "A file changed while removing $destination"
+        ? ($unchanged
+          ? "Could not remove $destination: mv failed while the destination was unchanged"
+          : "A file changed while removing $destination")
         : "A file changed while removing $destination. Rollback could not restore $destination",
       $preserved);
   }
@@ -917,9 +929,50 @@ sub secure_file {
   return $file;
 }
 
+# Every managed mutation relies on renameat2 through GNU mv (coreutils 9.5+).
+# Older mv rejects the options, which would later look like a concurrent
+# writer. Probe once per runner invocation in a private scratch directory.
+sub require_exchange_support {
+  # Probe outside the state directory: its metadata is watched by the shell
+  # service, and a read-only runner call must not generate change events.
+  my $base = (defined($ENV{TMPDIR}) && $ENV{TMPDIR} =~ m{\A/}) ? $ENV{TMPDIR} : "/tmp";
+  my $probe_path;
+  for (1 .. 100) {
+    my $candidate = sprintf("%s/omachord-probe.%08x%08x", $base, $$, int(rand(0xffffffff)));
+    if (mkdir($candidate, 0700)) { $probe_path = $candidate; last; }
+    last unless $! == EEXIST;
+  }
+  abort_operation("io-error", "Could not create the coreutils probe directory in $base: $!")
+    unless defined $probe_path;
+  my $supported = eval {
+    sysopen(my $probe, $probe_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_NONBLOCK) or die;
+    fcntl($probe, F_SETFD, 0) or die;
+    for my $name (qw(left right)) {
+      sysopen(my $file, component_path($probe, $name),
+        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600) or die;
+      print {$file} $name or die;
+      close $file or die;
+    }
+    my $content = sub {
+      open(my $file, "<", component_path($probe, $_[0])) or return "";
+      local $/;
+      return <$file> // "";
+    };
+    exchange_entries($probe, "left", $probe, "right", "coreutils probe")
+      && $content->("left") eq "right" && $content->("right") eq "left"
+      && move_noreplace($probe, "left", $probe, "moved")
+      && $content->("moved") eq "right" && !lstat(component_path($probe, "left"));
+  };
+  unlink(map { "$probe_path/$_" } qw(left right moved));
+  rmdir($probe_path);
+  abort_operation("unsupported-platform",
+    "Omachord requires GNU coreutils 9.5 or newer (mv --exchange)") unless $supported;
+}
+
 sub prepare_state {
   my ($path, $include_runtime) = @_;
   walk_directory($path, 1, "private", 1);
+  require_exchange_support();
 
   for my $name (qw(
       config.lock

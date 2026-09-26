@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
+TEST_TMP=${TMPDIR:-/tmp}
 TEST_DIR=$(mktemp -d "$TEST_TMP/omachord-panel-connection-test.XXXXXX")
 runtime_pid=""
 cleanup() {
@@ -26,6 +26,7 @@ chmod +x "$TEST_DIR/bin/omarchy-shell" "$TEST_DIR/bin/omarchy-theme-list"
 export PATH="$TEST_DIR/bin:$PATH"
 export OMACHORD_QML_TEST_DIR="$TEST_DIR"
 cp -- "$ROOT/test/qml-runtime/fake-panel-transition-runner" "$TEST_DIR/runner"
+cp -- "$ROOT/test/qml-runtime/fake-runner-grammar" "$TEST_DIR/fake-runner-grammar"
 chmod +x "$TEST_DIR/runner"
 export OMACHORD_RUNNER_PATH="$TEST_DIR/runner"
 export OMACHORD_THEME_DIR="$TEST_DIR/theme"

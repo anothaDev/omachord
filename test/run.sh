@@ -12,6 +12,8 @@ python3 "$ROOT/test/fs-recovery-test.py"
 python3 "$ROOT/test/action-capture-test.py"
 python3 "$ROOT/test/action-cancellation-test.py"
 "$ROOT/test/runner-test.sh"
+"$ROOT/test/runner-lifecycle-test.sh"
+python3 "$ROOT/test/brightness-test.py"
 "$ROOT/test/authorization-test.sh"
 "$ROOT/test/manual-revision-test.sh"
 python3 "$ROOT/test/automatic-trigger-test.py"
@@ -21,12 +23,14 @@ python3 "$ROOT/test/panel-capture-test.py"
 "$ROOT/test/qml-runtime-test.sh"
 bash "$ROOT/test/qml-bar-test.sh"
 "$ROOT/test/qml-service-test.sh"
+bash "$ROOT/test/qml-brightness-blocked-test.sh"
 python3 "$ROOT/test/qml-service-watchers-test.py"
 python3 "$ROOT/test/qml-routine-id-test.py"
 "$ROOT/test/qml-panel-enable-test.sh"
 "$ROOT/test/qml-manual-revision-test.sh"
 "$ROOT/test/qml-panel-connection-test.sh"
 "$ROOT/test/qml-toggle-test.sh"
+"$ROOT/test/qml-watchdog-test.sh"
 python3 "$ROOT/test/qml-theme-palette-test.py"
 node "$ROOT/test/model-test.mjs"
 node "$ROOT/test/conditions-test.mjs"
@@ -53,6 +57,7 @@ qmllint -I /usr/share/omarchy/shell \
   "$ROOT/BrandIcon.qml" \
   "$ROOT/RoutinePopup.qml" \
   "$ROOT/ThemePalette.qml" \
+  "$ROOT/ProcessWatchdog.qml" \
   "$ROOT/KeyCap.qml" \
   "$ROOT/EmptyState.qml" \
   "$ROOT/Collapsible.qml"

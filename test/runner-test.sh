@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 RUNNER="$ROOT/bin/omachord"
-if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
+TEST_TMP=${TMPDIR:-/tmp}
 TEST_ROOT=$(mktemp -d "$TEST_TMP/omachord-test.XXXXXX")
 INSTRUMENTED_RUNNER="$TEST_ROOT/instrumented/bin/omachord"
 export TEST_ROOT
@@ -107,6 +107,9 @@ cat >"$TEST_ROOT/bin/hyprctl" <<'STUB'
 #!/bin/bash
 set -euo pipefail
 case ${1:-} in
+  monitors)
+    printf '%s\n' '[{"name":"DP-1","make":"Fixture","model":"Display","serial":"fixture","focused":true,"disabled":false,"dpmsStatus":true}]'
+    ;;
   configerrors)
     if [[ -f $TEST_ROOT/create-connect-collision ]]; then
       printf '%s\n' 'concurrently created' >"$HOME/.config/hypr/omachord.lua"
@@ -311,6 +314,10 @@ cat >"$TEST_ROOT/bin/omarchy-brightness-display" <<'STUB'
 #!/bin/bash
 set -euo pipefail
 [[ ${1:-} == --no-osd ]] && shift
+if [[ ${1:-} == --monitor ]]; then
+  [[ ${2:-} == DP-1 ]] || exit 1
+  shift 2
+fi
 if [[ -f $TEST_ROOT/brightness-garbage ]]; then
   echo "n/a"
   exit 0
@@ -1696,13 +1703,13 @@ activate_result=$(mktemp)
 jq -e '.ok and .state == "activated" and .expiresAt == null' "$activate_result" >/dev/null
 assert_eq "$(stat -c %a "$ACTIVE_DIR")" 700 "activation directory is not private"
 assert_eq "$(stat -c %a "$ACTIVE_DIR/focus.json")" 600 "activation snapshot is not private"
-jq -e '.version == 2 and (.endPlanDigest | test("^sha256:[0-9a-f]{64}$")) and .routineId == "focus" and .trigger == "test" and .onEndMode == "restore"
+jq -e '.version == 3 and (.endPlanDigest | test("^sha256:[0-9a-f]{64}$")) and .routineId == "focus" and .trigger == "test" and .onEndMode == "restore"
   and (.claims == ["brightness","dnd","nightlight","stay-awake","theme"])
   and (.setters | length == 5)
   and (.setters[0] | .type == "dnd" and .before == false and .applied == true)
   and (.setters[2] | .type == "stay-awake" and .before == false and .applied == true)
   and (.setters[3] | .type == "theme" and .before == "gruvbox" and .applied == "tokyo-night")
-  and (.setters[4] | .type == "brightness" and .before == 80 and .applied == 40)' "$ACTIVE_DIR/focus.json" >/dev/null
+   and (.setters[4] | .type == "brightness" and .before == 80 and .applied == 40 and .confirmed == true and .target.name == "DP-1")' "$ACTIVE_DIR/focus.json" >/dev/null
 [[ -f $TEST_ROOT/shell-state/dnd && -f $TEST_ROOT/shell-state/nightlight && -f $TEST_ROOT/shell-state/stay-awake ]] \
   || fail "setters were not applied through the shell"
 assert_eq "$(cat "$TEST_ROOT/theme.name")" "Tokyo Night" "theme setter was not applied"
@@ -1823,7 +1830,7 @@ touch "$TEST_ROOT/brightness-garbage"
 if "$RUNNER" activate focus test >"$activate_result"; then
   fail "an unreadable setter should refuse activation"
 fi
-jq -e '.code == "action-failed" and (.error | test("brightness"))' "$activate_result" >/dev/null
+jq -e '.code == "brightness-unavailable" and (.error | test("brightness"))' "$activate_result" >/dev/null
 assert_missing "$TEST_ROOT/shell-state/dnd" "unreadable setter left earlier setters applied"
 assert_eq "$(cat "$TEST_ROOT/theme.name")" Gruvbox "unreadable setter left the theme changed"
 assert_missing "$ACTIVE_DIR/focus.json" "unreadable setter left a snapshot"

@@ -6,17 +6,47 @@ Security fixes are provided for the latest released version of Omachord.
 
 ## Reporting
 
-Use **Report a vulnerability** in the repository's Security tab to open a private security advisory. Do not include vulnerability details in a public issue. If private reporting is unavailable, contact the maintainer through the GitHub profile to request a private channel first.
+Use **Report a vulnerability** in the repository's Security tab (GitHub private vulnerability reporting) to open a private security advisory. Do not include vulnerability details in a public issue. If private reporting is unavailable, contact the maintainer through the GitHub profile to request a private channel first.
 
 Include the affected version, reproduction steps, impact, and any suggested mitigation. Reports will be acknowledged and assessed before coordinated disclosure.
 
 ## Trust Model
 
-Routine configuration is trusted local code and is not sandboxed. `exec` and `shell` actions can run arbitrary programs, read user data, and invoke `sudo`; cached credentials may permit elevation without another password prompt. Review externally supplied routine configuration before saving or running it.
+Routine configuration is trusted local code and is not sandboxed. `exec` and `shell` actions can run arbitrary programs and read user data. Review externally supplied routine configuration before saving or running it.
+
+Omachord needs no sudo or pkexec and never elevates itself. `exec` and `shell` actions run any program you choose with your user's rights, so a routine can call a privilege-elevation tool, and a recently cached password may let it do so without asking again. Save only routines you would run yourself.
+
+- `exec` launches the selected program with a literal JSON argument array and no shell parsing. `shell` intentionally runs `bash -lc`.
+- Omarchy command choices exclude commands marked hidden or `requires_sudo`, but that metadata is not a security boundary; a selected command can still open a privilege prompt internally.
 
 The runner protects its managed configuration and state files from unsafe ownership, permissions, symlinks, concurrent replacement, and partial integration transactions. Security reports that bypass those controls are in scope.
 
 The supported release environment is Omarchy 4.0.2, Hyprland 0.56.2, and Quickshell 0.3.1 on Linux, with the system tools listed in the README. The QML panel and condition service run inside the user's Omarchy Shell process; there is no privileged Omachord daemon or network listener. The user's shell/plugin installation, executable search path, and environment are trusted code/configuration inputs. Omachord does not isolate itself from arbitrary malicious code already executing as the same user, but same-user control of a documented configuration, integration path, or recovery record does not waive the integrity guarantees below.
+
+## Environment overrides
+
+The runner and the QML components support the public configuration overrides below. They exist for tests, runner-only installations, and unusual layouts. They are same-user conveniences, not security boundaries: anything that can set your environment can already run code as you.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OMACHORD_ACTION_TIMEOUT` | `30s` | Per-stage timeout for ordinary action programs (a `timeout(1)` duration) |
+| `OMACHORD_CONTROL_TIMEOUT` | `5s` | Timeout for built-in control probes (Omarchy, Hyprland, and shell queries) |
+| `OMACHORD_LOCK_TIMEOUT` | `10` | Seconds to wait for the configuration, run-history and per-routine locks (a writer that must end a running routine gives up with `routine-running` after this long); invalid values are rejected with `invalid-environment` |
+| `OMACHORD_OMARCHY_CONFIG_DIR` | `~/.config/omarchy` | Base for the default configuration, hook, shell, and runner paths |
+| `OMACHORD_CONFIG_FILE` | `<omarchy config>/omachord.json` | Routine configuration (also read by the QML components) |
+| `OMACHORD_STATE_DIR` | `$XDG_STATE_HOME/omarchy/omachord` | Private state directory (also read by the QML components) |
+| `OMACHORD_HYPR_DIR` | `~/.config/hypr` | Directory holding `bindings.lua` and the generated `omachord.lua` |
+| `OMACHORD_HOOK_ROOT` | `<omarchy config>/hooks` | Root of the `<event>.d/` hook directories |
+| `OMACHORD_DESKTOP_FILE` | `$XDG_DATA_HOME/applications/anothadev.omachord.desktop` | Installed launcher entry |
+| `OMACHORD_ICON_FILE` | `$XDG_DATA_HOME/icons/hicolor/scalable/apps/anothadev.omachord.svg` | Installed launcher icon |
+| `OMACHORD_SHELL_CONFIG` | `<omarchy config>/shell.json` | Shell configuration read and, once, edited by `widget ensure` |
+| `OMACHORD_RUN_LOCK_DIR` | `$XDG_RUNTIME_DIR/omachord`, else `<state>/runtime` | Per-routine and shared-resource locks |
+| `OMACHORD_THEME_DIR` | `$XDG_STATE_HOME/omarchy/current/theme` | Theme directory read by `theme-palette` |
+| `OMACHORD_THEME_NAME_FILE` | `$XDG_STATE_HOME/omarchy/current/theme.name` | Theme name read by `theme-palette` |
+| `OMACHORD_RUNNER_PATH` | `<omarchy config>/plugins/anothadev.omachord/bin/omachord` | Runner that generated shortcuts and hooks call; the QML components use it only when it is an absolute path |
+| `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_RUNTIME_DIR` | `~/.local/state`, `~/.local/share`, unset | Standard base directories for the defaults above |
+
+Internal capture and test knobs are not honored from the environment: `OMACHORD_CAPTURE_MODE`, `OMACHORD_CAPTURE_LIMIT`, the `OMACHORD_FS_TEST_*` fault controls, and the former `OMACHORD_SKIP_HYPR_RELOAD` bypass. The legacy bare `OMACHORD_BULK_CLEANUP` flag is ignored. The runner captures and clears that inherited variable; hook suppression accepts the captured PID/start-time token only while that process is live. Bulk cleanup supplies its own live-owner token to descendants. This context is not an authorization boundary. `OMACHORD_TRIGGER`, `OMACHORD_HOOK`, `OMACHORD_PHASE`, and `OMACHORD_ARG_<n>` are outputs: the runner clears inherited values on entry and sets them only for the child programs it starts.
 
 ## Authorization and recovery
 
@@ -25,6 +55,11 @@ The supported release environment is Omarchy 4.0.2, Hyprland 0.56.2, and Quicksh
 - Hook, shortcut, condition-service and timer requests recheck automatic eligibility after acquiring the shared configuration lock. A dispatcher launched before Disconnect cannot start work after Off has committed. Explicit manual/test commands retain their documented runner-only behavior.
 - Saved enable/disable intents compare the complete reviewed routine definition. Queued manual UI Run/Start carries the reviewed full-configuration revision from the click (or successful Save & Run commit) through the worker queue. The runner compares that revision with the exact bounded snapshot it resolves and executes, without a second configuration load. An intervening save, even to another routine, requires a fresh start request. Explicit runner CLI calls without a revision intentionally select the latest committed routine; the condition service binds requests to the revision it evaluated. End/recovery use recorded lifecycle state instead of a queued-start revision, while executable end plans still require their stored identity checks.
 - Active end-plan identity is frozen. A numeric checkpoint cannot be reused against today's edited action list. New activation records carry the plan digest; legacy action records require explicit recovery instead of inferring their history. Typed restore data remains available when an end action, restore, or removal fails.
+- Saves use revision-based compare-and-swap, so a stale panel cannot overwrite a newer configuration. Readers require the canonical configuration to match a post-reload commit record; a candidate cannot execute before its integration transaction commits, and an interrupted candidate fails closed.
+- Condition-service jobs carry the revision they evaluated; the runner rejects stale jobs and post-Disconnect activations before any routine action runs. A queued routine switch is bound to the complete definition reviewed when it was requested; a retry cancels that switch if the definition changed or disappeared, and independent switches remain available.
+- Saves reject changes to a retained active routine's end plan. End the routine before editing that plan; disabling or removing a routine still performs the existing cleanup first. Ending routines is not part of the rolled-back transaction: it happens as late as possible, and a routine ended before a later step fails stays ended.
+- Activation records are validated before use. A record that fails validation stops `run`, `activate`, `deactivate`, and `active` with `unsafe-state` instead of being treated as inactive. Setter writes are argv-literal calls to Omarchy tools.
+- A theme setter makes Omarchy fire its `theme-set` hook, which re-enters the runner. The per-routine lock reports the originating routine as busy, so a routine cannot recurse into itself.
 - `recovery restore ... --skip-end-actions` is an explicit revision-bound choice to restore saved setter values and skip remaining executable end effects. That choice is committed before restoration, so a retry cannot revive skipped commands.
 
 ## Process and resource boundaries
@@ -42,8 +77,11 @@ The native supervisor owns both output capture and the timeout process group. It
 | Toggle discovery | 4096 entries and 512 KiB before JSON construction |
 | Condition service | Four manual workers, one condition worker, bounded request queues |
 | Explicit delays | At most five minutes per delay |
+| QML runner watchdogs | 30 seconds for probes, 60 seconds for Connect/autostart, and 10 minutes total for routine execution, recovery, config apply, or Disconnect; SIGTERM, then SIGKILL if still running after a five-second grace period |
 
-These limits do not imply a universal deadline for filesystem I/O, an aggregate quota for independently invoked CLI/hook processes, or a sandbox for authored commands. A retained-output limit does not limit all bytes a trusted command produces. Filesystem fingerprinting and open-file inspection use bounded buffers but depend on kernel/filesystem progress. Recovery archives have no global retention quota. Supported runtime timeout overrides are not privilege boundaries; deployments must not treat a hostile environment as constrained by these defaults.
+The 10-minute QML limit applies to the whole request, including all routines ended by a bulk operation. It can stop a valid long sequence and is not extended by per-action timeout overrides. It does not limit how long a routine remains active after its activation command finishes, and it does not apply to direct CLI/hook invocations. Cancellation may leave completed effects; activation and end-action checkpoints remain available for recovery. Inspect current state before retrying an interrupted request.
+
+These limits do not imply a universal deadline for filesystem I/O, an aggregate quota for independently invoked CLI/hook processes, or a sandbox for authored commands. A retained-output limit does not limit all bytes a trusted command produces. Filesystem fingerprinting and open-file inspection use bounded buffers but depend on kernel/filesystem progress. Recovery archives have no global retention quota. The [environment overrides](#environment-overrides) are not privilege boundaries; deployments must not treat a hostile environment as constrained by these defaults.
 
 Production helpers do not honor `OMACHORD_FS_TEST_*` fault, pause, marker or count controls, or the former `OMACHORD_SKIP_HYPR_RELOAD` bypass. Compositor reload and validation still run when required. Deterministic failure tests explicitly create disposable instrumented helper copies; no runtime flag selects that instrumentation in the shipped helpers. Ordinary test calls continue to use production files, and separate production-boundary tests check that inherited test variables cannot alter their behavior.
 
@@ -55,7 +93,7 @@ Besides the Hyprland files it already owns, the runner installs its launcher and
 
 ## Filesystem preservation
 
-Private configuration/state/runtime roots and the fixed integration targets above define the managed surface. A newly acquired legacy icon must retain a missing baseline; repair cannot promote a concurrently created unowned icon into owned content. Checked staging writes precede publication and setter effects. Descriptor-relative compare-and-swap, rollback, and durability checks remain required even though routine execution itself is trusted code.
+Private configuration/state/runtime roots and the fixed integration targets above define the managed surface. Managed writes and removals pin verified parent-directory descriptors, use descriptor-relative atomic compare-and-swap operations, and check staged producer failures before publication. Successful publication syncs both the file and its containing directory. Concurrent versions and open or uncertain inodes are preserved, using private state archives where possible and adjacent private archives when inode identity requires it. A newly acquired legacy icon must retain a missing baseline; repair cannot promote a concurrently created unowned icon into owned content. Checked staging writes precede publication and setter effects. Descriptor-relative compare-and-swap, rollback, and durability checks remain required even though routine execution itself is trusted code.
 
 To preserve original inode identity and writes through held descriptors, the helper may create private `.omachord-conflicts` or `.omachord-retired` archives beside managed destinations when central state archives cannot preserve that inode. Transaction failures can also leave private temporary names there. Supported Omarchy/Quickshell discovery excludes the tested archive names; arbitrary recursive third-party consumers are outside that compatibility evidence.
 
