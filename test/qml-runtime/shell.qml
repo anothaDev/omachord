@@ -115,6 +115,25 @@ ShellRoot {
       editor.save()
       check(!!saved && JSON.stringify(saved.conditions[0].ssids) === JSON.stringify(["😀".repeat(8), "é".repeat(16)]),
         "Manual and picker Unicode names at exactly 32 UTF-8 bytes must save unchanged")
+
+      // Strings and counts the runner schema refuses are reported here first.
+      editor.routine = { id: "limits", name: "Limits", enabled: true, triggers: [],
+        actions: [{ type: "shell", command: "true" }] }
+      editor.stageActionText(0, "command", "true\nfalse", "")
+      saved = null
+      editor.save()
+      check(saved === null && editor.localError.indexOf("must fit on one line") !== -1,
+        "A multi-line shell command must be blocked before the runner rejects it")
+      var full = { id: "limits", name: "Limits", enabled: true, triggers: [], actions: [], conditions: [] }
+      for (var added = 0; added < 64; added++) full.actions.push({ type: "delay", milliseconds: 0 })
+      for (var condition = 0; condition < 16; condition++) full.conditions.push({ type: "power", source: "ac", batteryBelow: 0 })
+      editor.routine = full
+      editor.addAction("")
+      check(editor.draft.actions.length === 64 && editor.localError === "A routine can have at most 64 actions",
+        "Adding a 65th action must explain the runner limit")
+      editor.addCondition()
+      check(editor.draft.conditions.length === 16 && editor.localError === "A routine can have at most 16 conditions",
+        "Adding a 17th condition must explain the runner limit")
       root.editorPassed = true
       eofProc.running = true
     } catch (error) {

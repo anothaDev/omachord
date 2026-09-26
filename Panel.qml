@@ -673,6 +673,12 @@ Item {
 
   function applyConfig(next, selectId, afterApply) {
     if (mutating || loading || !configLoaded || serviceConnectionBusy()) return
+    var limitError = Model.validateConfigLimits(next)
+    if (limitError) {
+      showNotice(limitError, true)
+      routineEditor.externalError = limitError
+      return
+    }
     pendingConfig = Model.clone(next)
     pendingSelectId = selectId || ""
     pendingAfterApply = afterApply || ""
