@@ -25,7 +25,7 @@ The supported release environment is Omarchy 4.0.2, Hyprland 0.56.2, and Quicksh
 
 ## Environment overrides
 
-The runner and the QML components honor only the variables below. They exist for tests, runner-only installations, and unusual layouts. They are same-user conveniences, not security boundaries: anything that can set your environment can already run code as you.
+The runner and the QML components support the public configuration overrides below. They exist for tests, runner-only installations, and unusual layouts. They are same-user conveniences, not security boundaries: anything that can set your environment can already run code as you.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -46,7 +46,7 @@ The runner and the QML components honor only the variables below. They exist for
 | `OMACHORD_RUNNER_PATH` | `<omarchy config>/plugins/anothadev.omachord/bin/omachord` | Runner that generated shortcuts and hooks call; the QML components use it only when it is an absolute path |
 | `XDG_STATE_HOME`, `XDG_DATA_HOME`, `XDG_RUNTIME_DIR` | `~/.local/state`, `~/.local/share`, unset | Standard base directories for the defaults above |
 
-Internal knobs are not honored from the environment: `OMACHORD_BULK_CLEANUP`, `OMACHORD_CAPTURE_MODE`, `OMACHORD_CAPTURE_LIMIT`, the `OMACHORD_FS_TEST_*` fault controls, and the former `OMACHORD_SKIP_HYPR_RELOAD` bypass. `OMACHORD_TRIGGER`, `OMACHORD_HOOK`, `OMACHORD_PHASE`, and `OMACHORD_ARG_<n>` are outputs: the runner clears inherited values on entry and sets them only for the child programs it starts.
+Internal capture and test knobs are not honored from the environment: `OMACHORD_CAPTURE_MODE`, `OMACHORD_CAPTURE_LIMIT`, the `OMACHORD_FS_TEST_*` fault controls, and the former `OMACHORD_SKIP_HYPR_RELOAD` bypass. The legacy bare `OMACHORD_BULK_CLEANUP` flag is ignored. The runner captures and clears that inherited variable; hook suppression accepts the captured PID/start-time token only while that process is live. Bulk cleanup supplies its own live-owner token to descendants. This context is not an authorization boundary. `OMACHORD_TRIGGER`, `OMACHORD_HOOK`, `OMACHORD_PHASE`, and `OMACHORD_ARG_<n>` are outputs: the runner clears inherited values on entry and sets them only for the child programs it starts.
 
 ## Authorization and recovery
 
@@ -77,6 +77,9 @@ The native supervisor owns both output capture and the timeout process group. It
 | Toggle discovery | 4096 entries and 512 KiB before JSON construction |
 | Condition service | Four manual workers, one condition worker, bounded request queues |
 | Explicit delays | At most five minutes per delay |
+| QML runner watchdogs | 30 seconds for probes, 60 seconds for Connect/autostart, and 10 minutes total for routine execution, recovery, config apply, or Disconnect; SIGTERM, then SIGKILL if still running after a five-second grace period |
+
+The 10-minute QML limit applies to the whole request, including all routines ended by a bulk operation. It can stop a valid long sequence and is not extended by per-action timeout overrides. It does not limit how long a routine remains active after its activation command finishes, and it does not apply to direct CLI/hook invocations. Cancellation may leave completed effects; activation and end-action checkpoints remain available for recovery. Inspect current state before retrying an interrupted request.
 
 These limits do not imply a universal deadline for filesystem I/O, an aggregate quota for independently invoked CLI/hook processes, or a sandbox for authored commands. A retained-output limit does not limit all bytes a trusted command produces. Filesystem fingerprinting and open-file inspection use bounded buffers but depend on kernel/filesystem progress. Recovery archives have no global retention quota. The [environment overrides](#environment-overrides) are not privilege boundaries; deployments must not treat a hostile environment as constrained by these defaults.
 

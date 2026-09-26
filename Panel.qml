@@ -103,8 +103,9 @@ Item {
   property date displayNow: new Date()
   // Deadlines after which a runner that never exits is stopped, so loading,
   // saving and connection locks always recover (see ProcessWatchdog.qml).
-  // An apply or disconnect can end routines, and a direct action runs one,
-  // so they get the routine deadline; reads are bounded probes.
+  // Routine work, recovery, apply and disconnect share a 10-minute aggregate
+  // limit per request, including every routine ended by a bulk operation.
+  // Per-action timeout overrides do not extend it; reads are bounded probes.
   property int probeDeadlineMs: 30000
   property int connectionDeadlineMs: 60000
   property int routineDeadlineMs: 600000

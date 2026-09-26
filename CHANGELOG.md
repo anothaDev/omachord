@@ -2,9 +2,9 @@
 
 All notable changes to Omachord. Versions follow the `version` field in `manifest.json`; release tags are `v` plus that version.
 
-## Unreleased
+## 0.5.0 — 2026-09-26
 
-Targets 0.5.0. Activation records for brightness routines move to schema version 3 and the runner gains commands, so this is a minor release. Finish restoring active routines before downgrading: older runners reject version 3 records.
+Activation records for brightness routines move to schema version 3 and the runner gains commands. Finish restoring active routines before downgrading: older runners reject version 3 records.
 
 ### Brightness
 
@@ -22,12 +22,13 @@ Targets 0.5.0. Activation records for brightness routines move to schema version
 
 ### Hardening
 
-- Internal knobs `OMACHORD_BULK_CLEANUP`, `OMACHORD_CAPTURE_MODE`, and `OMACHORD_CAPTURE_LIMIT` are no longer honored from the environment. The supported overrides are listed in [SECURITY.md](SECURITY.md).
+- `OMACHORD_CAPTURE_MODE` and `OMACHORD_CAPTURE_LIMIT` are no longer honored from the environment. Hook suppression ignores the old bare `OMACHORD_BULK_CLEANUP` flag and requires an internal live-owner context. The supported overrides are listed in [SECURITY.md](SECURITY.md).
 - The runner checks for GNU coreutils 9.5 or later (`mv --exchange`) before stateful commands and reports a clear error instead of failing inside a transaction.
 - Invalid `OMACHORD_ACTION_TIMEOUT`, `OMACHORD_CONTROL_TIMEOUT` or `OMACHORD_LOCK_TIMEOUT` values are rejected with the `invalid-environment` code.
 - Actions only inherit standard input, output and error; timeouts, kills and supervisor failures are reported separately instead of all as timeouts.
 - `omachord --help` lists `themes`, `service-status`, and `theme-palette`.
 - QML watchdogs keep the panel, bar, and service from waiting indefinitely on a runner request that never finishes.
+- Panel and service operations that execute routine actions have a ten-minute total deadline, including configuration apply, Disconnect, and brightness recovery. Per-action timeout overrides do not extend it. Use the CLI for longer operations; see the README for interruption behavior.
 
 ### Documentation and CI
 

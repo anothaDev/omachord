@@ -32,9 +32,9 @@ Item {
   readonly property int failureRetryMs: 300000
   readonly property int maxPending: 256
   // A runner that never exits is stopped after these deadlines, so it cannot
-  // wedge a queue or the connection barrier. Routine work (and disconnect,
-  // which ends every active routine) must outlast the runner's own limits of
-  // up to 64 actions at 30 s each; probes are bounded reads.
+  // wedge a queue or the connection barrier. Routine work and disconnect
+  // share a 10-minute aggregate limit per request, even for valid longer
+  // action lists. Per-action timeout overrides do not extend this budget.
   property int probeDeadlineMs: 30000
   property int connectionDeadlineMs: 60000
   property int routineDeadlineMs: 600000

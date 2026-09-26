@@ -238,6 +238,8 @@ A routine can be run manually, by one optional keyboard shortcut, or by any comb
 
 Actions execute in order and stop at the first failure. Supported actions are microphone toggle, application launch, Omarchy command, notification, OSD, sound, delay, direct program execution, and an advanced shell command.
 
+Panel and condition-service requests that execute routine work have a **10-minute total execution limit**. This includes starting, ending, and recovering routines, plus configuration saves and Disconnect when they end routines; a bulk operation shares one budget across all routines. Long sequences can reach this limit even when every action is valid. Per-action timeout overrides do not extend it. For longer work, invoke the runner directly from the CLI, which has no QML watchdog. The limit concerns a running command, not how long an activated routine can remain active. A timeout can leave completed effects and retained recovery records: inspect the active state before retrying.
+
 ### Setters and restore
 
 Five actions set Omarchy state instead of running a program: **night light**, **do not disturb**, **stay awake**, **theme**, and **display brightness**. They go through the Omarchy shell (`omarchy-shell nightlight|idle|notifications`), `omarchy-theme-set`, and `omarchy-brightness-display`, so the bar indicators follow and Omarchy's own hooks still fire. There is no light/dark mode in Omarchy; the theme setter with restore is the equivalent.
