@@ -153,8 +153,24 @@ const blocked = { at: 900, op: "activate", revision, blocked: true }
 const queuedAfterFailure = (op, failure, currentRevision = revision, now = 900000) =>
   plain(conditions.reconcileJobs([{ id: "dark", op, reason: "condition" }], null,
     currentRevision, { dark: failure }, now, 300000, 256))
-assert.deepEqual(queuedAfterFailure("activate", blocked), [],
-  "a blocked activation cannot retry after the normal failure window")
+assert.deepEqual(queuedAfterFailure("activate", blocked, revision, 900 + 59999), [],
+  "a blocked activation waits for its first backoff step")
+assert.equal(queuedAfterFailure("activate", blocked, revision, 900 + 60000).length, 1,
+  "a blocked activation retries after one minute, not only after a false edge")
+for (const [attempts, delay] of [[1, 60000], [2, 120000], [3, 300000], [4, 600000], [9, 600000]]) {
+  const repeated = { ...blocked, attempts }
+  assert.deepEqual(queuedAfterFailure("activate", repeated, revision, 900 + delay - 1), [],
+    `attempt ${attempts} waits ${delay} ms`)
+  assert.equal(queuedAfterFailure("activate", repeated, revision, 900 + delay).length, 1,
+    `attempt ${attempts} retries at ${delay} ms`)
+}
+for (const attempts of [0, -1, "x", null, undefined, NaN]) {
+  assert.equal(conditions.failureRetryMs({ ...blocked, attempts }, 300000), 60000,
+    `malformed attempt count ${attempts} uses the first backoff step`)
+}
+assert.equal(conditions.failureRetryMs({ ...blocked, op: "deactivate" }, 300000), 300000,
+  "deactivation never uses the capability backoff")
+assert.equal(conditions.failureRetryMs({ ...blocked, blocked: false }, 300000), 300000)
 assert.equal(queuedAfterFailure("activate", blocked, "new-revision").length, 1,
   "a blocked activation is scoped to its config revision")
 assert.equal(queuedAfterFailure("deactivate", blocked).length, 1,
@@ -262,8 +278,11 @@ assert.deepEqual(plain(conditions.describeCondition(null, env())),
 
 const failure = { at: 1000, op: "activate", revision, error: "activate: shell not running" }
 assert.deepEqual(plain(conditions.describeFailure({ ...failure, blocked: true }, 300000)),
-  { op: "activate", at: 1000, error: failure.error, blocked: true, retryAt: null },
-  "blocked activations expose no automatic retry timestamp")
+  { op: "activate", at: 1000, error: failure.error, blocked: true, retryAt: 61000 },
+  "blocked activations expose their backoff retry timestamp")
+assert.deepEqual(plain(conditions.describeFailure({ ...failure, blocked: true, attempts: 3 }, 300000)),
+  { op: "activate", at: 1000, error: failure.error, blocked: true, retryAt: 301000 },
+  "repeated blocked activations back off further")
 assert.deepEqual(plain(conditions.describeFailure({ ...failure, op: "deactivate", blocked: true }, 300000)),
   { op: "deactivate", at: 1000, error: failure.error, blocked: false, retryAt: 301000 },
   "deactivation failures are always described as retryable")

@@ -32,11 +32,12 @@ for (const line of vectors) {
   seen.add(line)
   const fields = line.split(" ")
   if (fields[0] === "RETRY") {
-    assert.equal(fields.length, 9, line)
-    const [, runningText, presentText, sameOpText, sameRevText, blockedText, op, elapsedText, allowedText] = fields
+    assert.equal(fields.length, 10, line)
+    const [, runningText, presentText, sameOpText, sameRevText, blockedText, op, attemptsText, elapsedText, allowedText] = fields
     const [running, present, sameOp, sameRev, blocked, allowed] =
       [runningText, presentText, sameOpText, sameRevText, blockedText, allowedText].map(bool)
     assert.ok(op === "activate" || op === "deactivate", line)
+    const attempts = integer(attemptsText)
     const elapsed = integer(elapsedText)
     const otherOp = op === "activate" ? "deactivate" : "activate"
     // Absent job, same id/op, same id/different op, other id/same op.
@@ -45,7 +46,7 @@ for (const line of vectors) {
     for (const at of [0, 1700000000000]) {
       for (const currentJob of currentJobs) {
         const failures = present ? { routine: {
-          op: sameOp ? op : otherOp, revision: sameRev ? "revision" : "old-revision", at, blocked
+          op: sameOp ? op : otherOp, revision: sameRev ? "revision" : "old-revision", at, blocked, attempts
         } } : {}
         const actual = conditions.reconcileJobs([{ id: "routine", op, reason: "condition" }],
           currentJob, "revision", failures, at + elapsed, 300000, 256)
@@ -59,20 +60,21 @@ for (const line of vectors) {
     }
     retryVectors++
   } else {
-    assert.equal(fields.length, 6, line)
-    const [, op, blockedText, atText, retryMsText, retryAtText] = fields
+    assert.equal(fields.length, 7, line)
+    const [, op, blockedText, attemptsText, atText, retryMsText, retryAtText] = fields
     assert.ok(op === "activate" || op === "deactivate", line)
     const blocked = bool(blockedText)
+    const attempts = integer(attemptsText)
     const at = integer(atText)
     const retryMs = integer(retryMsText)
-    const retryAt = retryAtText === "null" ? null : integer(retryAtText)
-    const actual = conditions.describeFailure({ op, blocked, at, error: "fixture error" }, retryMs)
+    const retryAt = integer(retryAtText)
+    const actual = conditions.describeFailure({ op, blocked, attempts, at, error: "fixture error" }, retryMs)
     assert.deepEqual(JSON.parse(JSON.stringify(actual)),
-      { op, blocked: retryAt === null, at, error: "fixture error", retryAt }, line)
+      { op, blocked: blocked && op === "activate", at, error: "fixture error", retryAt }, line)
     descriptionVectors++
   }
 }
 // Fail closed on missing/truncated generator output, including an empty file.
-assert.equal(retryVectors, 512, "complete retry vector matrix")
-assert.equal(descriptionVectors, 24, "complete description vector matrix")
+assert.equal(retryVectors, 1536, "complete retry vector matrix")
+assert.equal(descriptionVectors, 48, "complete description vector matrix")
 console.log(`Lean/Conditions.js conformance: ${retryVectors} retry vectors (${retryChecks} checks), ${descriptionVectors} description vectors passed`)

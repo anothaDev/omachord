@@ -479,59 +479,107 @@ theorem revision_change_resets_block (blocked condition success : Bool) :
 theorem manual_success_resets_block (blocked condition revision : Bool) :
     retainBlock blocked condition revision true = false := by simp [retainBlock]
 
+-- Capped backoff for a blocked (typed capability) activation failure:
+-- 1, 2, 5, then 10 minutes, indexed by consecutive attempts (0 counts as 1).
+def blockedBackoffMs (attempts : Nat) : Int :=
+  if attempts ≤ 1 then 60000
+  else if attempts = 2 then 120000
+  else if attempts = 3 then 300000
+  else 600000
+
+theorem blocked_backoff_bounded (attempts : Nat) :
+    0 < blockedBackoffMs attempts ∧ blockedBackoffMs attempts ≤ 600000 := by
+  unfold blockedBackoffMs
+  by_cases h1 : attempts ≤ 1
+  · simp [h1]
+  · by_cases h2 : attempts = 2
+    · simp [h2]
+    · by_cases h3 : attempts = 3
+      · simp [h3]
+      · simp [h1, h2, h3]
+
+def retryDelay (op : Operation) (blocked : Bool) (attempts : Nat) (retryMs : Int) : Int :=
+  if op = .activate ∧ blocked = true then blockedBackoffMs attempts else retryMs
+
 -- running means an identical id AND operation are currently in flight.
 -- Caller still supplies desired transitions and handles reset/ownership rules.
 def retryAllowed (running hasFailure sameOperation sameRevision blocked : Bool)
-    (op : Operation) (elapsed retryMs : Int) : Bool :=
+    (op : Operation) (attempts : Nat) (elapsed retryMs : Int) : Bool :=
   !running && !(hasFailure && sameOperation && sameRevision &&
-    ((decide (op = .activate) && blocked) || decide (elapsed < retryMs)))
+    decide (elapsed < retryDelay op blocked attempts retryMs))
 
 theorem running_job_not_duplicated (present opMatch rev blocked : Bool)
-    (op : Operation) (elapsed retryMs : Int) :
-    retryAllowed true present opMatch rev blocked op elapsed retryMs = false := by simp [retryAllowed]
+    (op : Operation) (attempts : Nat) (elapsed retryMs : Int) :
+    retryAllowed true present opMatch rev blocked op attempts elapsed retryMs = false := by
+  simp [retryAllowed]
 
-theorem matching_blocked_activation_never_retried (elapsed retryMs : Int) :
-    retryAllowed false true true true true .activate elapsed retryMs = false := by simp [retryAllowed]
+theorem blocked_activation_waits_for_backoff (attempts : Nat) (elapsed retryMs : Int)
+    (h : elapsed < blockedBackoffMs attempts) :
+    retryAllowed false true true true true .activate attempts elapsed retryMs = false := by
+  simp [retryAllowed, retryDelay, h]
 
-theorem deactivation_ignores_blocked (blocked : Bool) (elapsed retryMs : Int) :
-    retryAllowed false true true true blocked .deactivate elapsed retryMs = decide (retryMs ≤ elapsed) := by
+theorem blocked_activation_retries_after_backoff (attempts : Nat) (elapsed retryMs : Int)
+    (h : blockedBackoffMs attempts ≤ elapsed) :
+    retryAllowed false true true true true .activate attempts elapsed retryMs = true := by
+  have hn : ¬ elapsed < blockedBackoffMs attempts := by omega
+  simp [retryAllowed, retryDelay, hn]
+
+-- Eligibility only: a blocked activation is never suppressed for longer than
+-- the cap. Whether the service then runs it (liveness) is not modeled.
+theorem blocked_activation_eligible_after_cap (attempts : Nat) (elapsed retryMs : Int)
+    (h : 600000 ≤ elapsed) :
+    retryAllowed false true true true true .activate attempts elapsed retryMs = true := by
+  have hb := (blocked_backoff_bounded attempts).2
+  exact blocked_activation_retries_after_backoff attempts elapsed retryMs (by omega)
+
+theorem deactivation_ignores_blocked (blocked : Bool) (attempts : Nat) (elapsed retryMs : Int) :
+    retryAllowed false true true true blocked .deactivate attempts elapsed retryMs
+      = decide (retryMs ≤ elapsed) := by
   by_cases h : elapsed < retryMs
   · have hn : ¬ retryMs ≤ elapsed := by omega
-    simp [retryAllowed, h, hn]
+    simp [retryAllowed, retryDelay, h, hn]
   · have hle : retryMs ≤ elapsed := by omega
-    simp [retryAllowed, h, hle]
+    simp [retryAllowed, retryDelay, h, hle]
 
-theorem ordinary_failure_waits (op : Operation) (elapsed retryMs : Int) (h : elapsed < retryMs) :
-    retryAllowed false true true true false op elapsed retryMs = false := by simp [retryAllowed, h]
+theorem ordinary_failure_waits (op : Operation) (attempts : Nat) (elapsed retryMs : Int)
+    (h : elapsed < retryMs) :
+    retryAllowed false true true true false op attempts elapsed retryMs = false := by
+  simp [retryAllowed, retryDelay, h]
 
-theorem ordinary_failure_retries_at_boundary (op : Operation) (retryMs : Int) :
-    retryAllowed false true true true false op retryMs retryMs = true := by simp [retryAllowed]
+theorem ordinary_failure_retries_at_boundary (op : Operation) (attempts : Nat) (retryMs : Int) :
+    retryAllowed false true true true false op attempts retryMs retryMs = true := by
+  simp [retryAllowed, retryDelay]
 
-theorem ordinary_failure_retries_after_boundary (op : Operation) (elapsed retryMs : Int)
+theorem ordinary_failure_retries_after_boundary (op : Operation) (attempts : Nat) (elapsed retryMs : Int)
     (h : retryMs ≤ elapsed) :
-    retryAllowed false true true true false op elapsed retryMs = true := by
+    retryAllowed false true true true false op attempts elapsed retryMs = true := by
   have hn : ¬ elapsed < retryMs := by omega
-  simp [retryAllowed, hn]
+  simp [retryAllowed, retryDelay, hn]
 
 theorem revision_change_allows_retry (present opMatch blocked : Bool)
-    (op : Operation) (elapsed retryMs : Int) :
-    retryAllowed false present opMatch false blocked op elapsed retryMs = true := by simp [retryAllowed]
+    (op : Operation) (attempts : Nat) (elapsed retryMs : Int) :
+    retryAllowed false present opMatch false blocked op attempts elapsed retryMs = true := by
+  simp [retryAllowed]
 
 theorem different_operation_allows_retry (present rev blocked : Bool)
-    (op : Operation) (elapsed retryMs : Int) :
-    retryAllowed false present false rev blocked op elapsed retryMs = true := by simp [retryAllowed]
+    (op : Operation) (attempts : Nat) (elapsed retryMs : Int) :
+    retryAllowed false present false rev blocked op attempts elapsed retryMs = true := by
+  simp [retryAllowed]
 
 theorem cleared_failure_allows_retry (opMatch rev blocked : Bool)
-    (op : Operation) (elapsed retryMs : Int) :
-    retryAllowed false false opMatch rev blocked op elapsed retryMs = true := by simp [retryAllowed]
+    (op : Operation) (attempts : Nat) (elapsed retryMs : Int) :
+    retryAllowed false false opMatch rev blocked op attempts elapsed retryMs = true := by
+  simp [retryAllowed]
 
-def retryAt (op : Operation) (blocked : Bool) (timestamp retryMs : Int) : Option Int :=
-  if op = .activate ∧ blocked = true then none else some (timestamp + retryMs)
+def retryAt (op : Operation) (blocked : Bool) (attempts : Nat) (timestamp retryMs : Int) : Int :=
+  timestamp + retryDelay op blocked attempts retryMs
 
-theorem blocked_activation_has_no_retry_time (timestamp retryMs : Int) :
-    retryAt .activate true timestamp retryMs = none := rfl
-theorem deactivation_keeps_retry_time (blocked : Bool) (timestamp retryMs : Int) :
-    retryAt .deactivate blocked timestamp retryMs = some (timestamp + retryMs) := by simp [retryAt]
+theorem blocked_activation_retry_time (attempts : Nat) (timestamp retryMs : Int) :
+    retryAt .activate true attempts timestamp retryMs = timestamp + blockedBackoffMs attempts := by
+  simp [retryAt, retryDelay]
+theorem deactivation_keeps_retry_time (blocked : Bool) (attempts : Nat) (timestamp retryMs : Int) :
+    retryAt .deactivate blocked attempts timestamp retryMs = timestamp + retryMs := by
+  simp [retryAt, retryDelay]
 
 #print axioms external_zero_normalized
 #print axioms internal_zero_preserved
@@ -588,7 +636,10 @@ theorem deactivation_keeps_retry_time (blocked : Bool) (timestamp retryMs : Int)
 #print axioms revision_change_resets_block
 #print axioms manual_success_resets_block
 #print axioms running_job_not_duplicated
-#print axioms matching_blocked_activation_never_retried
+#print axioms blocked_backoff_bounded
+#print axioms blocked_activation_waits_for_backoff
+#print axioms blocked_activation_retries_after_backoff
+#print axioms blocked_activation_eligible_after_cap
 #print axioms deactivation_ignores_blocked
 #print axioms ordinary_failure_waits
 #print axioms ordinary_failure_retries_at_boundary
@@ -596,7 +647,7 @@ theorem deactivation_keeps_retry_time (blocked : Bool) (timestamp retryMs : Int)
 #print axioms revision_change_allows_retry
 #print axioms different_operation_allows_retry
 #print axioms cleared_failure_allows_retry
-#print axioms blocked_activation_has_no_retry_time
+#print axioms blocked_activation_retry_time
 #print axioms deactivation_keeps_retry_time
 
 def operationName : Operation → String
@@ -615,13 +666,14 @@ def main : IO Unit := do
         for sameRev in bools do
           for blocked in bools do
             for op in ops do
-              for elapsed in ([-1000000, -1, 0, 1, 299999, 300000, 300001, 1000000] : List Int) do
-                let allowed := OmachordBrightness.retryAllowed running present sameOp sameRev blocked op elapsed 300000
-                IO.println s!"RETRY {running} {present} {sameOp} {sameRev} {blocked} {OmachordBrightness.operationName op} {elapsed} {allowed}"
+              for attempts in ([1, 4] : List Nat) do
+                for elapsed in ([-1000000, -1, 0, 1, 59999, 60000, 299999, 300000, 300001, 599999, 600000, 1000000] : List Int) do
+                  let allowed := OmachordBrightness.retryAllowed running present sameOp sameRev blocked op attempts elapsed 300000
+                  IO.println s!"RETRY {running} {present} {sameOp} {sameRev} {blocked} {OmachordBrightness.operationName op} {attempts} {elapsed} {allowed}"
   for op in ops do
     for blocked in bools do
-      for timestamp in ([-1000000, 0, 1700000000000] : List Int) do
-        for retryMs in ([0, 300000] : List Int) do
-          let retryAt := OmachordBrightness.retryAt op blocked timestamp retryMs
-          let rendered := match retryAt with | none => "null" | some value => toString value
-          IO.println s!"DESCRIPTION {OmachordBrightness.operationName op} {blocked} {timestamp} {retryMs} {rendered}"
+      for attempts in ([1, 4] : List Nat) do
+        for timestamp in ([-1000000, 0, 1700000000000] : List Int) do
+          for retryMs in ([0, 300000] : List Int) do
+            let retryAt := OmachordBrightness.retryAt op blocked attempts timestamp retryMs
+            IO.println s!"DESCRIPTION {OmachordBrightness.operationName op} {blocked} {attempts} {timestamp} {retryMs} {retryAt}"

@@ -243,6 +243,23 @@ function observedActiveIds(routines, env, active, deactivatingId) {
   return ids
 }
 
+// A typed capability failure (for example brightness that is asleep or busy)
+// is often transient, so it retries on a capped backoff instead of waiting out
+// the whole condition period: 1, 2, 5, then every 10 minutes.
+var BLOCKED_BACKOFF_MS = [60000, 120000, 300000, 600000]
+
+function blockedBackoffMs(attempts) {
+  var count = Math.floor(Number(attempts))
+  if (!(count >= 1)) count = 1
+  return BLOCKED_BACKOFF_MS[Math.min(count, BLOCKED_BACKOFF_MS.length) - 1]
+}
+
+// How long a recorded failure suppresses the same transition.
+function failureRetryMs(failure, retryMs) {
+  if (failure && failure.op === "activate" && failure.blocked === true) return blockedBackoffMs(failure.attempts)
+  return isNaN(Number(retryMs)) ? 0 : Number(retryMs)
+}
+
 // The pending queue is a projection of what is desired now, not an append-only
 // event log. Recomputing it drops transitions invalidated while another job ran.
 function reconcileJobs(transitions, currentJob, revision, failures, nowMs, retryMs, maxPending) {
@@ -256,8 +273,7 @@ function reconcileJobs(transitions, currentJob, revision, failures, nowMs, retry
     if (currentJob && String(currentJob.id) === id && String(currentJob.op) === op) continue
     var failure = mapValue(failures, id)
     if (failure && String(failure.op) === op && String(failure.revision) === String(revision)
-        && ((op === "activate" && failure.blocked === true)
-          || nowMs - Number(failure.at) < retryMs)) continue
+        && nowMs - Number(failure.at) < failureRetryMs(failure, retryMs)) continue
     if (!jobs[id]) order.push(id)
     jobs[id] = {
       id: id,
@@ -396,7 +412,7 @@ function describeFailure(failure, retryMs) {
     at: at,
     error: failure.error === undefined || failure.error === null ? "" : String(failure.error),
     blocked: blocked,
-    retryAt: blocked ? null : at + (isNaN(Number(retryMs)) ? 0 : Number(retryMs))
+    retryAt: at + failureRetryMs(failure, retryMs)
   }
 }
 

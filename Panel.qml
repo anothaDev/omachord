@@ -57,6 +57,10 @@ Item {
   property bool compactEditorOpen: false
   property string noticeText: ""
   property bool noticeError: false
+  // Routine whose last end failed on a held brightness record, offering the
+  // explicit "keep current brightness" decision next to that error.
+  property string heldBrightnessId: ""
+  property string heldBrightnessStage: ""
   property string shownNotice: ""
   property string shortcutQuery: ""
   property string shortcutFilter: "all"
@@ -343,12 +347,13 @@ Item {
       return { label: "Not evaluated", detail: "Conditions are evaluated only while Omachord is on.", urgent: false }
     if (!state) return { label: "Not evaluated", detail: "The condition service has not reported yet.", urgent: false }
     if (state.failure && state.failure.op) {
+      var retry = state.failure.retryAt ? Conditions.clockTime(new Date(Number(state.failure.retryAt)).toISOString()) : ""
       if (state.failure.op === "activate" && state.failure.blocked === true)
         return { label: "Unavailable", detail: "Could not start: " + (state.failure.error || "brightness unavailable")
-          + " · Automatic retry blocked. Retry manually or edit the routine.", urgent: true }
-      var retry = state.failure.retryAt ? Conditions.clockTime(new Date(Number(state.failure.retryAt)).toISOString()) : ""
+          + (retry ? " · retrying " + retry : "") + ". Retry now, or edit the routine.", urgent: true, retry: true }
       return { label: "Failed", detail: (state.failure.op === "activate" ? "Could not start: " : "Could not end: ")
-        + (state.failure.error || "runner error") + (retry ? " · retrying " + retry : ""), urgent: true }
+        + (state.failure.error || "runner error") + (retry ? " · retrying " + retry : ""), urgent: true,
+        retry: state.failure.op === "activate" }
     }
     if (state.matched === true && state.latched) return { label: "Ended by hand", detail: "Starts again once its conditions have been false at least once.", urgent: false }
     if (state.matched === true) return { label: "Matched", detail: "Starting shortly.", urgent: false }
@@ -1010,6 +1015,67 @@ Item {
     return false
   }
 
+  // Retrying a failed condition start goes back through the service, so the
+  // routine stays condition-owned and ends when its conditions stop matching.
+  function retryConditionStart(id) {
+    if (!service || typeof service.retryConditionActivation !== "function") return
+    if (routineActionBlocked(id)) return
+    if (service.retryConditionActivation(id))
+      showNotice("Retrying " + Model.nameFor(config, id) + "...", false)
+    else showNotice("Could not retry " + Model.nameFor(config, id) + " now", true)
+  }
+
+  // A held brightness record: the display shows neither the original nor the
+  // applied value, so the runner will not guess. Keeping the current value is
+  // an explicit decision bound to the recovery revision inspected just before.
+  function requestAcceptBrightness() {
+    if (!heldBrightnessId || heldBrightnessProc.running) return
+    showConfirmation(
+      "accept-brightness",
+      "Keep the display at its current brightness and finish ending \"" + Model.nameFor(config, heldBrightnessId)
+        + "\"? Its original brightness will not be restored.",
+      "Keep brightness")
+  }
+
+  function acceptHeldBrightness() {
+    if (!heldBrightnessId || heldBrightnessProc.running) return
+    heldBrightnessStage = "inspect"
+    heldBrightnessProc.command = [runnerPath, "recovery", "inspect", heldBrightnessId]
+    showNotice("Keeping the current brightness...", false, true)
+    startProcess(heldBrightnessProc)
+  }
+
+  function handleHeldBrightnessResult(text, errorText, exitCode) {
+    var id = heldBrightnessId
+    var stage = heldBrightnessStage
+    heldBrightnessStage = ""
+    if (!id || !stage) return
+    var parsed = parseJson(text, null)
+    if (stage === "inspect") {
+      if (exitCode === 0 && parsed && parsed.ok === true && typeof parsed.revision === "string"
+          && /^sha256:[0-9a-f]{64}$/.test(parsed.revision)) {
+        heldBrightnessStage = "accept"
+        heldBrightnessProc.command = [runnerPath, "recovery", "accept-brightness", id, parsed.revision]
+        Qt.callLater(function() {
+          if (!startProcess(heldBrightnessProc)) root.handleHeldBrightnessResult("", "The recovery runner is busy", -1)
+        })
+        return
+      }
+      heldBrightnessId = ""
+      showNotice((parsed && parsed.error) || errorText || "Could not inspect the recovery record", true)
+      return
+    }
+    heldBrightnessId = ""
+    var ok = exitCode === 0 && parsed && parsed.ok === true
+    if (ok) showNotice(actionNotice(parsed, Model.nameFor(config, id)), false)
+    else {
+      showNotice((parsed && parsed.error) || errorText || "Could not keep the current brightness", true)
+      if (parsed && parsed.code === "brightness-held") heldBrightnessId = id
+    }
+    requestRefreshProcess(logsProc)
+    if (!serviceLive) requestRefreshProcess(activeProc)
+  }
+
   // Ending from the Activity list goes through the service when it is loaded
   // (the same path the bar widget uses); otherwise the runner directly.
   function endRoutine(id) {
@@ -1139,8 +1205,10 @@ Item {
     }
     actionStarted = false
     var name = Model.nameFor(config, runningRoutineId)
+    var routineId = runningRoutineId
     runningRoutineId = ""
     showNotice(result.ok ? actionNotice(result, name) : (result.error || "Routine failed"), !result.ok)
+    if (!result.ok && result.code === "brightness-held") heldBrightnessId = routineId
     requestRefreshProcess(logsProc)
     if (!serviceLive) requestRefreshProcess(activeProc)
   }
@@ -1225,6 +1293,7 @@ Item {
 
   // Info notices fade out on their own; errors stay until the next change.
   function showNotice(text, isError, sticky) {
+    if (!heldBrightnessStage) heldBrightnessId = ""
     noticeError = isError === true
     noticeText = String(text || "")
     noticeExpiry.stop()
@@ -1232,6 +1301,7 @@ Item {
   }
 
   function clearNotice() {
+    if (!heldBrightnessStage) heldBrightnessId = ""
     noticeExpiry.stop()
     noticeText = ""
     noticeError = false
@@ -1301,6 +1371,7 @@ Item {
       var name = Model.nameFor(root.config, job.id)
       if (result && result.ok) root.showNotice(root.actionNotice(result, name), false)
       else root.showNotice((result && result.error) || (name + " could not be ended"), true)
+      if (result && result.ok === false && result.code === "brightness-held") root.heldBrightnessId = job.id
       root.requestRefreshProcess(logsProc)
     }
     function onConfigRevisionChanged() {
@@ -1551,6 +1622,15 @@ Item {
         Qt.callLater(function() {
           root.handleActionResult("", "Could not start the Omachord runner", -1)
         })
+    }
+  }
+
+  Process {
+    id: heldBrightnessProc
+    stdout: StdioCollector { id: heldBrightnessStdout; waitForEnd: true }
+    stderr: StdioCollector { id: heldBrightnessStderr; waitForEnd: true }
+    onExited: function(exitCode) {
+      root.handleHeldBrightnessResult(heldBrightnessStdout.text, heldBrightnessStderr.text.trim(), exitCode)
     }
   }
 
@@ -2601,6 +2681,7 @@ Item {
 
                           Column {
                             width: parent.width - conditionState.width - parent.spacing
+                              - (conditionRetry.visible ? conditionRetry.width + parent.spacing : 0)
                             spacing: Style.space(2)
                             anchors.verticalCenter: parent.verticalCenter
                             Text {
@@ -2633,6 +2714,23 @@ Item {
                               font.pixelSize: Style.font.caption
                               wrapMode: Text.WordWrap
                             }
+                          }
+
+                          Button {
+                            id: conditionRetry
+                            visible: !conditionRow.isOn && !!conditionRow.reason && conditionRow.reason.retry === true
+                              && !!root.service && typeof root.service.retryConditionActivation === "function"
+                            anchors.verticalCenter: parent.verticalCenter
+                            text: "Retry now"
+                            bordered: true
+                            focusable: true
+                            foreground: root.fg
+                            accent: root.accent
+                            enabled: !root.routineActionBlocked(conditionRow.modelData.id)
+                            opacity: enabled ? 1 : 0.6
+                            onClicked: root.retryConditionStart(conditionRow.modelData.id)
+                            Accessible.role: Accessible.Button
+                            Accessible.name: "Retry starting " + conditionRow.modelData.name
                           }
 
                           Text {
@@ -2898,6 +2996,7 @@ Item {
                   Text {
                     textFormat: Text.PlainText
                     width: parent.width - Style.space(20)
+                      - (heldBrightnessButton.visible ? heldBrightnessButton.width + parent.spacing : 0)
                     text: root.noticeText
                     color: root.noticeError ? root.urgent : root.dim
                     font.family: Style.font.family
@@ -2905,6 +3004,19 @@ Item {
                     wrapMode: Text.WordWrap
                     Accessible.role: Accessible.StaticText
                     Accessible.name: root.noticeText
+                  }
+                  Button {
+                    id: heldBrightnessButton
+                    visible: root.noticeError && root.heldBrightnessId !== "" && !heldBrightnessProc.running
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: "Keep brightness"
+                    bordered: true
+                    focusable: true
+                    foreground: root.fg
+                    accent: root.accent
+                    onClicked: root.requestAcceptBrightness()
+                    Accessible.role: Accessible.Button
+                    Accessible.name: "Keep the current brightness and finish ending the routine"
                   }
                 }
               }
@@ -2937,6 +3049,7 @@ Item {
           root.pendingUiAction = ""
           root.pendingUiValue = null
           if (purpose === "disconnect") root.mutateConnection("disconnect")
+          else if (purpose === "accept-brightness") root.acceptHeldBrightness()
           else if (purpose === "delete") root.deleteSelectedRoutine()
           else if (purpose === "discard") {
             routineEditor.dirty = false

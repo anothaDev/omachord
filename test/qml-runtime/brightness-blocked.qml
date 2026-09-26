@@ -38,10 +38,10 @@ ShellRoot {
   function waitFailure() {
     waitFor(function() { return state().failure && !service.routineBusy("scratch") }, "activation did not fail")
   }
-  function ageFailure() {
+  function ageFailure(ms) {
     // Clock seam: age only the failure, then exercise the real service tick.
     var failures = JSON.parse(JSON.stringify(service.failures))
-    failures.scratch.at = Date.now() - 2 * service.failureRetryMs
+    failures.scratch.at = Date.now() - (ms === undefined ? 2 * service.failureRetryMs : ms)
     service.failures = failures
     service.tick()
     service.evaluate()
@@ -54,15 +54,25 @@ ShellRoot {
     waitFor(function() { return service.configLoaded && service.activeLoaded && service.latchesSeeded }, "service did not initialize")
     waitFailure()
     waitFor(function() { return countCalls("activate scratch condition ") === 1 }, "initial activation was not recorded")
-    check(state().failure.blocked === true && state().failure.retryAt === null,
-      "typed capability failure was not recorded as blocked")
+    check(state().failure.blocked === true && state().failure.retryAt === state().failure.at + 60000,
+      "typed capability failure was not recorded with a one-minute backoff")
+    check(service.failures.scratch.attempts === 1, "first capability failure did not start the backoff count")
     check(state().latched && !state().active, "preflight failure must latch without activation")
-    for (var i = 0; i < 3; i++) {
-      ageFailure()
+    // Backoff 1, 2, 5, 10 minutes: never before the step, always after it.
+    var steps = [60000, 120000, 300000, 600000, 600000]
+    for (var i = 0; i < steps.length; i++) {
+      ageFailure(steps[i] - 5000)
       input.wait(350)
-      check(state().failure && state().failure.blocked && state().latched, "tick expired or unlatched blocked activation")
+      check(state().failure && state().failure.blocked && state().latched, "blocked activation retried before its backoff")
+      check(countCalls("activate scratch condition ") === i + 1, "blocked activation retried early at step " + i)
+      ageFailure(steps[i] + 1000)
+      waitFor(function() { return countCalls("activate scratch condition ") === i + 2 }, "blocked activation never retried at step " + i)
+      waitFailure()
+      waitFor(function() { return service.failures.scratch && service.failures.scratch.attempts === i + 2 },
+        "repeated capability failure did not back off further")
+      check(state().failure.blocked && state().latched, "condition retry lost the blocked failure")
     }
-    check(countCalls("activate scratch condition ") === 1, "blocked activation retried automatically")
+    check(countCalls("activate scratch manual") === 0, "backoff retry was not condition-owned")
   }
   function testFailedManualRetry() {
     check(service.startRoutine("scratch"), "blocked routine refused explicit retry")
@@ -80,11 +90,14 @@ ShellRoot {
     plan.toggles = ["scratch"]
     savePlan()
     service.applyToggles(["scratch"])
+    var before = countCalls("activate scratch condition ")
     service.evaluate()
     waitFailure()
-    waitFor(function() { return countCalls("activate scratch condition ") === 2 }, "new true edge did not retry")
+    waitFor(function() { return countCalls("activate scratch condition ") === before + 1 }, "new true edge did not retry")
+    check(service.failures.scratch.attempts === 1, "a new true period did not reset the backoff")
   }
   function testSuccessfulManualRetry() {
+    var automatic = countCalls("activate scratch condition ")
     plan.manualReply = { ok: true }
     savePlan()
     var clearedAtCompletion = false
@@ -102,7 +115,7 @@ ShellRoot {
     waitFor(function() { return !service.routineBusy("scratch") }, "manual end did not settle")
     input.wait(350)
     check(!state().active && state().latched, "manual end was undone while conditions remained true")
-    check(countCalls("activate scratch condition ") === 2, "manual success/end caused another automatic start")
+    check(countCalls("activate scratch condition ") === automatic, "manual success/end caused another automatic start")
   }
   function setMatched(matched) {
     plan.toggles = matched ? ["scratch"] : []
@@ -121,9 +134,10 @@ ShellRoot {
     savePlan()
     service.applyConfig(snapshot())
     check(!state().failure && !state().latched, "new config revision did not clear blocked state")
+    var automatic = countCalls("activate scratch condition ")
     service.evaluate()
     waitFailure()
-    waitFor(function() { return countCalls("activate scratch condition ") === 4 }, "new revision did not retry")
+    waitFor(function() { return countCalls("activate scratch condition ") === automatic + 1 }, "new revision did not retry")
     service.applyLiveLog({ routineId: "scratch", trigger: "condition", status: "success" })
     check(state().failure.blocked, "an automatic success log cleared a blocked explicit-retry requirement")
     // CLI/shortcut activations report through history, not manualFinished.
@@ -131,7 +145,7 @@ ShellRoot {
     check(!state().failure && state().latched, "external successful retry did not reconcile blocked state")
     service.evaluate()
     input.wait(350)
-    check(countCalls("activate scratch condition ") === 4, "successful one-shot log caused duplicate activation")
+    check(countCalls("activate scratch condition ") === automatic + 1, "successful one-shot log caused duplicate activation")
   }
   function testRetryableFailures() {
     // Matching prose is not a capability signal; only the exact typed code is.
@@ -181,8 +195,9 @@ ShellRoot {
     panel = component.createObject(root, { service: service })
     var reason = panel.conditionReason(plan.config.routines[0], state())
     check(reason.label === "Unavailable" && reason.urgent, "panel does not label blocked activation Unavailable")
-    check(reason.detail.indexOf("retrying") === -1 && reason.detail.indexOf("manually") !== -1
-      && reason.detail.indexOf("edit") !== -1, "panel invents a retry time or omits manual retry/edit advice")
+    check(reason.detail.indexOf("retrying") !== -1 && reason.detail.indexOf("Retry now") !== -1
+      && reason.detail.indexOf("edit") !== -1 && reason.retry === true,
+      "panel hides the backoff retry time or omits retry/edit advice")
     var recovery = { failure: { op: "deactivate", error: "restore failed", blocked: false, retryAt: Date.now() + 300000 } }
     reason = panel.conditionReason(plan.config.routines[0], recovery)
     check(reason.label === "Failed" && reason.detail.indexOf("retrying") !== -1, "panel hides recovery retry timing")
@@ -210,6 +225,34 @@ ShellRoot {
     input.wait(350)
     check(countCalls("activate scratch condition ") === before, "one-shot success was automatically repeated")
   }
+  function testConditionRetry() {
+    // Panel "Retry now" must re-enter the service as a condition activation,
+    // so the result is condition-owned and still ends on the false edge.
+    setMatched(false)
+    plan.reply = unavailable
+    setMatched(true)
+    waitFailure()
+    check(state().failure.blocked && state().latched, "retry fixture did not start blocked")
+    var component = Qt.createComponent("Panel.qml")
+    check(component.status === Component.Ready, component.errorString())
+    panel = component.createObject(root, { service: service })
+    var automatic = countCalls("activate scratch condition ")
+    var manual = countCalls("activate scratch manual") + countCalls("run scratch")
+    plan.reply = { ok: true }
+    savePlan()
+    panel.retryConditionStart("scratch")
+    waitFor(function() { return countCalls("activate scratch condition ") === automatic + 1 }, "panel retry did not reach the service")
+    waitFor(function() { return state().active && !service.routineBusy("scratch") }, "condition retry did not activate")
+    check(countCalls("activate scratch manual") + countCalls("run scratch") === manual, "panel retry made a manual activation")
+    check(!state().failure && state().trigger === "condition", "condition retry is not condition-owned")
+    var ended = countCalls("deactivate scratch condition ")
+    setMatched(false)
+    waitFor(function() { return countCalls("deactivate scratch condition ") === ended + 1 && !state().active },
+      "condition-owned retry did not end on the false edge")
+    check(!service.retryConditionActivation("scratch"), "retry without a failed start was accepted")
+    panel.destroy()
+    panel = null
+  }
   Timer {
     interval: 20; running: true; repeat: false
     onTriggered: {
@@ -218,6 +261,7 @@ ShellRoot {
         root.testRevisionAndExternalSuccess()
         root.testRetryableFailures(); root.testPanel()
         root.testManualRunOutcomes()
+        root.testConditionRetry()
         console.log("OMACHORD_QML_TEST_PASS")
       }
       catch (error) { console.error("OMACHORD_QML_TEST_FAIL", String(error)) }

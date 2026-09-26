@@ -442,10 +442,13 @@ Item {
     }
     var retainedFailures = Object.assign(Object.create(null), failures)
     for (var failed in retainedFailures) {
-      if (retainedFailures[failed].op !== "deactivate") continue
+      var backoff = retainedFailures[failed].op === "activate" && retainedFailures[failed].blocked === true
+      // A backoff record outlives its latch only while that activation is
+      // still wanted; otherwise it would outlast the true period it counts.
+      if (retainedFailures[failed].op !== "deactivate" && (!backoff || Conditions.mapValue(latched, failed))) continue
       var stillDesired = false
       for (var d = 0; d < desired.length; d++) {
-        if (desired[d].id === failed && desired[d].op === "deactivate") {
+        if (desired[d].id === failed && desired[d].op === retainedFailures[failed].op) {
           stillDesired = true
           break
         }
@@ -487,8 +490,13 @@ Item {
     var expiredFailures = Object.assign(Object.create(null), failures)
     var changed = false
     for (var id in expiredFailures) {
-      if (expiredFailures[id].op === "activate" && expiredFailures[id].blocked === true) continue
-      if (now - Number(expiredFailures[id].at) < failureRetryMs) continue
+      if (now - Number(expiredFailures[id].at) < Conditions.failureRetryMs(expiredFailures[id], failureRetryMs)) continue
+      if (expiredFailures[id].op === "activate" && expiredFailures[id].blocked === true) {
+        // Keep the record so a repeated capability failure backs off further;
+        // releasing the latch lets evaluate() retry it as a condition start.
+        unlatch(id)
+        continue
+      }
       var operation = expiredFailures[id].op
       delete expiredFailures[id]
       if (operation === "activate") unlatch(id)
@@ -529,6 +537,22 @@ Item {
     // A successful explicit retry satisfies this true period, including a
     // one-shot run with no active snapshot for evaluate() to observe.
     latch(id)
+  }
+
+  // "Retry now" for a condition start that failed: forget the failure and
+  // its latch so evaluate() queues a fresh condition-owned activation. Unlike
+  // a manual start, the result still ends when the conditions stop matching.
+  function retryConditionActivation(id) {
+    var routineId = String(id || "")
+    var failure = Conditions.mapValue(failures, routineId)
+    if (!failure || failure.op !== "activate" || failure.revision !== configRevision) return false
+    if (currentJob && currentJob.id === routineId) return false
+    var next = Object.assign(Object.create(null), failures)
+    delete next[routineId]
+    failures = next
+    unlatch(routineId)
+    evaluate()
+    return true
   }
 
   // ------------------------------------------------------- execution
@@ -581,14 +605,19 @@ Item {
     if (!ok) {
       // Do not hammer the runner while the cause persists (a stopped shell, a
       // restore that could not complete). A typed activation preflight failure
-      // waits for a false edge, a config edit, or a successful manual retry;
-      // all other failures, especially recovery, retain the retry window.
+      // backs off 1, 2, 5, then 10 minutes and is also cleared by a false edge,
+      // a config edit, or a successful retry; other failures keep the window.
       var next = Object.assign(Object.create(null), failures)
       if (job.revision === configRevision) {
         if (job.op === "activate") latch(job.id)
+        var blocked = job.op === "activate" && !!parsed && parsed.ok === false && parsed.code === "brightness-unavailable"
+        var prior = Conditions.mapValue(failures, job.id)
+        var repeated = blocked && !!prior && prior.op === "activate" && prior.blocked === true
+          && prior.revision === job.revision
         next[job.id] = {
           at: Date.now(), op: job.op, revision: job.revision,
-          blocked: job.op === "activate" && !!parsed && parsed.ok === false && parsed.code === "brightness-unavailable",
+          blocked: blocked,
+          attempts: repeated ? Math.min((Math.floor(Number(prior.attempts)) || 1) + 1, 100) : 1,
           error: parsed && parsed.error ? String(parsed.error) : "runner exited " + exitCode
         }
         failures = next
