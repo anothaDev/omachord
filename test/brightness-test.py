@@ -37,6 +37,15 @@ if name == "omarchy-brightness-display":
     fault = (root / "fault").read_text().strip()
     if not args:
         if fault == "unavailable": sys.exit(1)
+        # A slow DDC display applies a write only after some later reads.
+        late = root / "late-value"
+        if late.exists():
+            remaining = int((root / "late-reads").read_text())
+            if remaining <= 0:
+                (root / target).write_text(late.read_text())
+                late.unlink()
+            else:
+                (root / "late-reads").write_text(str(remaining - 1))
         print((root / target).read_text().strip())
         if (root / "switch-after-read").exists():
             (root / "focus").write_text("DP-2")
@@ -46,7 +55,12 @@ if name == "omarchy-brightness-display":
     if not target.startswith(("eDP-", "LVDS-", "DSI-")): value = max(1, value)
     if fault == "write-fail": sys.exit(1)
     if fault == "rounded": value += 1
-    if fault != "dropped-write":
+    if fault == "late":
+        (root / "late-value").write_text(str(value))
+        (root / "late-reads").write_text("1")
+        with (root / "writes.jsonl").open("a") as log:
+            log.write(json.dumps([target, value])+"\n")
+    elif fault != "dropped-write":
         (root / target).write_text(str(value))
         with (root / "writes.jsonl").open("a") as log:
             log.write(json.dumps([target, value])+"\n")
@@ -475,6 +489,196 @@ os.execv("/usr/bin/jq", ["jq", *sys.argv[1:]])
         record = json.loads(self.snapshot.read_text())
         self.assertEqual(record["version"], 3)
         self.assertEqual(record["setters"][0]["target"], before)
+
+    def inspect_revision(self):
+        inspection = self.f.run("recovery", "inspect", "brightness-check")
+        self.assertEqual(inspection.returncode, 0, inspection)
+        return json.loads(inspection.stdout)["revision"]
+
+    def hold_after_rounded_restore(self):
+        self.install()
+        self.run_routine("activate")
+        (self.f.root / "fault").write_text("rounded")
+        self.run_routine("deactivate", success=False)
+        (self.f.root / "fault").write_text("")
+        held = self.run_routine("deactivate", success=False)
+        self.assertEqual(held["code"], "brightness-held", held)
+        self.assertIn("accept-brightness", held["error"])
+        self.assertEqual((self.f.root / "DP-1").read_text(), "81")
+
+    def test_external_zero_original_is_restored_as_backend_minimum(self):
+        (self.f.root / "DP-1").write_text("0")
+        self.install()
+        self.run_routine("activate")
+        self.assertEqual(json.loads(self.snapshot.read_text())["setters"][0]["before"], 0)
+        result = self.run_routine("deactivate")
+        self.assertEqual(result["restored"], 1)
+        self.assertFalse(self.snapshot.exists(), "restoring an original 0 must complete")
+        self.assertEqual((self.f.root / "DP-1").read_text(), "1")
+        self.assertEqual(self.writes(), [["DP-1", 40], ["DP-1", 1]])
+
+    def test_external_zero_pending_restore_completes_at_minimum(self):
+        (self.f.root / "DP-1").write_text("0")
+        self.install()
+        self.run_routine("activate")
+        record = json.loads(self.snapshot.read_text())
+        record["setters"][0]["restoreState"] = "pending"
+        self.snapshot.write_text(json.dumps(record))
+        (self.f.root / "DP-1").write_text("1")
+        self.run_routine("deactivate")
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual(self.writes(), [["DP-1", 40]], "an already-restored minimum needs no write")
+
+    def test_accept_brightness_releases_held_record_without_writing(self):
+        self.hold_after_rounded_restore()
+        writes = self.writes()
+        stale = self.f.run("recovery", "accept-brightness", "brightness-check", "sha256:"+"0"*64)
+        self.assertNotEqual(stale.returncode, 0)
+        self.assertEqual(json.loads(stale.stdout)["code"], "stale-recovery")
+        self.assertTrue(self.snapshot.exists())
+        usage = self.f.run("recovery", "accept-brightness", "brightness-check")
+        self.assertEqual(json.loads(usage.stdout)["code"], "usage")
+        reply = self.f.run("recovery", "accept-brightness", "brightness-check", self.inspect_revision())
+        self.assertEqual(reply.returncode, 0, reply)
+        body = json.loads(reply.stdout)
+        self.assertEqual(body["state"], "deactivated")
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual((self.f.root / "DP-1").read_text(), "81", "the display is left as it is")
+        self.assertEqual(self.writes(), writes)
+
+    def test_accept_brightness_is_bound_to_the_inspected_record(self):
+        self.hold_after_rounded_restore()
+        revision = self.inspect_revision()
+        record = json.loads(self.snapshot.read_text())
+        record["activatedAt"] = "2026-09-24T00:00:00Z"
+        changed = json.dumps(record)
+        self.snapshot.write_text(changed)
+        reply = self.f.run("recovery", "accept-brightness", "brightness-check", revision)
+        self.assertEqual(json.loads(reply.stdout)["code"], "stale-recovery", reply)
+        self.assertEqual(self.snapshot.read_text(), changed)
+
+    def test_accept_brightness_requires_an_unresolved_brightness_entry(self):
+        self.f.install(support.document(support.routine("brightness-check",
+            actions=[{"type":"dnd", "value":True, "restore":True}])))
+        self.run_routine("activate")
+        original = self.snapshot.read_bytes()
+        reply = self.f.run("recovery", "accept-brightness", "brightness-check", self.inspect_revision())
+        self.assertEqual(json.loads(reply.stdout)["code"], "invalid-recovery", reply)
+        self.assertEqual(self.snapshot.read_bytes(), original)
+
+    def test_upgraded_legacy_manual_change_can_be_accepted(self):
+        self.install()
+        self.seed_legacy_snapshot()
+        (self.f.root / "DP-1").write_text("41")
+        reply = self.f.run("recovery", "bind-brightness", "brightness-check", self.inspect_revision(), "DP-1")
+        self.assertEqual(reply.returncode, 0, reply)
+        self.assertEqual(self.run_routine("deactivate", success=False)["code"], "brightness-held")
+        reply = self.f.run("recovery", "accept-brightness", "brightness-check", self.inspect_revision())
+        self.assertEqual(reply.returncode, 0, reply)
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual((self.f.root / "DP-1").read_text(), "41")
+        self.assertEqual(self.writes(), [])
+
+    def test_bind_can_confirm_a_legacy_write_still_showing_its_value(self):
+        self.install()
+        for live, confirmed in (("40", True), ("41", False)):
+            with self.subTest(live=live):
+                self.seed_legacy_snapshot()
+                (self.f.root / "DP-1").write_text(live)
+                reply = self.f.run("recovery", "bind-brightness", "brightness-check", self.inspect_revision(),
+                                   "DP-1", "--confirm-if-applied")
+                self.assertEqual(reply.returncode, 0, reply)
+                self.assertIs(json.loads(self.snapshot.read_text())["setters"][0]["confirmed"], confirmed)
+                self.assertEqual(self.writes(), [])
+        # A confirmed receipt makes a later manual change an override, not a hold.
+        self.seed_legacy_snapshot()
+        (self.f.root / "DP-1").write_text("40")
+        self.f.run("recovery", "bind-brightness", "brightness-check", self.inspect_revision(), "DP-1", "--confirm-if-applied")
+        (self.f.root / "DP-1").write_text("55")
+        self.assertEqual(self.run_routine("deactivate")["skipped"], 1)
+        self.assertEqual((self.f.root / "DP-1").read_text(), "55")
+        bad = self.f.run("recovery", "bind-brightness", "brightness-check", "sha256:"+"0"*64, "DP-1", "--confirm")
+        self.assertEqual(json.loads(bad.stdout)["code"], "usage")
+
+    def test_bind_rejects_legacy_end_actions_without_brightness(self):
+        self.f.install(support.document(support.routine("brightness-check",
+            actions=[{"type":"exec", "program":"/usr/bin/true", "args":[]}],
+            onEnd={"mode":"actions", "actions":[{"type":"exec", "program":"/usr/bin/true", "args":[]}]})))
+        self.run_routine("activate")
+        record = json.loads(self.snapshot.read_text())
+        self.assertEqual(record["version"], 2)
+        original = self.snapshot.read_bytes()
+        reply = self.f.run("recovery", "bind-brightness", "brightness-check", self.inspect_revision(), "DP-1")
+        self.assertEqual(json.loads(reply.stdout)["code"], "invalid-recovery", reply)
+        self.assertEqual(self.snapshot.read_bytes(), original)
+
+    def test_bind_accepts_legacy_end_actions_that_use_brightness(self):
+        self.f.install(support.document(support.routine("brightness-check",
+            actions=[{"type":"exec", "program":"/usr/bin/true", "args":[]}],
+            onEnd={"mode":"actions", "actions":[{"type":"brightness", "value":20, "restore":False}]})))
+        self.run_routine("activate")
+        record = json.loads(self.snapshot.read_text())
+        record["version"] = 2
+        record.pop("brightnessTarget")
+        self.snapshot.write_text(json.dumps(record))
+        reply = self.f.run("recovery", "bind-brightness", "brightness-check", self.inspect_revision(), "DP-1")
+        self.assertEqual(reply.returncode, 0, reply)
+        self.assertEqual(json.loads(self.snapshot.read_text())["version"], 3)
+        self.run_routine("deactivate")
+        self.assertEqual((self.f.root / "DP-1").read_text(), "20")
+
+    def test_late_applying_write_is_confirmed_by_rereading(self):
+        self.install()
+        (self.f.root / "fault").write_text("late")
+        self.run_routine("activate")
+        setter = json.loads(self.snapshot.read_text())["setters"][0]
+        self.assertTrue(setter["confirmed"])
+        self.assertEqual(setter["applied"], 40)
+        self.assertEqual((self.f.root / "DP-1").read_text(), "40")
+        self.run_routine("deactivate")
+        self.assertEqual((self.f.root / "DP-1").read_text(), "80")
+        self.assertEqual(self.writes(), [["DP-1", 40], ["DP-1", 80]])
+
+    def test_value_still_at_original_is_not_final_until_it_settles(self):
+        self.install()
+        self.run_routine("activate")
+        record = json.loads(self.snapshot.read_text())
+        record["setters"][0]["restoreState"] = "pending"
+        self.snapshot.write_text(json.dumps(record))
+        # The display reads 80 once, then an earlier write to 40 lands.
+        (self.f.root / "DP-1").write_text("80")
+        (self.f.root / "late-value").write_text("40")
+        (self.f.root / "late-reads").write_text("1")
+        self.run_routine("deactivate", success=False)
+        self.assertEqual(json.loads(self.snapshot.read_text())["setters"][0]["restoreState"], "pending")
+        self.assertEqual(self.writes(), [["DP-1", 40]])
+        self.run_routine("deactivate")
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual((self.f.root / "DP-1").read_text(), "80")
+
+    def test_backlight_step_rounding_is_tolerated_and_recorded(self):
+        (self.f.root / "monitor-data").write_text(json.dumps([
+            dict(name="eDP-1", make="Test", model="Panel", serial="panel", focused=True)]))
+        (self.f.root / "eDP-1").write_text("80")
+        self.install()
+        (self.f.root / "fault").write_text("rounded")
+        self.run_routine("activate")
+        setter = json.loads(self.snapshot.read_text())["setters"][0]
+        self.assertTrue(setter["confirmed"])
+        self.assertEqual(setter["applied"], 41, "applied records what the backlight really shows")
+        self.run_routine("deactivate")
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual((self.f.root / "eDP-1").read_text(), "81")
+
+    def test_backlight_tolerance_is_one_step_only(self):
+        (self.f.root / "monitor-data").write_text(json.dumps([
+            dict(name="eDP-1", make="Test", model="Panel", serial="panel", focused=True)]))
+        (self.f.root / "eDP-1").write_text("80")
+        self.install()
+        (self.f.root / "fault").write_text("dropped-write")
+        self.run_routine("activate", success=False)
+        self.assertFalse(self.snapshot.exists())
+        self.assertEqual((self.f.root / "eDP-1").read_text(), "80")
 
 
 if __name__ == "__main__":
