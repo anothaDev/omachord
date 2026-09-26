@@ -90,6 +90,7 @@ jobs:
       - name: Test runner integration with mocked desktop commands
         run: |
           runuser -u test-runner -- test/runner-test.sh
+          runuser -u test-runner -- test/runner-lifecycle-test.sh
           runuser -u test-runner -- python3 test/brightness-test.py
           runuser -u test-runner -- test/authorization-test.sh
           runuser -u test-runner -- test/manual-revision-test.sh

@@ -31,7 +31,7 @@ The runner and the QML components honor only the variables below. They exist for
 | --- | --- | --- |
 | `OMACHORD_ACTION_TIMEOUT` | `30s` | Per-stage timeout for ordinary action programs (a `timeout(1)` duration) |
 | `OMACHORD_CONTROL_TIMEOUT` | `5s` | Timeout for built-in control probes (Omarchy, Hyprland, and shell queries) |
-| `OMACHORD_LOCK_TIMEOUT` | `10` | Seconds to wait for the configuration and run-history locks |
+| `OMACHORD_LOCK_TIMEOUT` | `10` | Seconds to wait for the configuration, run-history and per-routine locks (a writer that must end a running routine gives up with `routine-running` after this long); invalid values are rejected with `invalid-environment` |
 | `OMACHORD_OMARCHY_CONFIG_DIR` | `~/.config/omarchy` | Base for the default configuration, hook, shell, and runner paths |
 | `OMACHORD_CONFIG_FILE` | `<omarchy config>/omachord.json` | Routine configuration (also read by the QML components) |
 | `OMACHORD_STATE_DIR` | `$XDG_STATE_HOME/omarchy/omachord` | Private state directory (also read by the QML components) |

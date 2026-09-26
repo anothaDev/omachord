@@ -17,13 +17,15 @@ Targets 0.5.0. Activation records for brightness routines move to schema version
 ### Integration and transactions
 
 - **`bindings.lua` round trip:** Connect followed by Disconnect leaves `~/.config/hypr/bindings.lua` byte-identical to the original. Backups under `~/.local/state/omarchy/omachord/backups/` are pruned to the ten most recent plus the original pre-Omachord copy.
-- **Configuration lock no longer held while actions run:** a long action (a theme change, a delay) no longer blocks a concurrent save for its whole duration. A save that cannot proceed while a routine is running reports the retryable `routine-running` code. (Previously listed in the known issues.)
+- **Configuration lock no longer held while actions run:** a long action (a theme change, a delay) no longer blocks a concurrent save for its whole duration. A save, Connect or Disconnect that must end a routine which is still mid-run waits up to the lock timeout (10 seconds by default) and then reports the retryable `routine-running` code without changing anything. (Previously listed in the known issues.)
 - **Deactivation ordering:** Disconnect and saves that remove or disable an active routine end it as late as possible, after the checks that could still refuse the operation. Ending a routine is not rolled back if a later step fails. (Previously listed in the known issues.)
 
 ### Hardening
 
 - Internal knobs `OMACHORD_BULK_CLEANUP`, `OMACHORD_CAPTURE_MODE`, and `OMACHORD_CAPTURE_LIMIT` are no longer honored from the environment. The supported overrides are listed in [SECURITY.md](SECURITY.md).
-- The runner checks for GNU coreutils 9.5 or later at startup and reports a clear error instead of failing inside a transaction.
+- The runner checks for GNU coreutils 9.5 or later (`mv --exchange`) before stateful commands and reports a clear error instead of failing inside a transaction.
+- Invalid `OMACHORD_ACTION_TIMEOUT`, `OMACHORD_CONTROL_TIMEOUT` or `OMACHORD_LOCK_TIMEOUT` values are rejected with the `invalid-environment` code.
+- Actions only inherit standard input, output and error; timeouts, kills and supervisor failures are reported separately instead of all as timeouts.
 - `omachord --help` lists `themes`, `service-status`, and `theme-palette`.
 - QML watchdogs keep the panel, bar, and service from waiting indefinitely on a runner request that never finishes.
 

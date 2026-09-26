@@ -343,9 +343,15 @@ apply_config "$(config_of \
 OMACHORD_BULK_CLEANUP=1 "$RUNNER" trigger hook theme-set x | jq -e '.matched == 1 and (.suppressed | not)' >/dev/null \
   || fail "an ambient bulk-cleanup flag suppressed hooks"
 grep -Fqx hooked "$TEST_ROOT/marks.log" || fail "the hook routine did not run"
-self_start=$(awk '{print $22}' "/proc/$BASHPID/stat")
-OMACHORD_BULK_CLEANUP="$BASHPID:$self_start" "$RUNNER" trigger hook theme-set x \
-  | jq -e '.suppressed == true' >/dev/null || fail "a live bulk-cleanup owner did not suppress hooks"
+# Use a dedicated live owner: $BASHPID expanded inside a pipeline names a
+# short-lived subshell, not this shell, so its start time would not match.
+sleep 60 & owner_pid=$!
+owner_start=$(awk '{print $22}' "/proc/$owner_pid/stat")
+self_start=$owner_start
+live_result=$(OMACHORD_BULK_CLEANUP="$owner_pid:$owner_start" "$RUNNER" trigger hook theme-set x)
+kill "$owner_pid" 2>/dev/null || true
+wait "$owner_pid" 2>/dev/null || true
+jq -e '.suppressed == true' <<<"$live_result" >/dev/null || fail "a live bulk-cleanup owner did not suppress hooks"
 sleep 0 & dead_pid=$!
 wait "$dead_pid"
 OMACHORD_BULK_CLEANUP="$dead_pid:$self_start" "$RUNNER" trigger hook theme-set x \
