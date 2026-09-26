@@ -337,8 +337,8 @@ apply_config "$(config_of \
   "$(routine ending '[]' '{"onEnd":{"mode":"actions","actions":[{"type":"theme","value":"ending-theme","restore":false},{"type":"exec","program":"detached-theme-set","args":[]}]}}')" \
   "$(routine on-theme '[{"type":"exec","program":"mark","args":["hooked"]}]' '{"triggers":[{"type":"hook","event":"theme-set"}]}')" \
   "$(routine keys '[]' '{"triggers":[{"type":"shortcut","keys":"SUPER + K","override":false}]}')")" \
-  | jq -e '.ok' >/dev/null
-"$RUNNER" connect | jq -e '.ok and .connected' >/dev/null
+  | jq -e '.ok' >/dev/null || fail "the bulk-cleanup fixture configuration was rejected"
+"$RUNNER" connect | jq -e '.ok and .connected' >/dev/null || fail "the bulk-cleanup fixture did not connect"
 : >"$TEST_ROOT/marks.log"
 OMACHORD_BULK_CLEANUP=1 "$RUNNER" trigger hook theme-set x | jq -e '.matched == 1 and (.suppressed | not)' >/dev/null \
   || fail "an ambient bulk-cleanup flag suppressed hooks"
@@ -347,15 +347,17 @@ grep -Fqx hooked "$TEST_ROOT/marks.log" || fail "the hook routine did not run"
 # short-lived subshell, not this shell, so its start time would not match.
 sleep 60 & owner_pid=$!
 owner_start=$(awk '{print $22}' "/proc/$owner_pid/stat")
-live_result=$(OMACHORD_BULK_CLEANUP="$owner_pid:$owner_start" "$RUNNER" trigger hook theme-set x)
+live_status=0
+live_result=$(OMACHORD_BULK_CLEANUP="$owner_pid:$owner_start" "$RUNNER" trigger hook theme-set x 2>&1) || live_status=$?
 kill "$owner_pid" 2>/dev/null || true
 wait "$owner_pid" 2>/dev/null || true
-jq -e '.suppressed == true' <<<"$live_result" >/dev/null \
-  || fail "a live bulk-cleanup owner did not suppress hooks: $live_result"
+jq -e '.suppressed == true' <<<"$live_result" >/dev/null 2>&1 \
+  || fail "a live bulk-cleanup owner did not suppress hooks (owner $owner_pid:$owner_start, exit $live_status): $live_result"
 # The same owner identity after that process has exited.
-dead_result=$(OMACHORD_BULK_CLEANUP="$owner_pid:$owner_start" "$RUNNER" trigger hook theme-set x)
-jq -e '.matched == 1 and (.suppressed | not)' <<<"$dead_result" >/dev/null \
-  || fail "a finished runner still suppressed hooks: $dead_result"
+dead_status=0
+dead_result=$(OMACHORD_BULK_CLEANUP="$owner_pid:$owner_start" "$RUNNER" trigger hook theme-set x 2>&1) || dead_status=$?
+jq -e '.matched == 1 and (.suppressed | not)' <<<"$dead_result" >/dev/null 2>&1 \
+  || fail "a finished runner still suppressed hooks (exit $dead_status): $dead_result"
 
 "$RUNNER" activate ending manual | jq -e '.ok and .state == "activated"' >/dev/null
 : >"$TEST_ROOT/theme-hook.log"
