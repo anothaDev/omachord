@@ -93,7 +93,7 @@ def main():
         (fixture / "calls").touch()
         env["OMACHORD_STATE_DIR"] = str(state)
         env["OMACHORD_CONFIG_FILE"] = str(config)
-        for name in ("Service.qml", "Conditions.js", "Runner.js"):
+        for name in ("Service.qml", "ProcessWatchdog.qml", "Conditions.js", "Runner.js"):
             shutil.copyfile(ROOT / name, fixture / name)
         (fixture / "runner").write_text(RUNNER)
         (fixture / "runner").chmod(0o700)

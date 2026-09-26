@@ -84,6 +84,9 @@ Item {
     onTriggered: root.readPalette()
   }
 
+  // A theme read is a bounded probe; never let a hung one stop the refreshes.
+  ProcessWatchdog { process: paletteProc; label: "theme-palette"; deadlineMs: 30000 }
+
   Process {
     id: paletteProc
     property bool startPending: false

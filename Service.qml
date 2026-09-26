@@ -31,6 +31,14 @@ Item {
   readonly property int reconcileMs: 300000
   readonly property int failureRetryMs: 300000
   readonly property int maxPending: 256
+  // A runner that never exits is stopped after these deadlines, so it cannot
+  // wedge a queue or the connection barrier. Routine work (and disconnect,
+  // which ends every active routine) must outlast the runner's own limits of
+  // up to 64 actions at 30 s each; probes are bounded reads.
+  property int probeDeadlineMs: 30000
+  property int connectionDeadlineMs: 60000
+  property int routineDeadlineMs: 600000
+  property int watchdogGraceMs: 5000
 
   property bool enabled: false
   // Latest accepted full status, with authoritative connection-command flags
@@ -875,7 +883,7 @@ Item {
     command: [root.runnerPath, "autostart"]
     stdout: StdioCollector { id: autostartStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      root.finishAutostart(autostartStdout.text, exitCode)
+      root.finishAutostart(autostartWatchdog.reply(autostartStdout.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -990,7 +998,7 @@ Item {
     id: runnerProc
     stdout: StdioCollector { id: runnerStdout; waitForEnd: true }
     onExited: function(exitCode) {
-      root.finishJob(runnerStdout.text, exitCode)
+      root.finishJob(runnerWatchdog.reply(runnerStdout.text), exitCode)
     }
     onRunningChanged: {
       if (!running && root.currentJob) {
@@ -1007,7 +1015,7 @@ Item {
     stdout: StdioCollector { id: manualStdout; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualConnection(manualStdout.text, exitCode)
+      root.finishManualConnection(manualWatchdog.reply(manualStdout.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1022,7 +1030,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout0; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker0, manualWorkerStdout0.text, exitCode)
+      root.finishManualRoutine(manualWorker0, manualWorkerWatchdog0.reply(manualWorkerStdout0.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1038,7 +1046,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout1; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker1, manualWorkerStdout1.text, exitCode)
+      root.finishManualRoutine(manualWorker1, manualWorkerWatchdog1.reply(manualWorkerStdout1.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1054,7 +1062,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout2; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker2, manualWorkerStdout2.text, exitCode)
+      root.finishManualRoutine(manualWorker2, manualWorkerWatchdog2.reply(manualWorkerStdout2.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1070,7 +1078,7 @@ Item {
     stdout: StdioCollector { id: manualWorkerStdout3; waitForEnd: true }
     onStarted: startPending = false
     onExited: function(exitCode) {
-      root.finishManualRoutine(manualWorker3, manualWorkerStdout3.text, exitCode)
+      root.finishManualRoutine(manualWorker3, manualWorkerWatchdog3.reply(manualWorkerStdout3.text), exitCode)
     }
     onRunningChanged: if (!running && startPending)
       Qt.callLater(function() {
@@ -1087,6 +1095,26 @@ Item {
       root.finishWidget(widgetStdout.text, exitCode)
     }
   }
+
+  ProcessWatchdog { id: autostartWatchdog; process: autostartProc; label: "autostart"; deadlineMs: root.connectionDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: statusProc; label: "status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: configProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: activeProc; label: "active"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: logsProc; label: "logs"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: togglesProbe; label: "toggles"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: runnerWatchdog; process: runnerProc; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog {
+    id: manualWatchdog
+    process: manualProc
+    label: root.manualJob ? String(root.manualJob.op) : "connection"
+    deadlineMs: root.manualJob && root.manualJob.op === "disconnect" ? root.routineDeadlineMs : root.connectionDeadlineMs
+    graceMs: root.watchdogGraceMs
+  }
+  ProcessWatchdog { id: manualWorkerWatchdog0; process: manualWorker0; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: manualWorkerWatchdog1; process: manualWorker1; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: manualWorkerWatchdog2; process: manualWorker2; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: manualWorkerWatchdog3; process: manualWorker3; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: widgetProc; label: "widget ensure"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
 
   Connections {
     target: root.pluginRegistry

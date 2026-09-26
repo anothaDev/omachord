@@ -97,6 +97,14 @@ Item {
   // completion settles. Other routines need not wait for that probe.
   property var actionSettling: Object.create(null)
   property date displayNow: new Date()
+  // Deadlines after which a runner that never exits is stopped, so loading,
+  // saving and connection locks always recover (see ProcessWatchdog.qml).
+  // An apply or disconnect can end routines, and a direct action runs one,
+  // so they get the routine deadline; reads are bounded probes.
+  property int probeDeadlineMs: 30000
+  property int connectionDeadlineMs: 60000
+  property int routineDeadlineMs: 600000
+  property int watchdogGraceMs: 5000
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: (manifest && manifest.id) || "anothadev.omachord"
@@ -1362,7 +1370,7 @@ Item {
     stderr: StdioCollector { id: configStderr; waitForEnd: true }
     onStarted: root.configStarted = true
     onExited: function(exitCode) {
-      root.handleConfigResult(configStdout.text, configStderr.text.trim(), exitCode)
+      root.handleConfigResult(configWatchdog.reply(configStdout.text), configStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && root.loading && !root.configStarted && !root.configHandled)
@@ -1411,7 +1419,7 @@ Item {
     stderr: StdioCollector { id: revisionStderr; waitForEnd: true }
     onStarted: root.revisionStarted = true
     onExited: function(exitCode) {
-      root.handleRevisionResult(revisionStdout.text, revisionStderr.text.trim(), exitCode)
+      root.handleRevisionResult(revisionWatchdog.reply(revisionStdout.text), revisionStderr.text.trim(), exitCode)
       root.finishRefreshProcess(revisionProc)
     }
     onRunningChanged: {
@@ -1519,7 +1527,7 @@ Item {
     }
     onExited: function(exitCode) {
       stdinEnabled = true
-      root.handleApplyResult(applyStdout.text, applyStderr.text.trim(), exitCode)
+      root.handleApplyResult(applyWatchdog.reply(applyStdout.text), applyStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running) stdinEnabled = true
@@ -1538,7 +1546,7 @@ Item {
     stderr: StdioCollector { id: mutationStderr; waitForEnd: true }
     onStarted: root.mutationStarted = true
     onExited: function(exitCode) {
-      root.handleMutationResult(mutationStdout.text, mutationStderr.text.trim(), exitCode)
+      root.handleMutationResult(mutationWatchdog.reply(mutationStdout.text), mutationStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && root.mutating
@@ -1556,7 +1564,7 @@ Item {
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onStarted: root.actionStarted = true
     onExited: function(exitCode) {
-      root.handleActionResult(actionStdout.text, actionStderr.text.trim(), exitCode)
+      root.handleActionResult(actionWatchdog.reply(actionStdout.text), actionStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && !root.actionStarted && root.runningRoutineId !== "")
@@ -1565,6 +1573,26 @@ Item {
         })
     }
   }
+
+  ProcessWatchdog { process: statusProc; label: "status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: configWatchdog; process: configProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: bindingsProc; label: "bindings"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: commandsProc; label: "commands"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: revisionWatchdog; process: revisionProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: activeProc; label: "active"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: themesProc; label: "themes"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: togglesProc; label: "toggles"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: serviceStatusProc; label: "service-status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: logsProc; label: "logs"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: applyWatchdog; process: applyProc; label: "config apply"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog {
+    id: mutationWatchdog
+    process: mutationProc
+    label: root.mutationOperation || "connection"
+    deadlineMs: root.mutationOperation === "disconnect" ? root.routineDeadlineMs : root.connectionDeadlineMs
+    graceMs: root.watchdogGraceMs
+  }
+  ProcessWatchdog { id: actionWatchdog; process: actionProc; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
 
   FloatingWindow {
     id: window
