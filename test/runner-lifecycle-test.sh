@@ -91,7 +91,9 @@ STUB
 cat >"$TEST_ROOT/bin/detached-theme-set" <<'STUB'
 #!/bin/bash
 # Leaves a descendant that outlives the runner which started it.
-( sleep 0.6; "$OMACHORD_TEST_RUNNER" trigger hook theme-set late >"$TEST_ROOT/detached-hook.json" 2>&1 ) \
+( while [[ ! -e $TEST_ROOT/detached.release ]]; do sleep 0.01; done
+  "$OMACHORD_TEST_RUNNER" trigger hook theme-set late >"$TEST_ROOT/detached-hook.tmp" 2>&1
+  mv "$TEST_ROOT/detached-hook.tmp" "$TEST_ROOT/detached-hook.json" ) \
   </dev/null >/dev/null 2>&1 &
 STUB
 
@@ -277,5 +279,118 @@ assert_eq "$(find "$backups" -maxdepth 1 -name 'bindings.lua.*' | wc -l)" 11 "ba
 "$RUNNER" disconnect | jq -e '.ok' >/dev/null
 assert_eq "$(find "$backups" -maxdepth 1 -name 'bindings.lua.*' | wc -l)" 11 "backups grew past the limit"
 pass "bindings backup retention"
+
+# --- A running routine no longer holds the config lock for its whole run
+revision() { "$RUNNER" config snapshot | jq -er '.revision'; }
+LOCK_CONFIG=$(config_of \
+  "$(routine long-run '[{"type":"exec","program":"hold","args":["run1"]}]')" \
+  "$(routine long-activate '[{"type":"dnd","value":true,"restore":true},{"type":"exec","program":"hold","args":["act1"]}]')" \
+  "$(routine other '[{"type":"exec","program":"mark","args":["other"]}]')")
+apply_config "$LOCK_CONFIG" | jq -e '.ok' >/dev/null
+renamed() { jq -c --arg name "$1" '(.routines[] | select(.id == "other") | .name) = $name' <<<"$LOCK_CONFIG"; }
+
+"$RUNNER" run long-run manual >"$TEST_ROOT/long-run.json" &
+long_pid=$!
+wait_for_file "$TEST_ROOT/run1.started" "the long stateless run did not start"
+start=$(date +%s%3N)
+apply_config "$(renamed "Other during run")" | jq -e '.ok' >/dev/null \
+  || fail "config apply failed while a stateless routine was running"
+elapsed=$(($(date +%s%3N) - start))
+((elapsed < 5000)) || fail "config apply waited ${elapsed}ms for a running routine"
+touch "$TEST_ROOT/run1.release"
+wait "$long_pid" || fail "the long stateless run failed"
+jq -e '.ok' "$TEST_ROOT/long-run.json" >/dev/null || fail "the long run reported failure"
+
+# A mid-activation routine that an apply would orphan is serialized through
+# its routine lock: the apply waits, then reports a retryable code without
+# changing anything.
+"$RUNNER" activate long-activate manual >"$TEST_ROOT/long-activate.json" &
+long_pid=$!
+wait_for_file "$TEST_ROOT/act1.started" "the long activation did not start"
+before=$(revision)
+without=$(jq -c 'del(.routines[] | select(.id == "long-activate"))' <<<"$(renamed "Other during run")")
+start=$(date +%s%3N)
+result=$(printf '%s\n' "$without" | OMACHORD_LOCK_TIMEOUT=0.5 "$RUNNER" config apply "$before" || true)
+elapsed=$(($(date +%s%3N) - start))
+jq -e '.ok == false and .code == "routine-running" and .deactivated == []' <<<"$result" >/dev/null \
+  || fail "orphaning a running activation did not return routine-running: $result"
+((elapsed < 5000)) || fail "the routine-running apply took ${elapsed}ms"
+assert_eq "$(revision)" "$before" "a routine-running apply changed the configuration"
+[[ -f $STATE_DIR/active/long-activate.json ]] || fail "a routine-running apply ended the activation"
+# An apply that keeps the routine proceeds while it is still activating.
+apply_config "$(renamed "Other during activation")" | jq -e '.ok and .deactivated == []' >/dev/null \
+  || fail "a compatible apply failed during an activation"
+touch "$TEST_ROOT/act1.release"
+wait "$long_pid" || fail "the long activation failed: $(cat "$TEST_ROOT/long-activate.json")"
+jq -e '.ok and .state == "activated"' "$TEST_ROOT/long-activate.json" >/dev/null \
+  || fail "the long activation did not complete"
+[[ -f $TEST_ROOT/shell-state/dnd ]] || fail "the activation's setter was lost"
+without=$(jq -c 'del(.routines[] | select(.id == "long-activate"))' <<<"$(renamed "Other during activation")")
+apply_config "$without" | jq -e '.ok and .deactivated == ["long-activate"]' >/dev/null \
+  || fail "the orphaned routine was not ended once it finished activating"
+[[ ! -f $TEST_ROOT/shell-state/dnd ]] || fail "ending the orphan did not restore its setter"
+[[ ! -e $STATE_DIR/active/long-activate.json ]] || fail "the orphan's record survived"
+pass "routines release the config lock and serialize with writers by routine lock"
+
+# --- Bulk cleanup: ordering, failure reporting and live-runner-bound hook suppression
+apply_config "$(config_of \
+  "$(routine ending '[]' '{"onEnd":{"mode":"actions","actions":[{"type":"theme","value":"ending-theme","restore":false},{"type":"exec","program":"detached-theme-set","args":[]}]}}')" \
+  "$(routine on-theme '[{"type":"exec","program":"mark","args":["hooked"]}]' '{"triggers":[{"type":"hook","event":"theme-set"}]}')" \
+  "$(routine keys '[]' '{"triggers":[{"type":"shortcut","keys":"SUPER + K","override":false}]}')")" \
+  | jq -e '.ok' >/dev/null
+"$RUNNER" connect | jq -e '.ok and .connected' >/dev/null
+: >"$TEST_ROOT/marks.log"
+OMACHORD_BULK_CLEANUP=1 "$RUNNER" trigger hook theme-set x | jq -e '.matched == 1 and (.suppressed | not)' >/dev/null \
+  || fail "an ambient bulk-cleanup flag suppressed hooks"
+grep -Fqx hooked "$TEST_ROOT/marks.log" || fail "the hook routine did not run"
+self_start=$(awk '{print $22}' "/proc/$BASHPID/stat")
+OMACHORD_BULK_CLEANUP="$BASHPID:$self_start" "$RUNNER" trigger hook theme-set x \
+  | jq -e '.suppressed == true' >/dev/null || fail "a live bulk-cleanup owner did not suppress hooks"
+sleep 0 & dead_pid=$!
+wait "$dead_pid"
+OMACHORD_BULK_CLEANUP="$dead_pid:$self_start" "$RUNNER" trigger hook theme-set x \
+  | jq -e '.matched == 1 and (.suppressed | not)' >/dev/null || fail "a finished runner still suppressed hooks"
+
+"$RUNNER" activate ending manual | jq -e '.ok and .state == "activated"' >/dev/null
+: >"$TEST_ROOT/theme-hook.log"
+: >"$TEST_ROOT/marks.log"
+# A failure before any side effect leaves the routine active.
+printf '%s\n' 'SUPER + J → Existing binding' >"$TEST_ROOT/bindings.txt"
+conflicting=$(jq -c 'del(.routines[] | select(.id == "ending")) | (.routines[] | select(.id == "keys") | .triggers[0].keys) = "SUPER + J"' "$CONFIG_PATH")
+result=$(printf '%s\n' "$conflicting" | "$RUNNER" config apply "$(revision)" || true)
+jq -e '.code == "shortcut-conflict" and (has("deactivated") | not)' <<<"$result" >/dev/null \
+  || fail "a conflicting apply did not fail before ending routines: $result"
+[[ -f $STATE_DIR/active/ending.json ]] || fail "a side-effect-free failure ended a routine"
+: >"$TEST_ROOT/bindings.txt"
+# A failure after the routine ended reports it in `deactivated`.
+touch "$TEST_ROOT/error-after-reload"
+rm -f "$TEST_ROOT/reloaded"
+broken=$(jq -c 'del(.routines[] | select(.id == "ending")) | (.routines[] | select(.id == "keys") | .triggers[0].keys) = "SUPER + L"' "$CONFIG_PATH")
+before=$(revision)
+result=$(printf '%s\n' "$broken" | "$RUNNER" config apply "$before" || true)
+rm -f "$TEST_ROOT/error-after-reload"
+jq -e '.ok == false and (.code | test("rolled-back|rollback-failed")) and .deactivated == ["ending"]' <<<"$result" >/dev/null \
+  || fail "a failure after ending routines omitted them: $result"
+assert_eq "$(revision)" "$before" "the failed apply did not restore the configuration"
+[[ ! -e $STATE_DIR/active/ending.json ]] || fail "the ended routine's record survived"
+grep -Fq '"suppressed":true' "$TEST_ROOT/theme-hook.log" \
+  || fail "the end action's hook was not suppressed during bulk cleanup: $(cat "$TEST_ROOT/theme-hook.log")"
+[[ ! -s $TEST_ROOT/marks.log ]] || fail "a hook routine ran during bulk cleanup"
+# The runner that set the marker has exited; its detached descendant's hook runs.
+touch "$TEST_ROOT/detached.release"
+wait_for_file "$TEST_ROOT/detached-hook.json" "the detached descendant did not trigger its hook"
+jq -e '.matched == 1 and (.suppressed | not)' "$TEST_ROOT/detached-hook.json" >/dev/null \
+  || fail "a detached descendant of a finished runner still suppressed hooks: $(cat "$TEST_ROOT/detached-hook.json")"
+"$RUNNER" status | jq -e '.ok' >/dev/null
+"$RUNNER" activate ending manual | jq -e '.ok and .state == "activated"' >/dev/null
+touch "$TEST_ROOT/error-after-reload"
+rm -f "$TEST_ROOT/reloaded"
+result=$("$RUNNER" disconnect || true)
+rm -f "$TEST_ROOT/error-after-reload" "$TEST_ROOT/reloaded"
+jq -e '.ok == false and .deactivated == ["ending"]' <<<"$result" >/dev/null \
+  || fail "a failed disconnect omitted the routines it ended: $result"
+"$RUNNER" status | jq -e '.connected' >/dev/null || fail "the failed disconnect was not rolled back"
+"$RUNNER" disconnect | jq -e '.ok' >/dev/null
+pass "bulk cleanup ordering, failure reporting and hook suppression"
 
 printf 'Runner lifecycle tests passed.\n'

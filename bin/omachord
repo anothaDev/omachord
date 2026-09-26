@@ -71,9 +71,17 @@ default_config() {
   printf '%s\n' '{"version":1,"routines":[]}'
 }
 
+# Once a bulk operation has ended routines, every later failure also reports
+# the ids it ended (`deactivated`): ending a routine is not rolled back.
+REPORT_DEACTIVATED=0
 json_error() {
   local message=$1
   local code=${2:-error}
+  if ((REPORT_DEACTIVATED)); then
+    jq -cn --arg error "$message" --arg code "$code" --argjson deactivated "${DEACTIVATED_IDS:-[]}" \
+      '{ok:false,code:$code,error:$error,deactivated:$deactivated}'
+    return
+  fi
   jq -cn --arg error "$message" --arg code "$code" '{ok:false,code:$code,error:$error}'
 }
 
@@ -632,6 +640,22 @@ acquire_config_lock() {
     flock -x -w "$LOCK_TIMEOUT" 9 || { exec 9>&-; LAST_ERROR="Timed out locking configuration state"; return 1; }
   fi
   if ! private_fd_matches_file 9 "$LOCK_FILE"; then exec 9>&-; return 1; fi
+}
+
+# A routine command holds the shared config lock (fd 9) only while it resolves
+# its definition from the committed snapshot and, for a stateful activation,
+# until its activation record is claimed (so a bulk writer always sees it).
+# After that the routine lock (fd 7) alone serializes it with writers: config
+# apply and disconnect wait for fd 7 before ending a routine, and every
+# checkpoint write happens under fd 7. Long actions therefore no longer make
+# config apply/connect/disconnect time out on the config lock. A routine
+# records against the end-plan digest it resolved, even if the committed
+# definition changes while it runs.
+CONFIG_LOCK_RELEASABLE=0
+release_config_lock_for_actions() {
+  ((CONFIG_LOCK_RELEASABLE)) || return 0
+  CONFIG_LOCK_RELEASABLE=0
+  exec 9>&-
 }
 
 acquire_log_lock() {
@@ -1944,17 +1968,12 @@ command_config_apply() {
 
   if ! active_end_plans_match "$candidate" 1; then
     rm -f -- "$candidate" "$candidate_lua"
-    fail "$LAST_ERROR" active-plan-conflict
+    fail "$LAST_ERROR" "$ACTIVE_PLAN_ERROR_CODE"
   fi
 
-  begin_bulk_cleanup
-  if ! deactivate_orphans config "$candidate"; then
-    end_bulk_cleanup
-    rm -f -- "$candidate" "$candidate_lua"
-    fail "$LAST_ERROR" action-failed
-  fi
-  end_bulk_cleanup
-
+  # Every check that can fail without side effects (snapshots, concurrent-
+  # edit fingerprints) runs before orphaned routines are ended, because
+  # ending a routine runs its restore/end actions and cannot be rolled back.
   if ! snapshot_begin \
     || ! snapshot_file "$CONFIG_FILE" config \
     || ! snapshot_file "$COMMIT_FILE" commit; then
@@ -1979,6 +1998,17 @@ command_config_apply() {
     rm -f -- "$candidate" "$candidate_lua"
     fail "$LAST_ERROR" snapshot-failed
   fi
+
+  begin_bulk_cleanup
+  if ! deactivate_orphans config "$candidate"; then
+    end_bulk_cleanup
+    REPORT_DEACTIVATED=1
+    snapshot_end
+    rm -f -- "$candidate" "$candidate_lua"
+    fail "$LAST_ERROR" "$DEACTIVATION_ERROR_CODE"
+  fi
+  end_bulk_cleanup
+  REPORT_DEACTIVATED=1
   transaction_arm "$([[ $update_generated == true ]] && printf 1 || printf 0)"
 
   mutation_error=""
@@ -2095,7 +2125,7 @@ connect_locked() {
   fi
   if ! active_end_plans_match "$candidate"; then
     rm -f -- "$candidate"
-    fail "$LAST_ERROR" active-plan-conflict
+    fail "$LAST_ERROR" "$ACTIVE_PLAN_ERROR_CODE"
   fi
   if [[ $already_connected == true ]]; then
     rm -f -- "$candidate"
@@ -2216,9 +2246,11 @@ command_disconnect() {
     begin_bulk_cleanup
     if ! deactivate_all disconnect; then
       end_bulk_cleanup
-      fail "$LAST_ERROR" action-failed
+      REPORT_DEACTIVATED=1
+      fail "$LAST_ERROR" "$DEACTIVATION_ERROR_CODE"
     fi
     end_bulk_cleanup
+    REPORT_DEACTIVATED=1
     write_connection_disabled || fail "$LAST_ERROR" unsafe-state
     jq -cn --argjson deactivated "$DEACTIVATED_IDS" \
       '{ok:true,connected:false,alreadyDisconnected:true,deactivated:$deactivated}'
@@ -2227,12 +2259,8 @@ command_disconnect() {
   if ! owned_connection; then
     fail "The Hyprland loader is not owned by this installation; it was left untouched" ownership-conflict
   fi
-  begin_bulk_cleanup
-  if ! deactivate_all disconnect; then
-    end_bulk_cleanup
-    fail "$LAST_ERROR" action-failed
-  fi
-  end_bulk_cleanup
+  # Snapshot and back up first: ending routines is irreversible, so it runs
+  # only after every check that can fail without side effects.
   if ! snapshot_begin || ! snapshot_owned_files 0 1; then
     snapshot_end
     fail "$LAST_ERROR" snapshot-failed
@@ -2241,6 +2269,15 @@ command_disconnect() {
     snapshot_end
     fail "$LAST_ERROR" backup-failed
   fi
+  begin_bulk_cleanup
+  if ! deactivate_all disconnect; then
+    end_bulk_cleanup
+    REPORT_DEACTIVATED=1
+    snapshot_end
+    fail "$LAST_ERROR" "$DEACTIVATION_ERROR_CODE"
+  fi
+  end_bulk_cleanup
+  REPORT_DEACTIVATED=1
   transaction_arm 1
 
   if ! remove_loader \
@@ -3183,8 +3220,10 @@ snapshot_end_plan_matches() {
 # Called under the exclusive config lock, before committing any configuration.
 # Apply may end removed/disabled/stateless routines using the old committed
 # config. Connect cannot do that after a direct edit, so it rejects the conflict.
+ACTIVE_PLAN_ERROR_CODE=active-plan-conflict
 active_end_plans_match() {
   local config_file=$1 allow_orphans=${2:-0} routine_id routine state active_ids
+  ACTIVE_PLAN_ERROR_CODE=active-plan-conflict
   if ! active_ids=$(active_routine_ids); then
     LAST_ERROR="Could not inspect active end plans"
     return 1
@@ -3193,6 +3232,19 @@ active_end_plans_match() {
     [[ -n $routine_id ]] || continue
     state=0
     read_snapshot "$routine_id" || state=$?
+    if ((state == 2)); then
+      # A still-running routine may be replacing its checkpoint right now.
+      # Every checkpoint writer holds the routine lock, so re-read under it.
+      local ROUTINE_LOCK_WAIT=1
+      if ! lock_routine "$routine_id"; then
+        [[ $LOCK_ERROR_CODE != routine-running ]] || ACTIVE_PLAN_ERROR_CODE=routine-running
+        return 1
+      fi
+      state=0
+      read_snapshot "$routine_id" || state=$?
+      exec 7>&-
+      ROUTINE_LOCK_WAIT=0
+    fi
     ((state != 2)) || return 1
     ((state == 0)) || continue
     if ! routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file"); then
@@ -3224,7 +3276,10 @@ RESOLVED_ROUTINE=""
 resolve_routine() {
   local routine_id=$1 allow_disabled=${2:-0} expected_revision=${3:-} config_file enabled current_revision
   RESOLVED_ROUTINE=""
-  config_file=$(mktemp)
+  config_file=$(mktemp) || {
+    json_error "Could not stage the routine configuration" unsafe-state
+    return 1
+  }
   if ! load_committed_config "$config_file"; then
     rm -f -- "$config_file"
     json_error "$LAST_ERROR" "$CONFIG_LOAD_ERROR_CODE"
@@ -3257,6 +3312,9 @@ resolve_routine() {
 }
 
 LOCK_ERROR_CODE=""
+# Callers that must serialize with a running routine (bulk cleanup under the
+# exclusive config lock) set ROUTINE_LOCK_WAIT=1 as a local to wait for it.
+ROUTINE_LOCK_WAIT=0
 lock_routine() {
   local routine_id=$1
   LOCK_ERROR_CODE=lock-error
@@ -3267,7 +3325,14 @@ lock_routine() {
     exec 7>&-
     return 1
   fi
-  if ! flock -n 7; then
+  if ((ROUTINE_LOCK_WAIT)); then
+    if ! flock -x -w "$LOCK_TIMEOUT" 7; then
+      exec 7>&-
+      LAST_ERROR="Routine is still running: $routine_id; retry when it finishes"
+      LOCK_ERROR_CODE=routine-running
+      return 1
+    fi
+  elif ! flock -n 7; then
     exec 7>&-
     LAST_ERROR="Routine is already running: $routine_id"
     LOCK_ERROR_CODE=busy
@@ -3417,6 +3482,8 @@ run_resolved_routine() {
     json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
     return 1
   fi
+  # A stateless run leaves no record a writer must see; fd 7 suffices now.
+  release_config_lock_for_actions
   arm_routine_traps
   if ! prepare_routine_brightness "$routine"; then
     reject_unavailable_brightness "$routine_id" "$trigger"
@@ -3526,6 +3593,8 @@ activate_resolved_routine() {
     json_error "$LAST_ERROR" "$ACTIVATION_ERROR_CODE"
     return 1
   fi
+  # The claimed record is visible to bulk writers, which wait for fd 7.
+  release_config_lock_for_actions
 
   while IFS= read -r entry; do
     if ! snapshot_still_owned "$routine_id"; then status="failed"; error=$LAST_ERROR; break; fi
@@ -3690,8 +3759,8 @@ deactivate_routine() {
   end_action_index=$(jq -r '.endActionIndex // 0' <<<"$snapshot")
 
   if [[ $on_end_mode == actions ]]; then
-    config_file=$(mktemp)
-    if load_committed_config "$config_file"; then
+    config_file=$(mktemp) || { config_file=""; LAST_ERROR="Could not stage the committed configuration"; }
+    if [[ -n $config_file ]] && load_committed_config "$config_file"; then
       routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
       if [[ -z $routine ]]; then
         status="failed"
@@ -3712,6 +3781,8 @@ deactivate_routine() {
     fi
     rm -f -- "$config_file"
   fi
+  # The ending plan is resolved; the routine lock alone serializes the rest.
+  release_config_lock_for_actions
 
   RESTORED_COUNT=0
   SKIPPED_COUNT=0
@@ -3815,43 +3886,53 @@ toggle_resolved_routine() {
 
 # Ends active routines that the given configuration no longer supports.
 DEACTIVATED_IDS="[]"
+DEACTIVATION_ERROR_CODE=action-failed
+
+# Bulk writers hold the exclusive config lock, but a routine that is still
+# activating or ending holds only its routine lock (fd 7). Wait for that lock
+# (bounded by LOCK_TIMEOUT) so a bulk end never races a running routine; a
+# routine still busy after the wait is reported as retryable routine-running.
+deactivate_listed_routine() {
+  local routine_id=$1 reason=$2 result error code
+  local ROUTINE_LOCK_WAIT=1
+  result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
+  if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
+    error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
+    code=$(jq -r '.code // empty' "$result" 2>/dev/null || true)
+    rm -f -- "$result"
+    [[ -z $error ]] || LAST_ERROR=$error
+    [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
+    [[ $code != routine-running ]] || DEACTIVATION_ERROR_CODE=routine-running
+    return 1
+  fi
+  # A routine that finished ending while we waited was not ended by us.
+  if ! jq -e '.alreadyInactive == true' "$result" >/dev/null 2>&1; then
+    DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+  fi
+  rm -f -- "$result"
+}
+
 deactivate_orphans() {
-  local reason=$1 config_file=$2 routine_id routine result error
+  local reason=$1 config_file=$2 routine_id routine
   DEACTIVATED_IDS="[]"
+  DEACTIVATION_ERROR_CODE=action-failed
   while IFS= read -r routine_id; do
     [[ -n $routine_id ]] || continue
     routine=$(jq -c --arg id "$routine_id" '.routines[] | select(.id == $id)' "$config_file" | head -n 1)
     if [[ -z $routine ]] || [[ $(jq -r '.enabled' <<<"$routine") != true ]] \
       || ! routine_is_stateful "$routine"; then
-      result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
-      if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
-        error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
-        rm -f -- "$result"
-        [[ -z $error ]] || LAST_ERROR=$error
-        [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
-        return 1
-      fi
-      rm -f -- "$result"
-      DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+      deactivate_listed_routine "$routine_id" "$reason" || return 1
     fi
   done < <(active_routine_ids)
 }
 
 deactivate_all() {
-  local reason=$1 routine_id result error
+  local reason=$1 routine_id
   DEACTIVATED_IDS="[]"
+  DEACTIVATION_ERROR_CODE=action-failed
   while IFS= read -r routine_id; do
     [[ -n $routine_id ]] || continue
-    result=$(mktemp) || { LAST_ERROR="Could not capture deactivation result"; return 1; }
-    if ! deactivate_routine "$routine_id" "$reason" >"$result"; then
-      error=$(jq -r '.error // empty' "$result" 2>/dev/null || true)
-      rm -f -- "$result"
-      [[ -z $error ]] || LAST_ERROR=$error
-      [[ -n $LAST_ERROR ]] || LAST_ERROR="Could not deactivate routine: $routine_id"
-      return 1
-    fi
-    rm -f -- "$result"
-    DEACTIVATED_IDS=$(jq -c --arg id "$routine_id" '. + [$id]' <<<"$DEACTIVATED_IDS")
+    deactivate_listed_routine "$routine_id" "$reason" || return 1
   done < <(active_routine_ids)
 }
 
@@ -3866,6 +3947,7 @@ command_run() {
     *) fail "Unknown run source: $trigger" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   if [[ $trigger == shortcut ]]; then
     automatic_integration_enabled || fail "$LAST_ERROR" not-connected
   fi
@@ -3890,6 +3972,7 @@ command_activate() {
     fail "A supplied activation revision must not be empty" usage
   fi
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   if [[ $trigger == condition || $trigger == service ]]; then
     [[ $expected_revision =~ ^sha256:[0-9a-f]{64}$ ]] \
       || fail "A service transition requires a valid configuration revision" stale-config
@@ -3921,6 +4004,7 @@ command_deactivate() {
     *) fail "Unknown deactivation source: $reason" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   if [[ $reason == condition || $reason == service || $reason == timer ]]; then
     service_revision_matches "$expected_revision" || fail "$LAST_ERROR" stale-config
   elif [[ -n $expected_revision ]]; then
@@ -3946,6 +4030,7 @@ command_recovery() {
     *) fail "Usage: omachord recovery <inspect|restore|bind-brightness>" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
+  CONFIG_LOCK_RELEASABLE=1
   lock_routine "$routine_id" || fail "$LAST_ERROR" "$LOCK_ERROR_CODE"
   read_snapshot "$routine_id" || state=$?
   if ((state != 0)); then
@@ -4081,6 +4166,9 @@ command_trigger_hook() {
   # conditions, its keep-until timer, or an explicit deactivation.
   for candidate in "${routine_ids[@]}"; do
     ((matched += 1))
+    # Earlier routines resolve and claim under the shared lock; only the last
+    # one may release it before its actions (see release_config_lock_for_actions).
+    ((matched < ${#routine_ids[@]})) || CONFIG_LOCK_RELEASABLE=1
     if ! activate_routine "$candidate" "hook:$event" 0 >/dev/null; then
       ((failures += 1))
     fi
@@ -4464,9 +4552,9 @@ sanitize_environment() {
 # own end actions trigger. The marker names the live runner that set it, so a
 # descendant detached from a finished runner never suppresses hooks forever.
 begin_bulk_cleanup() {
-  local start
-  start=$(process_start_time "$BASHPID") || start=""
-  export OMACHORD_BULK_CLEANUP="$BASHPID:$start"
+  local pid=$BASHPID start
+  start=$(process_start_time "$pid") || start=""
+  export OMACHORD_BULK_CLEANUP="$pid:$start"
 }
 
 end_bulk_cleanup() {
