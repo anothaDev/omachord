@@ -256,7 +256,8 @@ function reconcileJobs(transitions, currentJob, revision, failures, nowMs, retry
     if (currentJob && String(currentJob.id) === id && String(currentJob.op) === op) continue
     var failure = mapValue(failures, id)
     if (failure && String(failure.op) === op && String(failure.revision) === String(revision)
-        && nowMs - Number(failure.at) < retryMs) continue
+        && ((op === "activate" && failure.blocked === true)
+          || nowMs - Number(failure.at) < retryMs)) continue
     if (!jobs[id]) order.push(id)
     jobs[id] = {
       id: id,
@@ -389,11 +390,13 @@ function describeFailure(failure, retryMs) {
   if (!failure || typeof failure !== "object") return null
   var at = Number(failure.at)
   if (isNaN(at)) return null
+  var blocked = failure.op === "activate" && failure.blocked === true
   return {
     op: String(failure.op || ""),
     at: at,
     error: failure.error === undefined || failure.error === null ? "" : String(failure.error),
-    retryAt: at + (isNaN(Number(retryMs)) ? 0 : Number(retryMs))
+    blocked: blocked,
+    retryAt: blocked ? null : at + (isNaN(Number(retryMs)) ? 0 : Number(retryMs))
   }
 }
 

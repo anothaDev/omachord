@@ -2555,6 +2555,9 @@ execute_action() {
   case $type in
     nightlight|dnd|stay-awake|theme|brightness)
       setter_value=$(setter_value_from_action "$action")
+      if [[ $type == brightness ]]; then
+        setter_value=$(brightness_requested_value "$setter_value") || { rm -f -- "$output"; return 1; }
+      fi
       if ! write_setter "$type" "$setter_value"; then rm -f -- "$output"; return 1; fi
       ;;
     microphone-toggle)
@@ -2666,8 +2669,80 @@ theme_slug_from_name() {
 # (true|false, a theme slug, or an integer percentage). Fails closed on any
 # unexpected output so activation never records a value it cannot restore.
 SETTER_VALUE=""
+BRIGHTNESS_TARGET=""
+BRIGHTNESS_RESOLVED_TARGET=""
+
+# Pin compositor identity, not the focus at each invocation. This detects
+# observable hotplug/replacement; it cannot make external hardware calls atomic.
+resolve_brightness_target() {
+  local name=${1:-} raw selected identity
+  BRIGHTNESS_RESOLVED_TARGET=""
+  if ! raw=$(control_capture hyprctl monitors -j 2>/dev/null) \
+    || ! selected=$(jq -ecs --arg name "$name" '
+      select(length == 1) | .[0] | select(type == "array")
+      | [.[] | select(type == "object")
+          | select(if $name == "" then .focused == true else .name == $name end)]
+      | select(length == 1) | .[0]
+      | select((has("disabled") | not) or .disabled == false)
+      | select((has("dpmsStatus") | not) or .dpmsStatus == true)
+      | {name,make:(.make // ""),model:(.model // ""),serial:(.serial // "")}
+      | select(.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+          and . != "FALLBACK" and (startswith("HEADLESS") | not))
+      | select(all(.[]; type == "string" and length <= 256 and all(explode[]; . >= 32 and . != 127)))
+      ' <<<"$raw" 2>/dev/null); then
+    LAST_ERROR="The selected display is disconnected, asleep, or unavailable"
+    return 1
+  fi
+  # Omarchy's Apple HID helper picks a device globally, ignoring --monitor.
+  # Do not claim target-safe automation when that mapping is unavailable.
+  if jq -e '.make == "Apple Computer Inc" and (.model | test("StudioDisplay|ProDisplayXDR|Studio XDR"))' \
+    <<<"$selected" >/dev/null; then
+    LAST_ERROR="The Apple brightness helper cannot bind control to this display"
+    return 1
+  fi
+  identity=$(jq -cS . <<<"$selected" | sha256sum | awk '{print $1}') || return 1
+  name=$(brightness_target_name "$selected") || return 1
+  BRIGHTNESS_RESOLVED_TARGET=$(jq -cn --arg name "$name" \
+    --arg identity "sha256:$identity" '{name:$name,identity:$identity}')
+}
+
+brightness_target_name() {
+  local name
+  if ! name=$(jq -er '.name | select(type == "string")' <<<"$1") \
+    || [[ ! $name =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$ || $name == FALLBACK || $name == HEADLESS* ]]; then
+    LAST_ERROR="Could not identify the recorded brightness display"
+    return 1
+  fi
+  printf '%s\n' "$name"
+}
+
+verify_brightness_target() {
+  local name
+  if [[ -z $BRIGHTNESS_TARGET ]]; then
+    LAST_ERROR="Brightness recovery has no recorded display; inspect recovery and bind its display explicitly"
+    return 1
+  fi
+  name=$(brightness_target_name "$BRIGHTNESS_TARGET") || return 1
+  resolve_brightness_target "$name" || return 1
+  if ! jq -en --argjson expected "$BRIGHTNESS_TARGET" --argjson actual "$BRIGHTNESS_RESOLVED_TARGET" \
+    '$expected == $actual' >/dev/null; then
+    LAST_ERROR="The recorded brightness display was replaced; recovery is retained"
+    return 1
+  fi
+}
+
+brightness_requested_value() {
+  local value=$1 name
+  name=$(brightness_target_name "$BRIGHTNESS_TARGET") || return 1
+  # Omarchy's external DDC backend clamps absolute requests to 1..100.
+  # Record that effective request, not an unachievable zero. Backlights may
+  # support true zero. Other rounding is detected by post-write confirmation.
+  if [[ $value == 0 && ! $name =~ ^(eDP|LVDS|DSI)- ]]; then value=1; fi
+  printf '%s\n' "$value"
+}
+
 read_setter() {
-  local type=$1 raw value
+  local type=$1 raw value name
   SETTER_VALUE=""
   case $type in
     nightlight)
@@ -2701,14 +2776,17 @@ read_setter() {
       fi
       ;;
     brightness)
-      raw=$(control_capture omarchy-brightness-display --no-osd 2>/dev/null) \
-        || { LAST_ERROR="Could not read the display brightness"; return 1; }
+      verify_brightness_target || return 1
+      name=$(brightness_target_name "$BRIGHTNESS_TARGET") || return 1
+      raw=$(control_capture omarchy-brightness-display --no-osd --monitor "$name" 2>/dev/null) \
+        || { LAST_ERROR="Could not read brightness for $name; the display may not support software brightness control or may be temporarily unavailable"; return 1; }
       value=$(trim "$raw")
       if [[ ! $value =~ ^[0-9]{1,3}$ ]] || ((10#$value > 100)); then
         LAST_ERROR="Unexpected display brightness: ${raw:0:100}"
         return 1
       fi
       value=$((10#$value))
+      verify_brightness_target || return 1
       ;;
     *)
       LAST_ERROR="Unknown setter type: $type"
@@ -2719,7 +2797,7 @@ read_setter() {
 }
 
 write_setter() {
-  local type=$1 value=$2 output
+  local type=$1 value=$2 output name
   local -a command=()
   case $type in
     nightlight)
@@ -2737,7 +2815,9 @@ write_setter() {
       command=(omarchy-theme-set "$value")
       ;;
     brightness)
-      command=(omarchy-brightness-display --no-osd "${value}%")
+      verify_brightness_target || return 1
+      name=$(brightness_target_name "$BRIGHTNESS_TARGET") || return 1
+      command=(omarchy-brightness-display --no-osd --monitor "$name" "${value}%")
       ;;
     *)
       LAST_ERROR="Unknown setter type: $type"
@@ -2750,6 +2830,41 @@ write_setter() {
     return 1
   fi
   rm -f -- "$output"
+  if [[ $type == brightness ]]; then
+    read_setter brightness || return 1
+    if [[ $SETTER_VALUE != "$value" ]]; then
+      LAST_ERROR="Brightness write was not confirmed on $name (requested $value, observed $SETTER_VALUE); it may be busy or unsupported"
+      return 1
+    fi
+  fi
+}
+
+# A declared brightness action is a capability requirement for the whole
+# routine, not an instruction to silently skip that action on an unsupported
+# display. Preflight before ANY effect (including non-restoring setters).
+prepare_routine_brightness() {
+  local required
+  BRIGHTNESS_TARGET=""
+  required=$(jq -er 'any((.actions + (if .onEnd.mode == "actions" then .onEnd.actions else [] end))[]; .type == "brightness") | tostring' <<<"$1") \
+    || { LAST_ERROR="Could not inspect the routine brightness requirements"; return 1; }
+  if [[ $required == true ]]; then
+    resolve_brightness_target || return 1
+    BRIGHTNESS_TARGET=$BRIGHTNESS_RESOLVED_TARGET
+    read_setter brightness || return 1
+  fi
+}
+
+reject_unavailable_brightness() {
+  local routine_id=$1 trigger=$2 error
+  error="Brightness control is unavailable for this display; the routine did not start. ${LAST_ERROR}"
+  if ! log_run "$routine_id" "$trigger" failed 0 "$error"; then
+    unlock_routine
+    json_error "$LAST_ERROR" unsafe-state
+    return 1
+  fi
+  unlock_routine
+  json_error "$error" brightness-unavailable
+  return 1
 }
 
 snapshot_path() {
@@ -2796,11 +2911,33 @@ read_snapshot() {
     return 2
   fi
   SNAPSHOT_READ_FINGERPRINT=$CONFIG_SNAPSHOT_FINGERPRINT
+  if ! SNAPSHOT_JSON=$(validate_snapshot_content "$routine_id" <"$temporary"); then
+    rm -f -- "$temporary"
+    SNAPSHOT_JSON=""
+    LAST_ERROR="Activation snapshot is invalid: $path"
+    return 2
+  fi
+  rm -f -- "$temporary"
+  if jq -e '(.keepUntil | type) == "object"' <<<"$SNAPSHOT_JSON" >/dev/null \
+    && ! date -d "$(jq -r '.expiresAt' <<<"$SNAPSHOT_JSON")" +%s >/dev/null 2>&1; then
+    SNAPSHOT_JSON=""
+    LAST_ERROR="Activation snapshot has an invalid expiry: $path"
+    return 2
+  fi
+}
+
+validate_snapshot_content() {
+  local routine_id=$1 filter
   read -r -d '' filter <<'JQ' || true
+def target_valid:
+  type == "object" and keys == ["identity","name"]
+  and (.name | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$") and . != "FALLBACK" and (startswith("HEADLESS") | not))
+  and (.identity | type == "string" and test("^sha256:[0-9a-f]{64}$"));
 type == "object"
-  and (.version == 1 or (.version == 2
+  and (.version == 1 or ((.version == 2 or .version == 3)
        and (.endPlanDigest | type == "string" and test("^sha256:[0-9a-f]{64}$"))))
   and .routineId == $id
+  and (if has("brightnessTarget") then .brightnessTarget | target_valid else true end)
   and (.activatedAt | type == "string")
   and (.trigger | type == "string")
   and ((.keepUntil == "conditions" and .expiresAt == null)
@@ -2827,26 +2964,20 @@ type == "object"
         else
           (.before | type == "number" and floor == . and . >= 0 and . <= 100)
             and (.applied | type == "number" and floor == . and . >= 0 and . <= 100)
+            and (if has("target") then
+              (.target | target_valid)
+              and (.confirmed | type == "boolean")
+            else (has("confirmed") | not) end)
+            and (if has("restoreState") then .restoreState | . == "pending" or . == "done" or . == "skipped" else true end)
         end))
+  and (if .version == 3 then all(.setters[]; .type != "brightness" or has("target")) else true end)
   and (.claims == null or ([.setters[].type] - .claims | length) == 0)
 JQ
-  if ! SNAPSHOT_JSON=$(jq -ecs --arg id "$routine_id" "select(length == 1) | .[0] | select($filter)" "$temporary" 2>/dev/null); then
-    rm -f -- "$temporary"
-    SNAPSHOT_JSON=""
-    LAST_ERROR="Activation snapshot is invalid: $path"
-    return 2
-  fi
-  rm -f -- "$temporary"
-  if jq -e '(.keepUntil | type) == "object"' <<<"$SNAPSHOT_JSON" >/dev/null \
-    && ! date -d "$(jq -r '.expiresAt' <<<"$SNAPSHOT_JSON")" +%s >/dev/null 2>&1; then
-    SNAPSHOT_JSON=""
-    LAST_ERROR="Activation snapshot has an invalid expiry: $path"
-    return 2
-  fi
+  jq -ecs --arg id "$routine_id" "select(length == 1) | .[0] | select($filter)" 2>/dev/null
 }
 
 write_snapshot() {
-  local routine_id=$1 content=$2 temporary
+  local routine_id=$1 content=$2 temporary fingerprint
   temporary=$(mktemp) || {
     LAST_ERROR="Could not stage the activation snapshot"
     return 1
@@ -2856,18 +2987,30 @@ write_snapshot() {
     LAST_ERROR="Could not stage the activation snapshot"
     return 1
   fi
-  if ! write_atomic "$temporary" "$(snapshot_path "$routine_id")" 600; then
+  fingerprint=$(config_file_fingerprint "$temporary") || { rm -f -- "$temporary"; return 1; }
+  if [[ -z ${SNAPSHOT_EXPECTED:-} ]] \
+    || ! atomic_replace_if_fingerprint "$temporary" "$(snapshot_path "$routine_id")" "$SNAPSHOT_EXPECTED" 600; then
     rm -f -- "$temporary"
     LAST_ERROR="Could not write the activation snapshot"
     return 1
   fi
+  SNAPSHOT_EXPECTED=$fingerprint
   rm -f -- "$temporary"
+}
+
+snapshot_still_owned() {
+  local actual
+  actual=$(config_file_fingerprint "$(snapshot_path "$1")") || return 1
+  if [[ -z ${SNAPSHOT_EXPECTED:-} || $actual != "$SNAPSHOT_EXPECTED" ]]; then
+    LAST_ERROR="Activation snapshot changed concurrently; recovery is retained without further effects"
+    return 1
+  fi
 }
 
 remove_snapshot() {
   local path
   path=$(snapshot_path "$1")
-  if ! remove_file_atomic "$path"; then
+  if [[ -z ${SNAPSHOT_EXPECTED:-} ]] || ! atomic_remove_if_fingerprint "$path" "$SNAPSHOT_EXPECTED"; then
     LAST_ERROR="Could not remove the completed activation snapshot: $path"
     return 1
   fi
@@ -3077,34 +3220,104 @@ export_trigger_context() {
 RESTORED_COUNT=0
 SKIPPED_COUNT=0
 RESTORE_ERROR=""
+RESTORE_SNAPSHOT=""
+
+checkpoint_brightness_restore() {
+  local routine_id=$1 slot=$2 state=$3 next
+  # Once a manual override is detected, do not resume older writes for this
+  # target, including on a later retry caused by a different failing setter.
+  next=$(jq -c --argjson slot "$slot" --arg state "$state" '
+    if $state == "skipped" then
+      .setters[$slot].target as $target
+      | .setters |= map(if .type == "brightness" and .target == $target and .restoreState != "done"
+          then .restoreState = "skipped" else . end)
+    else .setters[$slot].restoreState = $state end' <<<"$RESTORE_SNAPSHOT") || return 1
+  write_snapshot "$routine_id" "$next" || return 1
+  RESTORE_SNAPSHOT=$next
+}
+
 restore_from_snapshot() {
-  local snapshot=$1 entry type before applied entries
+  local snapshot=$1 entry type before applied entries slot progress key routine_id
+  local BRIGHTNESS_TARGET=""
+  local -A brightness_stopped=()
+  RESTORE_SNAPSHOT=$snapshot
   RESTORED_COUNT=0
   SKIPPED_COUNT=0
   RESTORE_ERROR=""
-  if ! entries=$(jq -c '.setters | map(select(.restore == true)) | reverse | .[]' <<<"$snapshot"); then
+  if ! routine_id=$(jq -er .routineId <<<"$snapshot") \
+    || ! snapshot_still_owned "$routine_id"; then
+    RESTORE_ERROR=${LAST_ERROR:-"Could not identify the recovery record"}
+    return 0
+  fi
+  if ! entries=$(jq -c '.setters | to_entries | map(select(.value.restore == true)) | reverse | .[]' <<<"$snapshot"); then
     RESTORE_ERROR="Could not read the recorded setters"
     return 0
   fi
   while IFS= read -r entry; do
     [[ -n $entry ]] || continue
-    if ! type=$(jq -r '.type' <<<"$entry") \
+    if ! slot=$(jq -r '.key' <<<"$entry") \
+      || ! entry=$(jq -c '.value' <<<"$entry") \
+      || ! type=$(jq -r '.type' <<<"$entry") \
       || ! before=$(jq -r 'if (.before | type) == "number" then (.before | floor | tostring) else (.before | tostring) end' <<<"$entry") \
       || ! applied=$(jq -r 'if (.applied | type) == "number" then (.applied | floor | tostring) else (.applied | tostring) end' <<<"$entry"); then
       [[ -n $RESTORE_ERROR ]] || RESTORE_ERROR="Could not read a recorded setter"
       continue
     fi
+    if [[ $type == brightness ]]; then
+      if ! BRIGHTNESS_TARGET=$(jq -c '.target // empty' <<<"$entry") \
+        || ! progress=$(jq -r '.restoreState // ""' <<<"$entry"); then
+        RESTORE_ERROR="Could not read brightness recovery progress"
+        break
+      fi
+      key=${BRIGHTNESS_TARGET:-legacy}
+      [[ -z ${brightness_stopped[$key]:-} ]] || continue
+      if [[ $progress == done || $progress == skipped ]]; then
+        SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+        continue
+      fi
+    fi
+    if ! snapshot_still_owned "$routine_id"; then RESTORE_ERROR=$LAST_ERROR; break; fi
     if ! read_setter "$type"; then
       [[ -n $RESTORE_ERROR ]] || RESTORE_ERROR=$LAST_ERROR
+      [[ $type != brightness ]] || brightness_stopped[$key]=1
+      continue
+    fi
+    if [[ $type == brightness && $progress == pending && $SETTER_VALUE == "$before" ]]; then
+      if ! checkpoint_brightness_restore "$routine_id" "$slot" done; then RESTORE_ERROR=$LAST_ERROR; break; fi
+      RESTORED_COUNT=$((RESTORED_COUNT + 1))
       continue
     fi
     if [[ $SETTER_VALUE != "$applied" ]]; then
+      # An interrupted/unconfirmed write has no reliable applied receipt. Do
+      # not mistake an unexplained intermediate value for a manual override
+      # and silently discard the only record of its original value.
+      if [[ $type == brightness && ( $progress == pending || $(jq -r '.confirmed // false' <<<"$entry") != true ) && $SETTER_VALUE != "$before" ]]; then
+        [[ -n $RESTORE_ERROR ]] || RESTORE_ERROR="Brightness write was not confirmed; inspect the retained recovery record before changing the display"
+        brightness_stopped[$key]=1
+        continue
+      fi
+      if [[ $type == brightness ]]; then
+        if [[ $(jq -r '.confirmed // false' <<<"$entry") != true && $SETTER_VALUE == "$before" ]]; then
+          if ! checkpoint_brightness_restore "$routine_id" "$slot" done; then RESTORE_ERROR=$LAST_ERROR; break; fi
+        else
+          if ! checkpoint_brightness_restore "$routine_id" "$slot" skipped; then RESTORE_ERROR=$LAST_ERROR; break; fi
+          brightness_stopped[$key]=1
+        fi
+      fi
       SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
       continue
     fi
+    if [[ $type == brightness ]]; then
+      if ! checkpoint_brightness_restore "$routine_id" "$slot" pending; then RESTORE_ERROR=$LAST_ERROR; break; fi
+    fi
+    if ! snapshot_still_owned "$routine_id"; then RESTORE_ERROR=$LAST_ERROR; break; fi
     if ! write_setter "$type" "$before"; then
       [[ -n $RESTORE_ERROR ]] || RESTORE_ERROR=$LAST_ERROR
+      [[ $type != brightness ]] || brightness_stopped[$key]=1
       continue
+    fi
+    if [[ $type == brightness ]]; then
+      if ! checkpoint_brightness_restore "$routine_id" "$slot" done; then RESTORE_ERROR=$LAST_ERROR; break; fi
     fi
     RESTORED_COUNT=$((RESTORED_COUNT + 1))
   done <<<"$entries"
@@ -3112,12 +3325,17 @@ restore_from_snapshot() {
 
 run_resolved_routine() {
   local routine=$1 routine_id=$2 trigger=$3
+  local BRIGHTNESS_TARGET=""
   local action start end duration status="success" error=""
   if ! lock_routine "$routine_id"; then
     json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
     return 1
   fi
   arm_routine_traps
+  if ! prepare_routine_brightness "$routine"; then
+    reject_unavailable_brightness "$routine_id" "$trigger"
+    return 1
+  fi
   start=$(date +%s%3N)
   export_trigger_context "$trigger" run
   while IFS= read -r action; do
@@ -3154,6 +3372,8 @@ run_routine() {
 # interrupted activation always leaves a restorable record.
 activate_resolved_routine() {
   local routine=$1 routine_id=$2 trigger=$3 already_locked=${4:-0}
+  local BRIGHTNESS_TARGET=""
+  local SNAPSHOT_EXPECTED="missing"
   local snapshot_state=0 snapshot next_snapshot claims keep_until on_end_mode end_plan minutes expires_at="" now
   local entry index action type value restore start end duration status="activated" error=""
   if ((!already_locked)) && ! lock_routine "$routine_id"; then
@@ -3173,6 +3393,10 @@ activate_resolved_routine() {
     return 0
   fi
   arm_routine_traps
+  if ! prepare_routine_brightness "$routine"; then
+    reject_unavailable_brightness "$routine_id" "$trigger"
+    return 1
+  fi
   start=$(date +%s%3N)
   export_trigger_context "$trigger" activate
 
@@ -3203,7 +3427,9 @@ activate_resolved_routine() {
     --arg onEndMode "$on_end_mode" \
     --arg endPlanDigest "$end_plan" \
     --argjson claims "$claims" \
-    '{version:2,routineId:$routineId,activatedAt:$activatedAt,trigger:$trigger,keepUntil:$keepUntil,expiresAt:(if $expiresAt == "" then null else $expiresAt end),onEndMode:$onEndMode,endPlanDigest:$endPlanDigest,endActionIndex:0,claims:$claims,setters:[]}'); then
+    --argjson target "${BRIGHTNESS_TARGET:-null}" \
+    '({version:(if $target != null then 3 else 2 end),routineId:$routineId,activatedAt:$activatedAt,trigger:$trigger,keepUntil:$keepUntil,expiresAt:(if $expiresAt == "" then null else $expiresAt end),onEndMode:$onEndMode,endPlanDigest:$endPlanDigest,endActionIndex:0,claims:$claims,setters:[]}
+      + if $target != null then {brightnessTarget:$target} else {} end)'); then
     unlock_routine
     json_error "Could not prepare the activation snapshot" unsafe-state
     return 1
@@ -3216,11 +3442,19 @@ activate_resolved_routine() {
   fi
 
   while IFS= read -r entry; do
+    if ! snapshot_still_owned "$routine_id"; then status="failed"; error=$LAST_ERROR; break; fi
     index=$(jq -r '.key' <<<"$entry")
     action=$(jq -c '.value' <<<"$entry")
     type=$(jq -r '.type' <<<"$action")
     if is_setter_type "$type"; then
       value=$(setter_value_from_action "$action")
+      if [[ $type == brightness ]]; then
+        if ! value=$(brightness_requested_value "$value"); then
+          status="failed"
+          error="Could not prepare the display brightness request"
+          break
+        fi
+      fi
       restore=$(jq -r '.restore' <<<"$action")
       if [[ $restore == true ]]; then
         if ! read_setter "$type"; then
@@ -3228,9 +3462,11 @@ activate_resolved_routine() {
           error=$LAST_ERROR
           break
         fi
-        if ! next_snapshot=$(jq -c --argjson index "$index" --arg type "$type" --arg before "$SETTER_VALUE" --arg applied "$value" '
+        if ! next_snapshot=$(jq -c --argjson index "$index" --arg type "$type" --arg before "$SETTER_VALUE" --arg applied "$value" \
+          --argjson target "${BRIGHTNESS_TARGET:-null}" '
           def typed($t; $v): if $t == "theme" then $v elif $t == "brightness" then ($v | tonumber) else ($v == "true") end;
-          .setters += [{index:$index,type:$type,before:typed($type; $before),applied:typed($type; $applied),restore:true}]' <<<"$snapshot"); then
+          .setters += [({index:$index,type:$type,before:typed($type; $before),applied:typed($type; $applied),restore:true}
+            + if $type == "brightness" then {target:$target,confirmed:false} else {} end)]' <<<"$snapshot"); then
           status="failed"
           error="Could not prepare the setter checkpoint"
           break
@@ -3246,6 +3482,15 @@ activate_resolved_routine() {
           error=$LAST_ERROR
           break
         fi
+        if [[ $type == brightness ]]; then
+          if ! next_snapshot=$(jq -c '.setters[-1].confirmed = true' <<<"$snapshot") \
+            || ! write_snapshot "$routine_id" "$next_snapshot"; then
+            status="failed"
+            error="Could not confirm the brightness recovery checkpoint"
+            break
+          fi
+          snapshot=$next_snapshot
+        fi
       elif ! write_setter "$type" "$value"; then
         status="failed"
         error=$LAST_ERROR
@@ -3258,6 +3503,10 @@ activate_resolved_routine() {
     fi
   done < <(jq -c '.actions | to_entries[]' <<<"$routine")
 
+  if [[ $status != failed ]] && ! snapshot_still_owned "$routine_id"; then
+    status="failed"
+    error=$LAST_ERROR
+  fi
   if [[ $status == "failed" ]]; then
     restore_from_snapshot "$snapshot"
     if [[ -z $RESTORE_ERROR ]]; then
@@ -3305,7 +3554,8 @@ activate_routine() {
 deactivate_routine() {
   local routine_id=$1 reason=$2 already_locked=${3:-0}
   local snapshot_state=0 snapshot on_end_mode end_action_index routine="" config_file entry action index action_count end_rows
-  local start end duration status="deactivated" error=""
+  local start end duration status="deactivated" error="" end_brightness
+  local SNAPSHOT_EXPECTED="" BRIGHTNESS_TARGET=""
   if ((!already_locked)) && ! lock_routine "$routine_id"; then
     json_error "$LAST_ERROR" "$LOCK_ERROR_CODE"
     return 1
@@ -3323,6 +3573,9 @@ deactivate_routine() {
     return 0
   fi
   snapshot=$SNAPSHOT_JSON
+  SNAPSHOT_EXPECTED=$SNAPSHOT_READ_FINGERPRINT
+  BRIGHTNESS_TARGET=$(jq -c '.brightnessTarget // empty' <<<"$snapshot") \
+    || { unlock_routine; json_error "Could not read the brightness target" unsafe-state; return 1; }
   if [[ $reason == condition || $reason == service ]]; then
     if ! jq -e '(.trigger == "condition" or .trigger == "service") and .keepUntil == "conditions"' \
       <<<"$snapshot" >/dev/null; then
@@ -3379,9 +3632,19 @@ deactivate_routine() {
   RESTORE_ERROR=""
   if [[ $on_end_mode != none ]]; then
     restore_from_snapshot "$snapshot"
+    snapshot=$RESTORE_SNAPSHOT
     if [[ -n $RESTORE_ERROR ]]; then
       status="failed"
       error="restore: $RESTORE_ERROR"
+    fi
+  fi
+  if [[ $on_end_mode == actions && -n $routine && $status == deactivated ]]; then
+    if ! end_brightness=$(jq -er 'any(.onEnd.actions[]; .type == "brightness") | tostring' <<<"$routine"); then
+      status="failed"
+      error="end action: could not inspect brightness requirements"
+    elif [[ $end_brightness == true ]] && ! verify_brightness_target; then
+      status="failed"
+      error="end action: $LAST_ERROR"
     fi
   fi
   if [[ $on_end_mode == actions && -n $routine && $status == deactivated ]]; then
@@ -3586,12 +3849,15 @@ command_deactivate() {
 command_recovery() {
   local operation=${1:-} routine_id=${2:-} expected_revision=${3:-} flag=${4:-}
   local snapshot revision baseline replacement temporary state=0 digest
+  local BRIGHTNESS_TARGET=""
   [[ $routine_id =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || fail "Invalid recovery routine id" usage
   case $operation in
     inspect) [[ $# -eq 2 ]] || fail "Usage: omachord recovery inspect <routine-id>" usage ;;
     restore) [[ $# -eq 4 && $expected_revision =~ ^sha256:[0-9a-f]{64}$ && $flag == --skip-end-actions ]] \
       || fail "Usage: omachord recovery restore <routine-id> <inspected-revision> --skip-end-actions" usage ;;
-    *) fail "Usage: omachord recovery <inspect|restore>" usage ;;
+    bind-brightness) [[ $# -eq 4 && $expected_revision =~ ^sha256:[0-9a-f]{64}$ && $flag =~ ^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$ ]] \
+      || fail "Usage: omachord recovery bind-brightness <routine-id> <inspected-revision> <monitor>" usage ;;
+    *) fail "Usage: omachord recovery <inspect|restore|bind-brightness>" usage ;;
   esac
   acquire_config_lock shared || fail "$LAST_ERROR" unsafe-state
   lock_routine "$routine_id" || fail "$LAST_ERROR" "$LOCK_ERROR_CODE"
@@ -3611,21 +3877,55 @@ command_recovery() {
   fi
   if [[ $expected_revision != "$revision" ]]; then
     unlock_routine
-    fail "Recovery changed since it was inspected; inspect it again before deciding to skip end actions" stale-recovery
+    fail "Recovery changed since it was inspected; inspect it again before deciding how to recover" stale-recovery
   fi
-  # Persist the explicit skip decision before restoration. A crash or failed
-  # removal must not cause a normal retry to resume abandoned executable work.
-  digest=$(end_plan_digest '{"onEnd":{"mode":"restore"}}') || { unlock_routine; fail "Could not identify recovery plan" unsafe-state; }
-  if ! replacement=$(jq -c --arg digest "$digest" \
-      '.version=2 | .onEndMode="restore" | .endPlanDigest=$digest' <<<"$snapshot"); then
+  if [[ $operation == bind-brightness ]]; then
+    # Never silently infer the old target from today's focus, or retarget a
+    # record that already has one. This command records an inspected user's
+    # explicit legacy mapping; it does not write the physical display.
+    if ! jq -e 'any(.setters[]; .type == "brightness" and (has("target") | not))
+        or (.version < 3 and .onEndMode == "actions" and (has("brightnessTarget") | not))' <<<"$snapshot" >/dev/null; then
+      unlock_routine
+      fail "Recovery has no unbound legacy brightness setter" invalid-recovery
+    fi
+    if [[ $(jq -r .version <<<"$snapshot") == 1 && $(jq -r .onEndMode <<<"$snapshot") == actions ]]; then
+      unlock_routine
+      fail "Inspect and explicitly skip legacy end actions before binding brightness recovery" invalid-recovery
+    fi
+    if ! resolve_brightness_target "$flag"; then
+      unlock_routine
+      fail "$LAST_ERROR" brightness-unavailable
+    fi
+    digest=$(jq -r 'if .version == 1 then "" else .endPlanDigest end' <<<"$snapshot") \
+      || { unlock_routine; fail "Could not identify recovery plan" unsafe-state; }
+    if [[ -z $digest ]]; then
+      digest=$(end_plan_digest "$(jq -c '{onEnd:{mode:.onEndMode,actions:[]}}' <<<"$snapshot")") \
+        || { unlock_routine; fail "Could not identify recovery plan" unsafe-state; }
+    fi
+    replacement=$(jq -c --argjson target "$BRIGHTNESS_RESOLVED_TARGET" --arg digest "$digest" '
+      .version=3 | .endPlanDigest=$digest | .brightnessTarget //= $target
+      | .setters |= map(if .type == "brightness" and (has("target") | not)
+          then . + {target:$target,confirmed:false} else . end)' <<<"$snapshot") \
+      || { unlock_routine; fail "Could not bind brightness recovery" unsafe-state; }
+  else
+    # Persist the explicit skip decision before restoration. A crash or failed
+    # removal must not cause a normal retry to resume abandoned executable work.
+    digest=$(end_plan_digest '{"onEnd":{"mode":"restore"}}') || { unlock_routine; fail "Could not identify recovery plan" unsafe-state; }
+    if ! replacement=$(jq -c --arg digest "$digest" \
+        '.version=(if .version == 3 then 3 else 2 end) | .onEndMode="restore" | .endPlanDigest=$digest' <<<"$snapshot"); then
+      unlock_routine
+      fail "Could not prepare the restore-only recovery record" unsafe-state
+    fi
+  fi
+  if ! validate_snapshot_content "$routine_id" <<<"$replacement" >/dev/null; then
     unlock_routine
-    fail "Could not prepare the restore-only recovery record" unsafe-state
+    fail "Could not validate the replacement recovery record" unsafe-state
   fi
   temporary=$(mktemp) || { unlock_routine; fail "Could not prepare recovery" unsafe-state; }
   if ! printf '%s\n' "$replacement" >"$temporary"; then
     rm -f -- "$temporary"
     unlock_routine
-    fail "Could not stage the restore-only recovery record" unsafe-state
+    fail "Could not stage the recovery record" unsafe-state
   fi
   if ! atomic_replace_if_fingerprint "$temporary" "$(snapshot_path "$routine_id")" "$baseline" 600; then
     rm -f -- "$temporary"
@@ -3633,6 +3933,11 @@ command_recovery() {
     fail "$LAST_ERROR" concurrent-edit
   fi
   rm -f -- "$temporary"
+  if [[ $operation == bind-brightness ]]; then
+    unlock_routine
+    json_ok "Legacy brightness display recorded; deactivate the routine to retry recovery"
+    return
+  fi
   deactivate_routine "$routine_id" recovery 1
 }
 
@@ -4029,6 +4334,7 @@ Commands:
   recovery inspect <routine-id>
                         Inspect recovery data and its approval revision
   recovery restore <routine-id> <revision> --skip-end-actions
+  recovery bind-brightness <routine-id> <revision> <monitor>
                         Explicitly skip remaining end actions and restore setters
   active                Snapshots of currently active stateful routines
   trigger hook <event> [args...]

@@ -343,6 +343,9 @@ Item {
       return { label: "Not evaluated", detail: "Conditions are evaluated only while Omachord is on.", urgent: false }
     if (!state) return { label: "Not evaluated", detail: "The condition service has not reported yet.", urgent: false }
     if (state.failure && state.failure.op) {
+      if (state.failure.op === "activate" && state.failure.blocked === true)
+        return { label: "Unavailable", detail: "Could not start: " + (state.failure.error || "brightness unavailable")
+          + " · Automatic retry blocked. Retry manually or edit the routine.", urgent: true }
       var retry = state.failure.retryAt ? Conditions.clockTime(new Date(Number(state.failure.retryAt)).toISOString()) : ""
       return { label: "Failed", detail: (state.failure.op === "activate" ? "Could not start: " : "Could not end: ")
         + (state.failure.error || "runner error") + (retry ? " · retrying " + retry : ""), urgent: true }

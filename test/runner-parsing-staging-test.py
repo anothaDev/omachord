@@ -41,7 +41,8 @@ if name == "jq":
         sys.exit(2)
     if os.environ.get("FAIL_LUA_JSON") == "1" and "-j" in args:
         sys.exit(2)
-    if os.environ.get("FAIL_RESTORE_JSON") == "1" and any(".setters | map(select(.restore" in arg for arg in args):
+    if os.environ.get("FAIL_RESTORE_JSON") == "1" and any(
+            ".setters | to_entries | map(select(.value.restore" in arg for arg in args):
         sys.exit(2)
     if os.environ.get("FAIL_CLAIMS_JSON") == "1" and any("$active.claims" in arg for arg in args):
         sys.exit(2)

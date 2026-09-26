@@ -370,10 +370,13 @@ Item {
         if (Conditions.evaluateAll(routines[r].conditions, currentEnv(new Date())) === true) latch(routineId)
         break
       }
+    } else if ((status === "activated" || status === "success") && trigger !== "condition" && trigger !== "service") {
+      reconcileBlockedActivation(routineId)
     } else if (status === "failed" && trigger !== "condition" && trigger !== "service"
         && String(entry.error || "").indexOf("activate:") === 0
         && String(entry.error || "").indexOf("recovery record kept") === -1) {
-      unlatch(routineId)
+      var failure = Conditions.mapValue(failures, routineId)
+      if (!failure || failure.op !== "activate" || failure.blocked !== true) unlatch(routineId)
     }
   }
 
@@ -484,6 +487,7 @@ Item {
     var expiredFailures = Object.assign(Object.create(null), failures)
     var changed = false
     for (var id in expiredFailures) {
+      if (expiredFailures[id].op === "activate" && expiredFailures[id].blocked === true) continue
       if (now - Number(expiredFailures[id].at) < failureRetryMs) continue
       var operation = expiredFailures[id].op
       delete expiredFailures[id]
@@ -514,6 +518,17 @@ Item {
     var next = Object.assign(Object.create(null), latched)
     delete next[String(id)]
     latched = next
+  }
+
+  function reconcileBlockedActivation(id) {
+    var failure = Conditions.mapValue(failures, id)
+    if (!failure || failure.op !== "activate" || failure.blocked !== true) return
+    var next = Object.assign(Object.create(null), failures)
+    delete next[String(id)]
+    failures = next
+    // A successful explicit retry satisfies this true period, including a
+    // one-shot run with no active snapshot for evaluate() to observe.
+    latch(id)
   }
 
   // ------------------------------------------------------- execution
@@ -565,13 +580,15 @@ Item {
     }
     if (!ok) {
       // Do not hammer the runner while the cause persists (a stopped shell, a
-      // restore that could not complete); retry after the failure window or
-      // once the conditions have gone false.
+      // restore that could not complete). A typed activation preflight failure
+      // waits for a false edge, a config edit, or a successful manual retry;
+      // all other failures, especially recovery, retain the retry window.
       var next = Object.assign(Object.create(null), failures)
       if (job.revision === configRevision) {
         if (job.op === "activate") latch(job.id)
         next[job.id] = {
           at: Date.now(), op: job.op, revision: job.revision,
+          blocked: job.op === "activate" && !!parsed && parsed.ok === false && parsed.code === "brightness-unavailable",
           error: parsed && parsed.error ? String(parsed.error) : "runner exited " + exitCode
         }
         failures = next
@@ -772,6 +789,10 @@ Item {
   function reportManualFinished(job, result, exitCode) {
     lastManualResult = result
     if (!job) return
+    if (result.ok === true && job.revision === configRevision
+        && (job.op === "activate" || job.op === "run")
+        && result.state !== "deactivated" && result.state !== "inactive")
+      reconcileBlockedActivation(job.id)
     logEvent("manual-exit", job.op + " " + job.id + " " + (result.ok ? "ok" : "failed: " + (result.error || exitCode)))
     manualFinished(job, result)
   }
