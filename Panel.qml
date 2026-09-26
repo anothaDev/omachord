@@ -886,8 +886,9 @@ Item {
       return
     }
 
-    var committed = result.config && result.config.version === 1
-      ? result.config : enableSubmittedConfig
+    // The runner's reply names only the new revision; what it committed is
+    // exactly the submitted document.
+    var committed = enableSubmittedConfig
     appendEnableResults(result)
     configRevision = result.revision
     enableCommittedConfig = Model.clone(committed)

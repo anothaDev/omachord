@@ -135,6 +135,10 @@ ShellRoot {
     onTriggered: {
       var text = root.readCalls()
       var elapsed = Date.now() - root.phaseAt
+      if (text.indexOf("UNEXPECTED ") !== -1) {
+        root.finish(false, "the service sent an argv the runner rejects:\n" + text)
+        return
+      }
 
       // Distinct routine IDs must occupy separate workers. Both starts are
       // required before either blocked process is released.
@@ -424,7 +428,7 @@ ShellRoot {
     }
     // Queue tests start with the fixture's already reviewed revision; startup
     // loading is covered separately by service.qml.
-    service = component.createObject(this, {configRevision:"sha256:concurrency"})
+    service = component.createObject(this, {configRevision:"sha256:" + "c".repeat(64)})
     if (!service) {
       finish(false, "Service.qml createObject returned null")
       return

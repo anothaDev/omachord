@@ -51,7 +51,7 @@ ShellRoot {
       }
       connectionBusy = false
       manualFinished({ op: op, id: "" }, ok
-        ? { ok: true, connected: enabled, revision: "sha256:connected" }
+        ? { ok: true, connected: enabled, repaired: false, warnings: [], revision: "sha256:" + "c".repeat(64) }
         : { ok: false, error: "Fixture connection failure" })
     }
   }
@@ -103,7 +103,7 @@ ShellRoot {
     check(!panel.mutating, "the apply boundary must reject saves while a service connection is pending")
     service.finish("disconnect", false)
     input.keyClick(Qt.Key_S, Qt.ControlModifier)
-    waitFor(function() { return !panel.mutating && panel.configRevision === "sha256:applied" },
+    waitFor(function() { return !panel.mutating && panel.configRevision === "sha256:" + "a".repeat(64) },
       "Ctrl+S must resume saving after the service connection settles")
 
     // Public UI requests reject a duplicate row without blocking other rows
@@ -164,11 +164,11 @@ ShellRoot {
       panel.clearNotice()
       panel.configLoaded = true
       panel.loading = false
-      panel.configRevision = "sha256:base"
+      panel.configRevision = "sha256:" + "0".repeat(64)
 
       panel.requestIntegrationToggle()
       check(service.connectRequests === 1, "panel must use the shared service connection queue")
-      check(service.requestedRevision === "sha256:base", "connect must retain revision checking")
+      check(service.requestedRevision === "sha256:" + "0".repeat(64), "connect must retain revision checking")
       check(panel.integrationBusy === true, "panel switch must remain pending while connecting")
       panel.requestIntegrationToggle()
       check(service.connectRequests === 1, "pending connection must ignore repeat activation")
@@ -176,7 +176,7 @@ ShellRoot {
       service.finish("connect", true)
       check(panel.integrationOn && !panel.integrationBusy && !panel.mutating,
         "completed connection must display its committed state before unlocking")
-      check(panel.configRevision === "sha256:connected", "connection revision must be retained")
+      check(panel.configRevision === "sha256:" + "c".repeat(64), "connection revision must be retained")
 
       service.requestDisconnect()
       check(panel.integrationBusy, "a connection started in the bar must also block the panel")

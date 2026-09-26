@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix="ori.", dir="/tmp") as directory:
     (fixture / "runner").write_text('''#!/bin/bash
 case "$1" in
   active|logs|toggles) printf '[]\\n' ;;
-  *) printf '{"ok":false}\\n' ;;
+  *) printf '{"ok":false,"code":"unavailable","error":"fixture runner offline"}\\n'; exit 1 ;;
 esac
 ''')
     (fixture / "runner").chmod(0o700)
