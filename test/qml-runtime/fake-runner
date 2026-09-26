@@ -6,16 +6,20 @@ set -euo pipefail
 dir=${OMACHORD_QML_TEST_DIR:?}
 calls="$dir/runner-calls.log"
 active_marker="$dir/fake-active"
+export FAKE_UNEXPECTED_LOG="$calls"
+source "${BASH_SOURCE[0]%/*}/fake-runner-grammar"
+fake_check_argv "$@"
+revision=$(fake_revision 1)
 
 case "${1:-} ${2:-}" in
   "autostart ")
-    printf '%s\n' '{"ok":true,"connected":true}'
+    printf '%s\n' '{"ok":true,"connected":true,"warnings":[]}'
     ;;
   "status ")
     printf '%s\n' '{"ok":true,"connected":true,"ownedConnection":true,"integrationComplete":true,"connectionEnabled":true,"configValid":true,"activeCount":0}'
     ;;
   "config snapshot")
-    printf '%s\n' '{"ok":true,"revision":"sha256:test","committed":true,"config":{"version":1,"routines":[{"id":"scratch-routine","name":"Scratch","enabled":true,"triggers":[],"conditions":[{"type":"omarchy-toggle","flag":"scratch"}],"actions":[{"type":"dnd","value":true,"restore":true}]},{"id":"plain","name":"Plain","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]}]}}'
+    printf '{"ok":true,"revision":"%s","committed":true,"config":{"version":1,"routines":[{"id":"scratch-routine","name":"Scratch","enabled":true,"triggers":[],"conditions":[{"type":"omarchy-toggle","flag":"scratch"}],"actions":[{"type":"dnd","value":true,"restore":true}]},{"id":"plain","name":"Plain","enabled":true,"triggers":[],"actions":[{"type":"delay","milliseconds":0}]}]}}\n' "$revision"
     ;;
   "logs "*)
     if [[ -f $dir/delay-logs ]]; then
@@ -57,8 +61,6 @@ case "${1:-} ${2:-}" in
     printf '{"ok":true,"routineId":"%s","trigger":"%s","state":"deactivated","restored":1,"skipped":0,"durationMs":1}\n' "$2" "${3:-}"
     ;;
   *)
-    printf '%s\n' "unexpected $*" >>"$calls"
-    printf '%s\n' '{"ok":false,"code":"usage","error":"unexpected call"}'
-    exit 1
+    fake_usage "$@"
     ;;
 esac

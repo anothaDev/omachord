@@ -134,6 +134,7 @@ ShellRoot {
     repeat: true
     onTriggered: {
       var text = root.readCalls()
+      if (!root.check(text.indexOf("UNEXPECTED ") === -1, "the service sent an argv the runner rejects")) return
       if (!root.check(text.indexOf("FORBIDDEN STATUS") === -1,
           "watcher/reconcile launched status during a queued/running connection:\n" + text)) return
       if (root.phase === 0) {

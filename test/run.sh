@@ -29,6 +29,7 @@ python3 "$ROOT/test/qml-routine-id-test.py"
 "$ROOT/test/qml-manual-revision-test.sh"
 "$ROOT/test/qml-panel-connection-test.sh"
 "$ROOT/test/qml-toggle-test.sh"
+"$ROOT/test/qml-watchdog-test.sh"
 python3 "$ROOT/test/qml-theme-palette-test.py"
 node "$ROOT/test/model-test.mjs"
 node "$ROOT/test/conditions-test.mjs"
@@ -55,6 +56,7 @@ qmllint -I /usr/share/omarchy/shell \
   "$ROOT/BrandIcon.qml" \
   "$ROOT/RoutinePopup.qml" \
   "$ROOT/ThemePalette.qml" \
+  "$ROOT/ProcessWatchdog.qml" \
   "$ROOT/KeyCap.qml" \
   "$ROOT/EmptyState.qml" \
   "$ROOT/Collapsible.qml"

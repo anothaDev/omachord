@@ -1,0 +1,69 @@
+# shellcheck shell=bash
+# Sourced by the bash runner fakes so they accept exactly the argv that
+# bin/omachord's main() and command_* functions accept, and nothing more. A
+# refusal has the runner's usage shape ({ok:false,code:"usage",error}) but
+# exits 2 instead of 1, so a fixture can tell a broken QML command line from
+# a scripted runner failure. Set FAKE_UNEXPECTED_LOG to also record it.
+
+FAKE_REVISION_PATTERN='^sha256:[0-9a-f]{64}$'
+FAKE_ROUTINE_ID_PATTERN='^[a-z0-9]+(-[a-z0-9]+)*$'
+
+# A real-shaped revision built from one hex digit, e.g. fake_revision a.
+fake_revision() {
+  local digit=${1:?} value=""
+  while ((${#value} < 64)); do value+=$digit; done
+  printf 'sha256:%s' "$value"
+}
+
+fake_usage() {
+  if [[ -n ${FAKE_UNEXPECTED_LOG:-} ]]; then
+    printf 'UNEXPECTED %s\n' "$*" >>"$FAKE_UNEXPECTED_LOG"
+  fi
+  jq -cn --arg error "Usage: unexpected runner arguments: $*" '{ok:false,code:"usage",error:$error}'
+  exit 2
+}
+
+fake_is_revision() { [[ ${1:-} =~ $FAKE_REVISION_PATTERN ]]; }
+fake_is_expected_revision() { [[ ${1:-} == missing ]] || fake_is_revision "${1:-}"; }
+fake_is_routine_id() { [[ ${1:-} =~ $FAKE_ROUTINE_ID_PATTERN ]]; }
+
+fake_argv_valid() {
+  local command=${1:-} source=${3:-manual} revision=${4:-}
+  case $command in
+    autostart|status|disconnect|bindings|commands|themes|service-status|theme-palette|toggles|active)
+      (($# == 1)) ;;
+    config)
+      case ${2:-} in
+        snapshot|show|validate) (($# == 2)) ;;
+        apply) (($# == 3)) && fake_is_expected_revision "$3" ;;
+        *) return 1 ;;
+      esac ;;
+    connect) (($# == 1)) || { (($# == 2)) && fake_is_expected_revision "$2"; } ;;
+    logs) (($# == 1)) || { (($# == 2)) && [[ $2 =~ ^[0-9]+$ ]]; } ;;
+    widget) (($# == 2)) && [[ $2 =~ ^(ensure|status|forget)$ ]] ;;
+    run)
+      (($# >= 2 && $# <= 4)) && fake_is_routine_id "$2" && [[ $source =~ ^(manual|shortcut|test)$ ]] \
+        && { (($# < 4)) || fake_is_revision "$revision"; } ;;
+    activate)
+      (($# >= 2 && $# <= 4)) && fake_is_routine_id "$2" || return 1
+      case $source in
+        condition|service) fake_is_revision "$revision" ;;
+        shortcut) (($# < 4)) ;;
+        manual|test) (($# < 4)) || fake_is_revision "$revision" ;;
+        *) return 1 ;;
+      esac ;;
+    deactivate)
+      (($# >= 2 && $# <= 4)) && fake_is_routine_id "$2" || return 1
+      case $source in
+        condition|service|timer) (($# == 4)) && fake_is_revision "$revision" ;;
+        manual|shortcut|test) (($# < 4)) ;;
+        *) return 1 ;;
+      esac ;;
+    *) return 1 ;;
+  esac
+}
+
+# Exits through fake_usage unless the argv is one the real runner accepts.
+fake_check_argv() {
+  fake_argv_valid "$@" || fake_usage "$@"
+}

@@ -15,6 +15,7 @@ ShellRoot {
   readonly property string testDir: Quickshell.env("OMACHORD_QML_TEST_DIR")
   readonly property string flagPath: testDir + "/state/omarchy/toggles/scratch"
   readonly property string callsPath: testDir + "/runner-calls.log"
+  readonly property string revision: "sha256:" + "1".repeat(64)
   readonly property string holdDeactivatePath: testDir + "/hold-deactivate"
 
   function finish(passed, detail) {
@@ -65,7 +66,12 @@ ShellRoot {
     repeat: true
     onTriggered: {
       var text = root.readCalls()
-      if (root.phase === 1 && text.indexOf("activate scratch-routine condition sha256:test\n") !== -1) {
+      if (text.indexOf("UNEXPECTED ") !== -1) {
+        poll.stop()
+        root.finish(false, "the service sent an argv the runner rejects:\n" + text)
+        return
+      }
+      if (root.phase === 1 && text.indexOf("activate scratch-routine condition " + root.revision + "\n") !== -1) {
         var status = JSON.parse(root.service.statusJson())
         if (!status.enabled || !status.ready) {
           poll.stop()
@@ -76,7 +82,7 @@ ShellRoot {
         settle.start()
         return
       }
-      if (root.phase === 3 && text.indexOf("deactivate scratch-routine condition sha256:test\n") !== -1) {
+      if (root.phase === 3 && text.indexOf("deactivate scratch-routine condition " + root.revision + "\n") !== -1) {
         root.phase = 4
         restoreFlag.running = true
         return

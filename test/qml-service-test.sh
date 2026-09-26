@@ -18,7 +18,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$TEST_DIR/state/omarchy/toggles" "$TEST_DIR/state/omarchy/omachord" "$TEST_DIR/home"
-for file in Service.qml Conditions.js; do
+for file in Service.qml ProcessWatchdog.qml Conditions.js Runner.js; do
   ln -s "$ROOT/$file" "$TEST_DIR/$file"
 done
 : >"$TEST_DIR/runner-calls.log"
@@ -70,6 +70,7 @@ run_runtime_test service-concurrency.qml fake-concurrency-runner 'service concur
 # A private executable lets the connection fixture test FailedToStart without
 # changing the tracked runner or touching any user configuration.
 cp -- "$ROOT/test/qml-runtime/fake-connection-runner" "$TEST_DIR/connection-runner"
+cp -- "$ROOT/test/qml-runtime/fake-runner-grammar" "$TEST_DIR/fake-runner-grammar"
 chmod +x "$TEST_DIR/connection-runner"
 : >"$TEST_DIR/connection-calls.log"
 printf '{}\n' >"$OMACHORD_STATE_DIR/connection.json"

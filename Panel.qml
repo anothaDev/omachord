@@ -7,6 +7,7 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 import "Conditions.js" as Conditions
+import "Runner.js" as Runner
 
 Item {
   id: root
@@ -96,15 +97,19 @@ Item {
   // completion settles. Other routines need not wait for that probe.
   property var actionSettling: Object.create(null)
   property date displayNow: new Date()
+  // Deadlines after which a runner that never exits is stopped, so loading,
+  // saving and connection locks always recover (see ProcessWatchdog.qml).
+  // An apply or disconnect can end routines, and a direct action runs one,
+  // so they get the routine deadline; reads are bounded probes.
+  property int probeDeadlineMs: 30000
+  property int connectionDeadlineMs: 60000
+  property int routineDeadlineMs: 600000
+  property int watchdogGraceMs: 5000
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: (manifest && manifest.id) || "anothadev.omachord"
-  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-  readonly property string runnerPath: configuredRunnerPath.indexOf("/") === 0
-    ? configuredRunnerPath
-    : (manifest && manifest.__sourceDir
-      ? String(manifest.__sourceDir) + "/bin/omachord"
-      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
+  readonly property string runnerPath: Runner.runnerPath(Quickshell.env("OMACHORD_RUNNER_PATH"), manifest,
+    Runner.omarchyConfigDir(home, Quickshell.env("OMACHORD_OMARCHY_CONFIG_DIR")))
   readonly property var filteredBindings: Model.filterBindings(bindings, shortcutQuery, shortcutFilter)
   readonly property bool compact: window.width < Style.space(920)
   readonly property bool uiLocked: loading || mutating || revisionRefreshPending || !configLoaded
@@ -177,9 +182,7 @@ Item {
     else window.visible = false
   }
 
-  function parseJson(text, fallback) {
-    try { return JSON.parse(String(text || "")) } catch (e) { return fallback }
-  }
+  function parseJson(text, fallback) { return Runner.parseJson(text, fallback) }
 
   function setActiveView(view) {
     if (activeView === view) return
@@ -346,7 +349,7 @@ Item {
       if (state.failure.op === "activate" && state.failure.blocked === true)
         return { label: "Unavailable", detail: "Could not start: " + (state.failure.error || "brightness unavailable")
           + " · Automatic retry blocked. Retry manually or edit the routine.", urgent: true }
-      var retry = state.failure.retryAt ? Conditions.clockTime(new Date(Number(state.failure.retryAt)).toISOString()) : ""
+      var retry = state.failure.retryAt ? Conditions.clockTime(Number(state.failure.retryAt)) : ""
       return { label: "Failed", detail: (state.failure.op === "activate" ? "Could not start: " : "Could not end: ")
         + (state.failure.error || "runner error") + (retry ? " · retrying " + retry : ""), urgent: true }
     }
@@ -371,6 +374,7 @@ Item {
         name: Model.nameFor(currentConfig, id),
         activatedAt: String(record.activatedAt || ""),
         trigger: String(record.trigger || ""),
+        keepUntil: record.keepUntil === undefined ? "conditions" : record.keepUntil,
         expiresAt: record.expiresAt ? String(record.expiresAt) : "",
         onEndMode: String(record.onEndMode || "restore"),
         setterCount: Number(record.setterCount || 0),
@@ -400,7 +404,7 @@ Item {
     if (row.expiresAt) {
       var left = Conditions.minutesLeft(row.expiresAt, displayNow)
       parts.push(left !== null && left >= 0 ? (left < 1 ? "ending now" : left + " min left") : "until " + Conditions.clockTime(row.expiresAt))
-    } else if (row.conditions > 0) parts.push("while its conditions hold")
+    } else if (Conditions.endsWithConditions(row)) parts.push(Conditions.conditionHoldText(row))
     return parts.join(" · ")
   }
 
@@ -459,11 +463,17 @@ Item {
       // evidence of review; Enable/Repair must not approve an unseen file.
       if (typeof parsed.revision === "string") configRevision = parsed.revision
       configUncommitted = true
-      failConfigLoad("The routine configuration is not committed and was not loaded. Inspect it with "
-        + "omachord config snapshot, review every routine, then approve that snapshot using omachord connect "
-        + configRevision + ". Refresh this panel afterward.")
+      failConfigLoad(uncommittedConfigNotice())
     } else if (parsed && parsed.error) failConfigLoad(parsed.error)
     else failConfigLoad("The runner returned invalid configuration JSON")
+  }
+
+  // Shared by the load failure and the switch, so the switch never fails
+  // silently; the common prefix lets a later successful load clear either.
+  function uncommittedConfigNotice() {
+    return "The routine configuration is not committed and was not loaded. Inspect it with "
+      + "omachord config snapshot, review every routine, then approve that snapshot using omachord connect "
+      + configRevision + ". Refresh this panel afterward."
   }
 
   function refreshApps() {
@@ -672,6 +682,12 @@ Item {
 
   function applyConfig(next, selectId, afterApply) {
     if (mutating || loading || !configLoaded || serviceConnectionBusy()) return
+    var limitError = Model.validateConfigLimits(next)
+    if (limitError) {
+      showNotice(limitError, true)
+      routineEditor.externalError = limitError
+      return
+    }
     pendingConfig = Model.clone(next)
     pendingSelectId = selectId || ""
     pendingAfterApply = afterApply || ""
@@ -870,8 +886,9 @@ Item {
       return
     }
 
-    var committed = result.config && result.config.version === 1
-      ? result.config : enableSubmittedConfig
+    // The runner's reply names only the new revision; what it committed is
+    // exactly the submitted document.
+    var committed = enableSubmittedConfig
     appendEnableResults(result)
     configRevision = result.revision
     enableCommittedConfig = Model.clone(committed)
@@ -1028,7 +1045,11 @@ Item {
 
   function mutateConnection(operation) {
     if (mutating || loading || integrationBusy || !(configLoaded || configUncommitted)) return
-    if (operation === "connect" && !configLoaded) return
+    if (operation === "connect" && !configLoaded) {
+      // Turning on from here would approve content nobody reviewed here.
+      showNotice(uncommittedConfigNotice(), true)
+      return
+    }
     connectionEpoch++
     mutationOperation = operation
     mutating = true
@@ -1350,7 +1371,7 @@ Item {
     stderr: StdioCollector { id: configStderr; waitForEnd: true }
     onStarted: root.configStarted = true
     onExited: function(exitCode) {
-      root.handleConfigResult(configStdout.text, configStderr.text.trim(), exitCode)
+      root.handleConfigResult(configWatchdog.reply(configStdout.text), configStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && root.loading && !root.configStarted && !root.configHandled)
@@ -1399,7 +1420,7 @@ Item {
     stderr: StdioCollector { id: revisionStderr; waitForEnd: true }
     onStarted: root.revisionStarted = true
     onExited: function(exitCode) {
-      root.handleRevisionResult(revisionStdout.text, revisionStderr.text.trim(), exitCode)
+      root.handleRevisionResult(revisionWatchdog.reply(revisionStdout.text), revisionStderr.text.trim(), exitCode)
       root.finishRefreshProcess(revisionProc)
     }
     onRunningChanged: {
@@ -1507,7 +1528,7 @@ Item {
     }
     onExited: function(exitCode) {
       stdinEnabled = true
-      root.handleApplyResult(applyStdout.text, applyStderr.text.trim(), exitCode)
+      root.handleApplyResult(applyWatchdog.reply(applyStdout.text), applyStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running) stdinEnabled = true
@@ -1526,7 +1547,7 @@ Item {
     stderr: StdioCollector { id: mutationStderr; waitForEnd: true }
     onStarted: root.mutationStarted = true
     onExited: function(exitCode) {
-      root.handleMutationResult(mutationStdout.text, mutationStderr.text.trim(), exitCode)
+      root.handleMutationResult(mutationWatchdog.reply(mutationStdout.text), mutationStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && root.mutating
@@ -1544,7 +1565,7 @@ Item {
     stderr: StdioCollector { id: actionStderr; waitForEnd: true }
     onStarted: root.actionStarted = true
     onExited: function(exitCode) {
-      root.handleActionResult(actionStdout.text, actionStderr.text.trim(), exitCode)
+      root.handleActionResult(actionWatchdog.reply(actionStdout.text), actionStderr.text.trim(), exitCode)
     }
     onRunningChanged: {
       if (!running && !root.actionStarted && root.runningRoutineId !== "")
@@ -1553,6 +1574,26 @@ Item {
         })
     }
   }
+
+  ProcessWatchdog { process: statusProc; label: "status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: configWatchdog; process: configProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: bindingsProc; label: "bindings"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: commandsProc; label: "commands"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: revisionWatchdog; process: revisionProc; label: "config snapshot"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: activeProc; label: "active"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: themesProc; label: "themes"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: togglesProc; label: "toggles"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: serviceStatusProc; label: "service-status"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { process: logsProc; label: "logs"; deadlineMs: root.probeDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog { id: applyWatchdog; process: applyProc; label: "config apply"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
+  ProcessWatchdog {
+    id: mutationWatchdog
+    process: mutationProc
+    label: root.mutationOperation || "connection"
+    deadlineMs: root.mutationOperation === "disconnect" ? root.routineDeadlineMs : root.connectionDeadlineMs
+    graceMs: root.watchdogGraceMs
+  }
+  ProcessWatchdog { id: actionWatchdog; process: actionProc; label: "routine"; deadlineMs: root.routineDeadlineMs; graceMs: root.watchdogGraceMs }
 
   FloatingWindow {
     id: window

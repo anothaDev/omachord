@@ -6,6 +6,10 @@ set -euo pipefail
 
 dir=${OMACHORD_QML_TEST_DIR:?}
 calls="$dir/manual-calls.log"
+export FAKE_UNEXPECTED_LOG="$calls"
+source "${BASH_SOURCE[0]%/*}/fake-runner-grammar"
+fake_check_argv "$@"
+revision=$(fake_revision c)
 
 wait_for_release() {
   local operation=$1
@@ -17,13 +21,13 @@ wait_for_release() {
 
 case "${1:-} ${2:-}" in
   "autostart ")
-    printf '%s\n' '{"ok":true,"connected":true}'
+    printf '%s\n' '{"ok":true,"connected":true,"warnings":[]}'
     ;;
   "status ")
     printf '%s\n' '{"ok":true,"connected":true,"ownedConnection":true,"integrationComplete":true,"connectionEnabled":true,"configValid":true,"activeCount":0}'
     ;;
   "config snapshot")
-    printf '%s\n' '{"ok":true,"revision":"sha256:concurrency","committed":true,"config":{"version":1,"routines":[]}}'
+    printf '{"ok":true,"revision":"%s","committed":true,"config":{"version":1,"routines":[]}}\n' "$revision"
     ;;
   "logs "*)
     printf '%s\n' '[]'
@@ -45,18 +49,25 @@ case "${1:-} ${2:-}" in
     printf 'START %s %s\n' "$operation" "$routine_id" >>"$calls"
     wait_for_release "$operation" "$routine_id"
     printf 'END %s %s\n' "$operation" "$routine_id" >>"$calls"
-    printf '{"ok":true,"routineId":"%s","state":"complete"}\n' "$routine_id"
+    # Stateful replies as the runner shapes them; these routines restore nothing.
+    if [[ $operation == deactivate ]]; then
+      printf '{"ok":true,"routineId":"%s","trigger":"%s","state":"inactive","alreadyInactive":true}\n' "$routine_id" "${3:-manual}"
+    else
+      printf '{"ok":true,"routineId":"%s","trigger":"%s","state":"activated","durationMs":1,"expiresAt":null}\n' "$routine_id" "${3:-manual}"
+    fi
     ;;
   "connect "|"disconnect ")
     operation=$1
     printf 'START %s\n' "$operation" >>"$calls"
     wait_for_release "$operation"
     printf 'END %s\n' "$operation" >>"$calls"
-    printf '%s\n' '{"ok":true,"connected":true}'
+    if [[ $operation == connect ]]; then
+      printf '%s\n' '{"ok":true,"connected":true,"warnings":[]}'
+    else
+      printf '%s\n' '{"ok":true,"connected":false,"deactivated":[]}'
+    fi
     ;;
   *)
-    printf 'UNEXPECTED %s\n' "$*" >>"$calls"
-    printf '%s\n' '{"ok":false,"code":"usage","error":"unexpected call"}'
-    exit 1
+    fake_usage "$@"
     ;;
 esac

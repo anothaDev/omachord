@@ -26,6 +26,10 @@ ShellRoot {
   function pass() {
     poll.stop()
     deadline.stop()
+    if (readCalls().indexOf("UNEXPECTED ") !== -1) {
+      console.error("OMACHORD_QML_TEST_FAIL", "the panel sent an argv the runner rejects:\n" + readCalls())
+      return
+    }
     console.log("OMACHORD_QML_TEST_PASS")
   }
 
@@ -63,6 +67,9 @@ ShellRoot {
     return String(callsView.text() || "")
   }
 
+  // A real-shaped configuration revision made of one repeated hex digit.
+  function rev(digit) { return "sha256:" + String(digit).repeat(64) }
+
   function checkReviewBinding() {
     var original = { id: "reviewed", name: "Reviewed", enabled: false,
       triggers: [], actions: [{ type: "exec", argv: ["/usr/bin/true"] }] }
@@ -87,7 +94,7 @@ ShellRoot {
       panel.revisionRefreshPending = true
       panel.revisionRefreshPurpose = "enable"
       panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
-        revision: "sha256:changed-" + i,
+        revision: rev((i + 1).toString(16)),
         config: { version: 1, routines: [changed, panel.config.routines[1]] } }), "", 0)
       if (routineEnabled("reviewed") !== false || panel.routineEnablePending("reviewed")
           || !panel.routineEnablePending("independent")) {
@@ -106,7 +113,7 @@ ShellRoot {
       panel.revisionRefreshPending = true
       panel.revisionRefreshPurpose = "enable"
       panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
-        revision: "sha256:recreated-" + pass, config: { version: 1,
+        revision: rev(pass === 0 ? "a" : "c"), config: { version: 1,
           routines: pass === 0 ? [panel.config.routines[1]] : [original, panel.config.routines[0]] } }), "", 0)
       if (panel.routineEnablePending("reviewed")) {
         fail("deleted or recreated routine inherited approval")
@@ -123,7 +130,7 @@ ShellRoot {
     panel.revisionRefreshPending = true
     panel.revisionRefreshPurpose = "enable"
     panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
-      revision: "sha256:reordered", config: { version: 1, routines: [reordered] } }), "", 0)
+      revision: rev("a"), config: { version: 1, routines: [reordered] } }), "", 0)
     if (!panel.routineEnablePending("reviewed")) {
       fail("unchanged definition lost its legitimate retry")
       return false
@@ -133,7 +140,7 @@ ShellRoot {
     panel.revisionRefreshPending = true
     panel.revisionRefreshPurpose = "enable"
     panel.handleRevisionResult(JSON.stringify({ ok: true, committed: true,
-      revision: "sha256:changed-later", config: { version: 1, routines: [reordered] } }), "", 0)
+      revision: rev("c"), config: { version: 1, routines: [reordered] } }), "", 0)
     if (panel.routineEnablePending("reviewed") || routineEnabled("reviewed") !== false) {
       fail("successive retry transferred an earlier approval")
       return false
@@ -146,7 +153,7 @@ ShellRoot {
     }
     panel.configHandled = false
     panel.handleConfigResult(JSON.stringify({ ok: true, committed: false,
-      revision: "sha256:unreviewed", config: { version: 1, routines: [original] } }), "", 0)
+      revision: rev("f"), config: { version: 1, routines: [original] } }), "", 0)
     panel.mutateConnection("connect")
     if (panel.mutating || panel.configLoaded || panel.noticeText.indexOf("config snapshot") === -1) {
       fail("uncommitted unseen config could be blindly approved by Repair")
@@ -199,7 +206,7 @@ ShellRoot {
       }
 
       if (root.phase === 2 && !root.panel.mutating) {
-        if (root.startCount(calls) !== 2 || root.panel.configRevision !== "sha256:apply-2"
+        if (root.startCount(calls) !== 2 || root.panel.configRevision !== root.rev(2)
             || root.routineEnabled("alpha") !== true || root.routineEnabled("beta") !== false
             || Object.keys(root.panel.enableIntents).length !== 0) {
           root.fail("the first batch did not settle cleanly after two ordered applies")
@@ -227,7 +234,7 @@ ShellRoot {
       }
 
       if (root.phase === 4 && !root.panel.mutating) {
-        if (root.panel.configRevision !== "sha256:rebased"
+        if (root.panel.configRevision !== root.rev("b")
             || root.routineEnabled("alpha") !== false
             || root.routineEnabled("beta") !== true
             || root.routineEnabled("gamma") !== true) {
@@ -325,7 +332,7 @@ ShellRoot {
         { id: "beta", name: "Beta", enabled: true, triggers: [], actions: [{ type: "delay", milliseconds: 0 }] }
       ]
     }
-    panel.configRevision = "sha256:base"
+    panel.configRevision = rev(0)
     panel.configLoaded = true
     panel.loading = false
     panel.setRoutineEnabled("alpha", false)
