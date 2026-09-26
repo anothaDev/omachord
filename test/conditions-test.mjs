@@ -205,6 +205,13 @@ assert.deepEqual(plain(conditions.seedLatches(routines, [
   { timestamp: iso(31, 22, 50), routineId: "dark", trigger: "condition", status: "deactivated" }
 ], at(31, 23, 0))), {}, "a deactivation the service made itself does not latch")
 assert.deepEqual(plain(conditions.seedLatches(routines, [
+  { timestamp: iso(31, 22, 50), routineId: "dark", trigger: "service", status: "deactivated" }
+], at(31, 23, 0))), {}, "a legacy service-trigger deactivation does not latch either")
+assert.deepEqual(plain(conditions.seedLatches(routines, [
+  { timestamp: iso(31, 10, 30), routineId: "work", trigger: "service", status: "success" },
+  { timestamp: iso(31, 15, 50), routineId: "dark", trigger: "service", status: "failed" }
+], at(31, 16, 0))), { work: true, dark: true }, "a legacy service-trigger run in the current period latches")
+assert.deepEqual(plain(conditions.seedLatches(routines, [
   { timestamp: "garbage", routineId: "dark", trigger: "shortcut", status: "deactivated" }
 ], at(31, 23, 0))), {}, "unparseable timestamps are ignored")
 

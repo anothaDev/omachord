@@ -161,10 +161,13 @@ function seedLatches(routines, logs, now) {
     if (!entry) continue
     var at = Date.parse(String(entry.timestamp || ""))
     if (isNaN(at) || now.getTime() - at > latchHorizonMs(routine, now)) continue
+    // Older runners recorded service transitions as "service"; both mean
+    // the condition service itself, as in conditionOwned().
     var trigger = String(entry.trigger || "")
     var status = String(entry.status || "")
-    if (status === "deactivated" && trigger !== "condition") latched[id] = true
-    else if (trigger === "condition" && (status === "success" || status === "failed")) latched[id] = true
+    var byService = trigger === "condition" || trigger === "service"
+    if (status === "deactivated" && !byService) latched[id] = true
+    else if (byService && (status === "success" || status === "failed")) latched[id] = true
   }
   return latched
 }
