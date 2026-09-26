@@ -1,16 +1,10 @@
 # Known Issues and Deferred Design Notes
 
-Items to open as issues once the repository is published. Each records the current behavior, why it is that way, and what a change would involve.
+Current known limitations and deferred design decisions.
 
-## Configuration lock is held for the duration of a run
+## Ending routines is not rolled back
 
-`run`, `activate`, and `deactivate` hold the shared configuration lock while actions execute, so a long action (a theme change, a delay) blocks a concurrent `config apply` for that time. This predates the routine work and guarantees a routine never observes a half-applied configuration. A narrower design would release the lock after the routine JSON is resolved and rely on the per-routine lock alone.
-
-## Disconnect ends active routines before its transaction
-
-`disconnect` restores every active routine *before* the file transaction begins, so a rolled-back disconnect leaves routines ended but integration intact. This is deliberate: a routine that could no longer be ended after its dispatcher was removed is the worse outcome. It could move inside the transaction once a snapshot-restore step exists for activation records.
-
-Configuration saves likewise end routines deleted or disabled by the candidate before publishing it. If the later configuration transaction fails, those routines stay ended while the old configuration remains committed.
+`disconnect`, and configuration saves that delete or disable an active routine, end those routines as late as possible, after the checks that could still refuse the operation. Ending a routine is not part of the rolled-back file transaction: if a later step fails, the routine stays ended while the integration or the previous configuration remains in place. This is deliberate, because a routine that could no longer be ended after its dispatcher was removed is the worse outcome. Including it would need a snapshot-restore step for activation records and for the external state their setters restored.
 
 ## Latches after a service restart are reconstructed heuristically
 
