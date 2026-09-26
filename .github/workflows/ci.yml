@@ -55,7 +55,7 @@ jobs:
           fi
           for file in Panel.qml Service.qml BarWidget.qml BrandIcon.qml \
             Collapsible.qml EmptyState.qml KeyCap.qml PanelScrollBar.qml \
-            RoutinePopup.qml ThemePalette.qml \
+            RoutinePopup.qml ThemePalette.qml Runner.js \
             assets/omachord-icon.svg assets/omachord-white.svg assets/omachord-black.svg; do
             test -s "$file"
           done

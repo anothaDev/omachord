@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import path from "node:path"
+import vm from "node:vm"
 import { fileURLToPath } from "node:url"
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
@@ -158,10 +159,41 @@ assert.match(service, /property var toggles: Object\.create\(null\)/,
   "toggle names must be stored in a prototype-safe map")
 assert.match(service, /applyToggles\(exitCode === 0 \?[^:]+: null\)/,
   "a failed toggle probe must clear stale condition state")
-assert.match(service, /configuredRunnerPath\.indexOf\("\/"\) === 0/,
-  "the service must ignore relative runner overrides")
-assert.match(panel, /configuredRunnerPath\.indexOf\("\/"\) === 0/,
-  "the panel must ignore relative runner overrides")
+// One runner/config path resolver, matching bin/omachord's environment.
+const runnerSource = fs.readFileSync(path.join(root, "Runner.js"), "utf8")
+const runner = {}
+vm.createContext(runner)
+vm.runInContext(runnerSource, runner)
+assert.equal(runner.runnerPath("/opt/runner", { __sourceDir: "/src" }, "/cfg"), "/opt/runner")
+assert.equal(runner.runnerPath("relative/runner", { __sourceDir: "/src" }, "/cfg"), "/src/bin/omachord",
+  "a relative runner override must be ignored")
+assert.equal(runner.runnerPath("", null, "/cfg"), "/cfg/plugins/anothadev.omachord/bin/omachord")
+assert.equal(runner.omarchyConfigDir("/home/u", ""), "/home/u/.config/omarchy")
+assert.equal(runner.omarchyConfigDir("/home/u", "/alt/omarchy"), "/alt/omarchy",
+  "OMACHORD_OMARCHY_CONFIG_DIR must move the default plugin and config paths like the runner")
+assert.equal(runner.configPath("", "/alt/omarchy"), "/alt/omarchy/omachord.json")
+assert.equal(runner.configPath("/x/config.json", "/alt/omarchy"), "/x/config.json")
+assert.equal(runner.parseJson("{\"ok\":true}", null).ok, true)
+assert.equal(runner.parseJson("not json", "fallback"), "fallback")
+assert.equal(runner.parseJson(undefined, 7), 7)
+for (const [file, pattern] of [
+  ["Service.qml", /runnerPath: Runner\.runnerPath\(Quickshell\.env\("OMACHORD_RUNNER_PATH"\), manifest,/],
+  ["Panel.qml", /runnerPath: Runner\.runnerPath\(Quickshell\.env\("OMACHORD_RUNNER_PATH"\), manifest,/],
+  ["ThemePalette.qml", /defaultRunnerPath: Runner\.runnerPath\(Quickshell\.env\("OMACHORD_RUNNER_PATH"\), null,/]
+]) {
+  const source = fs.readFileSync(path.join(root, file), "utf8")
+  assert.match(source, pattern, `${file} must resolve the runner through Runner.js`)
+  assert.match(source, /Runner\.omarchyConfigDir\((?:home|Quickshell\.env\("HOME"\)), Quickshell\.env\("OMACHORD_OMARCHY_CONFIG_DIR"\)\)/,
+    `${file} must honour OMACHORD_OMARCHY_CONFIG_DIR like the runner`)
+  assert.doesNotMatch(source, /\/\.config\/omarchy\/plugins/, `${file} must not hard-code the plugin path`)
+}
+assert.match(service, /configPath: Runner\.configPath\(Quickshell\.env\("OMACHORD_CONFIG_FILE"\), omarchyConfigDir\)/,
+  "the service must watch the configuration file the runner reads")
+for (const [file, source] of [["Service.qml", service], ["Panel.qml", panel]])
+  assert.match(source, /function parseJson\(text, fallback\) \{ return Runner\.parseJson\(text, fallback\) \}/,
+    `${file} must parse runner replies through Runner.parseJson`)
+assert.doesNotMatch(fs.readFileSync(path.join(root, "ThemePalette.qml"), "utf8"), /JSON\.parse\(/,
+  "ThemePalette.qml must parse runner replies through Runner.parseJson")
 const card = fs.readFileSync(path.join(root, "ActionCard.qml"), "utf8")
 assert.doesNotMatch(card, /\broot\./,
   "ActionCard must stay list-agnostic and only speak to the editor through signals")

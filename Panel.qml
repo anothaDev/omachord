@@ -7,6 +7,7 @@ import qs.Commons
 import qs.Ui
 import "Model.js" as Model
 import "Conditions.js" as Conditions
+import "Runner.js" as Runner
 
 Item {
   id: root
@@ -99,12 +100,8 @@ Item {
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string pluginId: (manifest && manifest.id) || "anothadev.omachord"
-  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-  readonly property string runnerPath: configuredRunnerPath.indexOf("/") === 0
-    ? configuredRunnerPath
-    : (manifest && manifest.__sourceDir
-      ? String(manifest.__sourceDir) + "/bin/omachord"
-      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
+  readonly property string runnerPath: Runner.runnerPath(Quickshell.env("OMACHORD_RUNNER_PATH"), manifest,
+    Runner.omarchyConfigDir(home, Quickshell.env("OMACHORD_OMARCHY_CONFIG_DIR")))
   readonly property var filteredBindings: Model.filterBindings(bindings, shortcutQuery, shortcutFilter)
   readonly property bool compact: window.width < Style.space(920)
   readonly property bool uiLocked: loading || mutating || revisionRefreshPending || !configLoaded
@@ -177,9 +174,7 @@ Item {
     else window.visible = false
   }
 
-  function parseJson(text, fallback) {
-    try { return JSON.parse(String(text || "")) } catch (e) { return fallback }
-  }
+  function parseJson(text, fallback) { return Runner.parseJson(text, fallback) }
 
   function setActiveView(view) {
     if (activeView === view) return

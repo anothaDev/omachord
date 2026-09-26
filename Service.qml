@@ -4,6 +4,7 @@ import Quickshell.Io
 import Quickshell.Networking
 import Quickshell.Services.UPower
 import "Conditions.js" as Conditions
+import "Runner.js" as Runner
 
 // Headless condition watcher loaded by omarchy-shell as the plugin's
 // "service" kind. It only decides *when* a routine should start or end;
@@ -21,14 +22,10 @@ Item {
   readonly property string home: Quickshell.env("HOME")
   readonly property string stateHome: Quickshell.env("XDG_STATE_HOME") || (home + "/.local/state")
   readonly property string stateDir: Quickshell.env("OMACHORD_STATE_DIR") || (stateHome + "/omarchy/omachord")
-  readonly property string configPath: Quickshell.env("OMACHORD_CONFIG_FILE") || (home + "/.config/omarchy/omachord.json")
+  readonly property string omarchyConfigDir: Runner.omarchyConfigDir(home, Quickshell.env("OMACHORD_OMARCHY_CONFIG_DIR"))
+  readonly property string configPath: Runner.configPath(Quickshell.env("OMACHORD_CONFIG_FILE"), omarchyConfigDir)
   readonly property string togglesDir: stateHome + "/omarchy/toggles"
-  readonly property string configuredRunnerPath: Quickshell.env("OMACHORD_RUNNER_PATH")
-  readonly property string runnerPath: configuredRunnerPath.indexOf("/") === 0
-    ? configuredRunnerPath
-    : (manifest && manifest.__sourceDir
-      ? String(manifest.__sourceDir) + "/bin/omachord"
-      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord")
+  readonly property string runnerPath: Runner.runnerPath(Quickshell.env("OMACHORD_RUNNER_PATH"), manifest, omarchyConfigDir)
 
   readonly property int safetyMs: 60000
   readonly property int reconcileMs: 300000
@@ -140,9 +137,7 @@ Item {
     console.log("omachord " + lastEventAt + " " + lastEvent)
   }
 
-  function parseJson(text, fallback) {
-    try { return JSON.parse(String(text || "")) } catch (e) { return fallback }
-  }
+  function parseJson(text, fallback) { return Runner.parseJson(text, fallback) }
 
   function currentEnv(now) {
     return {
@@ -205,7 +200,8 @@ Item {
   }
 
   function finishWidget(text, exitCode) {
-    var parsed = exitCode === 0 ? parseJson(text, null) : parseJson(text, null)
+    // A refusal is reported as JSON on a non-zero exit, so parse either way.
+    var parsed = parseJson(text, null)
     if (parsed && parsed.ok === true) {
       widgetEnsured = true
       logEvent("bar-widget", parsed.placed === true ? "placed" : "already recorded")

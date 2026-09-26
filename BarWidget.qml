@@ -43,9 +43,9 @@ Panel {
   ThemePalette {
     id: palette
     active: root.opened
-    runnerPath: configuredRunnerPath.indexOf("/") === 0 ? configuredRunnerPath
-      : root.service && root.service.runnerPath ? root.service.runnerPath
-      : home + "/.config/omarchy/plugins/anothadev.omachord/bin/omachord"
+    // The service resolves the same absolute override first, and also knows
+    // the loaded plugin's own directory.
+    runnerPath: root.service && root.service.runnerPath ? String(root.service.runnerPath) : palette.defaultRunnerPath
   }
 
   function endRoutine(id) {

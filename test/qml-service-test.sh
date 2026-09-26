@@ -18,7 +18,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$TEST_DIR/state/omarchy/toggles" "$TEST_DIR/state/omarchy/omachord" "$TEST_DIR/home"
-for file in Service.qml Conditions.js; do
+for file in Service.qml Conditions.js Runner.js; do
   ln -s "$ROOT/$file" "$TEST_DIR/$file"
 done
 : >"$TEST_DIR/runner-calls.log"

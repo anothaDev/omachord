@@ -13,7 +13,7 @@ for file in /usr/share/omarchy/shell/Ui/*; do
   [[ ${file##*/} == KeyboardPanel.qml ]] || ln -s "$file" "$TEST_DIR/Ui/${file##*/}"
 done
 cp -- "$ROOT/test/qml-runtime/KeyboardPanel.qml" "$TEST_DIR/Ui/KeyboardPanel.qml"
-for file in BarWidget.qml BrandIcon.qml RoutinePopup.qml PendingSwitch.qml ThemePalette.qml Model.js Conditions.js assets; do
+for file in BarWidget.qml BrandIcon.qml RoutinePopup.qml PendingSwitch.qml ThemePalette.qml Model.js Conditions.js Runner.js assets; do
   ln -s "$ROOT/$file" "$TEST_DIR/$file"
 done
 mkdir -p "$TEST_DIR/home" "$TEST_DIR/config" "$TEST_DIR/state" "$TEST_DIR/data" \

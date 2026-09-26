@@ -20,7 +20,8 @@ with tempfile.TemporaryDirectory(prefix="otp.", dir="/tmp") as directory:
         env[key] = str(fixture / name)
     (fixture / "theme").mkdir(mode=0o700)
     (fixture / "Commons").symlink_to("/usr/share/omarchy/shell/Commons")
-    shutil.copyfile(root / "ThemePalette.qml", fixture / "ThemePalette.qml")
+    for name in ("ThemePalette.qml", "Runner.js"):
+        shutil.copyfile(root / name, fixture / name)
     shutil.copyfile(root / "test/qml-runtime/theme-palette.qml", fixture / "shell.qml")
     result = subprocess.run(["/usr/bin/quickshell", "--no-duplicate", "--path", str(fixture / "shell.qml"),
                              "--no-color"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
