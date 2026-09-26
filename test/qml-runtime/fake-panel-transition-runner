@@ -3,6 +3,10 @@
 set -euo pipefail
 
 test_dir=${OMACHORD_QML_TEST_DIR:?}
+export FAKE_UNEXPECTED_LOG="$test_dir/transition-calls.log"
+source "${BASH_SOURCE[0]%/*}/fake-runner-grammar"
+fake_check_argv "$@"
+base=$(fake_revision 0)
 operation=${1:-}
 if [[ $operation = config ]]; then operation="config-${2:-}"; fi
 plan="$test_dir/$operation-plan.json"
@@ -11,21 +15,22 @@ case $operation in
     reply='{"ok":true,"connected":false,"ownedConnection":false,"integrationComplete":false,"connectionEnabled":false,"configValid":true}'
     ;;
   config-snapshot)
-    reply='{"ok":true,"committed":true,"revision":"sha256:base","config":{"version":1,"routines":[{"id":"alpha","name":"Alpha","enabled":true,"triggers":[],"actions":[{"type":"dnd","value":true,"restore":true}]},{"id":"beta","name":"Beta","enabled":true,"triggers":[],"actions":[{"type":"dnd","value":true,"restore":true}]}]}}'
+    reply='{"ok":true,"committed":true,"revision":"'"$base"'","config":{"version":1,"routines":[{"id":"alpha","name":"Alpha","enabled":true,"triggers":[],"actions":[{"type":"dnd","value":true,"restore":true}]},{"id":"beta","name":"Beta","enabled":true,"triggers":[],"actions":[{"type":"dnd","value":true,"restore":true}]}]}}'
     ;;
   config-apply)
     IFS= read -r payload
-    reply=$(jq -cn --argjson config "$payload" '{ok:true,revision:"sha256:applied",config:$config}')
+    jq -e '.version == 1 and (.routines | type == "array")' <<<"$payload" >/dev/null
+    reply=$(jq -cn --arg revision "$(fake_revision a)" '{ok:true,connected:false,warnings:[],revision:$revision,deactivated:[]}')
     ;;
-  connect) reply='{"ok":true,"connected":true,"revision":"sha256:connected"}' ;;
-  disconnect) reply='{"ok":true,"connected":false}' ;;
-  run) reply='{"ok":true,"state":"activated"}' ;;
-  deactivate) reply='{"ok":true,"state":"deactivated","restored":1}' ;;
+  connect) reply=$(jq -cn --arg revision "$(fake_revision c)" '{ok:true,connected:true,repaired:false,warnings:[],revision:$revision}') ;;
+  disconnect) reply='{"ok":true,"connected":false,"deactivated":[]}' ;;
+  run) reply=$(jq -cn --arg id "$2" --arg trigger "${3:-manual}" '{ok:true,routineId:$id,trigger:$trigger,state:"activated",durationMs:1,expiresAt:null}') ;;
+  deactivate) reply=$(jq -cn --arg id "$2" --arg trigger "${3:-manual}" '{ok:true,routineId:$id,trigger:$trigger,state:"deactivated",restored:1,skipped:0,durationMs:1}') ;;
   themes) reply='Fixture Theme' ;;
   service-status) reply='{"ready":true,"enabled":true,"routines":[]}' ;;
   theme-palette) reply='{"ok":true,"green":"#aabbcc","name":"Fixture Theme"}' ;;
   active|bindings|commands|logs|toggles) reply='[]' ;;
-  *) printf 'Unexpected fixture call: %s\n' "$*" >&2; exit 1 ;;
+  *) fake_usage "$@" ;;
 esac
 
 tag=default

@@ -210,4 +210,69 @@ const invalidNotification = model.validationByIndex({
 })
 assert.equal(invalidNotification.actions[0], "Enter a notification title of at most 200 characters")
 assert.equal(model.summarizeCondition({ type: "time", start: "18:30", end: "08:00", weekdays: ["mon"] }), "Mon 18:30–08:00")
+
+// The runner's clean_strings refuses NUL, CR and LF in every string, so the
+// editor must report them instead of handing an unsavable document over.
+const controlCharacters = ["\u0000", "\n", "\r"]
+for (const bad of controlCharacters) {
+  assert.equal(model.hasForbiddenControl("a" + bad + "b"), true)
+  assert.equal(model.validateArguments(["ok", "x" + bad]), "Arguments cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "exec", program: "/bin/echo", args: ["x" + bad] }, false),
+    "Arguments cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "exec", program: "/bin/" + bad + "echo", args: [] }, false),
+    "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "shell", command: "true" + bad + "false" }, false),
+    "A shell command must fit on one line; join commands with ; or &&")
+  assert.equal(model.validateAction({ type: "notification", title: "Hi" + bad, body: "", urgency: "low", glyph: "" }, false),
+    "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "notification", title: "Hi", body: "a" + bad, urgency: "low", glyph: "" }, true),
+    "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "osd", icon: "", message: bad, progress: 0, duration: 0 }, false),
+    "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "sound", path: "/a" + bad }, false), "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "launch-app", desktopId: "a" + bad + ".desktop" }, false),
+    "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateAction({ type: "omarchy-command", route: "omarchy x" + bad, args: [] }, false),
+    "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateCondition({ type: "wifi", ssids: ["Home" + bad] }), "Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateRoutineDetails({ id: "x", name: "A" + bad, enabled: true, triggers: [], actions: [] }),
+    "Routine name cannot contain line breaks or NUL characters")
+  assert.equal(model.validateRoutineDetails({ id: "x", name: "A", enabled: true,
+    triggers: [{ type: "shortcut", keys: "SUPER + " + bad, override: false }], actions: [] }),
+    "Triggers: Text cannot contain line breaks or NUL characters")
+  assert.equal(model.validateRoutineDetails({ id: "x", name: "A", enabled: true, triggers: [],
+    actions: [{ type: "delay", milliseconds: 0 }], onEnd: { mode: "actions", actions: [{ type: "shell", command: bad }] } }),
+    "End action 1: A shell command must fit on one line; join commands with ; or &&")
+  assert.equal(model.validateRoutineDetails({ id: "x", name: "A", enabled: true, triggers: [], actions: [], future: [bad] }),
+    "Text cannot contain line breaks or NUL characters", "any other string the runner would reject")
+}
+assert.equal(model.hasForbiddenControl("tab\tand unicode   are allowed"), false)
+assert.equal(model.validateAction({ type: "shell", command: "echo a; echo b" }, false), "")
+assert.equal(model.validationByIndex({ id: "x", name: "x", enabled: true, triggers: [],
+  actions: [{ type: "shell", command: "a\nb" }] }).actions[0], "A shell command must fit on one line; join commands with ; or &&")
+
+// Schema counts (bin/omachord validate_config_file).
+assert.equal(model.MAX_ACTIONS, 64)
+assert.equal(model.MAX_END_ACTIONS, 64)
+assert.equal(model.MAX_CONDITIONS, 16)
+assert.equal(model.MAX_ROUTINES, 256)
+const delay = { type: "delay", milliseconds: 0 }
+const countRoutine = (actions, conditions, endActions) => ({ id: "x", name: "x", enabled: true, triggers: [],
+  actions: Array(actions).fill(delay), conditions: Array(conditions).fill({ type: "power", source: "ac", batteryBelow: 0 }),
+  onEnd: { mode: "actions", actions: Array(endActions).fill(delay) } })
+assert.equal(model.validateRoutineDetails(countRoutine(64, 16, 64)), "", "the limits themselves are allowed")
+assert.equal(model.validateRoutineDetails(countRoutine(65, 0, 0)), "A routine can have at most 64 actions")
+assert.equal(model.validateRoutineDetails(countRoutine(1, 17, 0)), "A routine can have at most 16 conditions")
+assert.equal(model.validateRoutineDetails(countRoutine(1, 0, 65)), "A routine can have at most 64 end actions")
+const manyRoutines = count => ({ version: 1, routines: Array.from({ length: count }, (_, i) => ({ id: "r" + i })) })
+assert.equal(model.validateConfigLimits(manyRoutines(256)), "")
+assert.equal(model.validateConfigLimits(manyRoutines(257)), "Omachord can keep at most 256 routines. Delete one before adding another.")
+assert.equal(model.validateConfigLimits(null), "")
+
+// One condition catalogue feeds the editor.
+assert.deepEqual(JSON.parse(JSON.stringify(model.CONDITION_TYPES.map(option => option.value))), ["time", "wifi", "power", "omarchy-toggle"])
+for (const option of model.CONDITION_TYPES) {
+  assert.ok(option.label && option.description, option.value)
+  assert.equal(model.defaultCondition(option.value).type, option.value)
+}
 console.log("Model catalogue tests passed.")

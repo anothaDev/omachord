@@ -5,6 +5,9 @@ set -euo pipefail
 
 dir=${OMACHORD_QML_TEST_DIR:?}
 calls="$dir/connection-calls.log"
+export FAKE_UNEXPECTED_LOG="$calls"
+source "${BASH_SOURCE[0]%/*}/fake-runner-grammar"
+fake_check_argv "$@"
 
 wait_for_release() {
   while [[ ! -f $dir/release-$1 ]]; do sleep 0.01; done
@@ -29,7 +32,7 @@ case ${1:-} in
     ;;
   config)
     printf '%s\n' 'CONFIG SNAPSHOT' >>"$calls"
-    printf '%s\n' '{"ok":true,"revision":"sha256:connection","committed":true,"config":{"version":1,"routines":[]}}'
+    printf '{"ok":true,"revision":"%s","committed":true,"config":{"version":1,"routines":[]}}\n' "$(fake_revision a)"
     ;;
   active|logs|toggles)
     printf '%s\n' '[]'
@@ -46,19 +49,23 @@ case ${1:-} in
       exit 1
     fi
     if [[ $outcome == incomplete ]]; then
+      # Deliberately malformed (no "connected"): the service must not trust it.
       printf '%s\n' '{"ok":true,"warnings":[]}'
       exit 0
     fi
-    printf '{"ok":true,"connected":%s,"warnings":[]}\n' "$connected"
+    if [[ $1 == connect ]]; then
+      printf '{"ok":true,"connected":%s,"warnings":[]}\n' "$connected"
+    else
+      printf '{"ok":true,"connected":%s,"deactivated":[]}\n' "$connected"
+    fi
     ;;
   activate|deactivate|run)
     printf 'ROUTINE START %s %s\n' "$1" "${2:-}" >>"$calls"
     wait_for_release "routine-${2:?}"
     printf 'ROUTINE END %s %s\n' "$1" "$2" >>"$calls"
-    printf '{"ok":true,"routineId":"%s","state":"complete"}\n' "$2"
+    printf '{"ok":true,"routineId":"%s","trigger":"%s","state":"activated","durationMs":1,"expiresAt":null}\n' "$2" "${3:-manual}"
     ;;
   *)
-    printf '%s\n' '{"ok":false,"error":"unexpected fake-runner call"}'
-    exit 1
+    fake_usage "$@"
     ;;
 esac

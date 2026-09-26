@@ -4,7 +4,7 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 HELPER="$ROOT/bin/omachord-fs"
-if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
+TEST_TMP=${TMPDIR:-/tmp}
 TEST_ROOT=$(mktemp -d "$TEST_TMP/omachord-fs-test.XXXXXX")
 INSTRUMENTED_HELPER="$TEST_ROOT/instrumented/bin/omachord-fs"
 

@@ -161,10 +161,13 @@ function seedLatches(routines, logs, now) {
     if (!entry) continue
     var at = Date.parse(String(entry.timestamp || ""))
     if (isNaN(at) || now.getTime() - at > latchHorizonMs(routine, now)) continue
+    // Older runners recorded service transitions as "service"; both mean
+    // the condition service itself, as in conditionOwned().
     var trigger = String(entry.trigger || "")
     var status = String(entry.status || "")
-    if (status === "deactivated" && trigger !== "condition") latched[id] = true
-    else if (trigger === "condition" && (status === "success" || status === "failed")) latched[id] = true
+    var byService = trigger === "condition" || trigger === "service"
+    if (status === "deactivated" && !byService) latched[id] = true
+    else if (byService && (status === "success" || status === "failed")) latched[id] = true
   }
   return latched
 }
@@ -204,6 +207,18 @@ function conditionOwned(snapshot) {
   if (!snapshot) return false
   var trigger = String(snapshot.trigger || "")
   return (trigger === "condition" || trigger === "service") && snapshot.keepUntil === "conditions"
+}
+
+// Whether the service itself will end this active row once its routine's
+// conditions stop matching: only a condition-owned activation of a routine
+// that still has conditions. Rows carry the routine's condition count.
+function endsWithConditions(row) {
+  return conditionOwned(row) && Number(row && row.conditions || 0) > 0
+}
+
+// The one wording the Activity view and the bar popup use for that promise.
+function conditionHoldText(row) {
+  return endsWithConditions(row) ? "while its conditions hold" : ""
 }
 
 // latched: routine ids that already fired for the current true period, so a
@@ -445,7 +460,9 @@ function toMs(value) {
   if (typeof value === "number") ms = value
   else if (typeof value === "object" && typeof value.getTime === "function") ms = value.getTime()
   else ms = Date.parse(String(value))
-  return typeof ms === "number" && isFinite(ms) ? ms : null
+  // A Date holds at most 8.64e15 ms either side of the epoch; anything
+  // beyond that is an Invalid Date whose toISOString() throws.
+  return typeof ms === "number" && isFinite(ms) && Math.abs(ms) <= 8.64e15 ? ms : null
 }
 
 function nowMsOf(nowDate) {

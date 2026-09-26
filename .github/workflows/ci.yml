@@ -1,19 +1,29 @@
 name: CI
 
 on:
+  # Branch pushes are covered by pull_request; push runs only for the default
+  # branch and release tags so a PR branch is not tested twice.
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   portable:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     # Omachord needs GNU mv >= 9.5; Ubuntu 24.04 only provides coreutils 9.4.
+    # debian:trixie-slim pinned by manifest-list digest (resolved 2026-09-26).
+    # Dependabot does not update this; refresh the digest deliberately.
     container:
-      image: debian:trixie-slim
+      image: debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
       options: --init
     defaults:
       run:
@@ -28,12 +38,12 @@ jobs:
           # Match Omarchy's Unicode shortcut case folding; Debian defaults to mawk.
           apt-get install --yes --no-install-recommends \
             ca-certificates coreutils desktop-file-utils gawk git jq lua5.4 nodejs \
-            perl procps psmisc python3 sound-theme-freedesktop util-linux
+            perl procps psmisc python3 sound-theme-freedesktop strace util-linux
           # Permission-denial regressions must not run as the container's root user.
           useradd --create-home --shell /bin/bash test-runner
 
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
 
@@ -55,7 +65,7 @@ jobs:
           fi
           for file in Panel.qml Service.qml BarWidget.qml BrandIcon.qml \
             Collapsible.qml EmptyState.qml KeyCap.qml PanelScrollBar.qml \
-            RoutinePopup.qml ThemePalette.qml \
+            RoutinePopup.qml ThemePalette.qml ProcessWatchdog.qml Runner.js \
             assets/omachord-icon.svg assets/omachord-white.svg assets/omachord-black.svg; do
             test -s "$file"
           done

@@ -43,7 +43,7 @@ else: raise AssertionError(mode)
 
 
 def main():
-    temp_parent = "/tmp/opencode" if Path("/tmp/opencode").is_dir() else "/tmp"
+    temp_parent = os.environ.get("TMPDIR") or "/tmp"
     with tempfile.TemporaryDirectory(prefix="omachord-panel-capture.", dir=temp_parent) as directory:
         base = Path(directory)
         env = {"PATH": str(base / "bin") + ":/usr/bin:/bin", "LANG": "C", "PROBE_FIXTURE": str(base),

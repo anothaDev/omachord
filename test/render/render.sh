@@ -1,14 +1,23 @@
 #!/bin/bash
 
 # Renders the Omachord panel views, its compact layout, and the bar popup
-# offscreen into test/render/out/ for visual review. Reads the live
-# configuration through the runner; never writes anything.
+# offscreen for visual review. Reads the live configuration through the
+# runner and never writes it. The images show your real routines, so by
+# default they go to a new private temporary directory (printed at the end);
+# pass a directory as the first argument to choose the location instead:
+#
+#   test/render/render.sh                  # new temporary directory
+#   test/render/render.sh test/render/out  # explicit, ignored by the VCS
 
 set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-OUT="${1:-$ROOT/test/render/out}"
-if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
+TEST_TMP=${TMPDIR:-/tmp}
+if [[ -n ${1:-} ]]; then
+  OUT=$1
+else
+  OUT=$(mktemp -d "$TEST_TMP/omachord-render-out.XXXXXX")
+fi
 WORK=$(mktemp -d "$TEST_TMP/omachord-render.XXXXXX")
 trap 'rm -rf -- "$WORK"' EXIT
 mkdir -p "$OUT"
@@ -52,3 +61,4 @@ for image in routines.png shortcuts.png activity.png routines-compact.png popup.
   [[ -s $OUT/$image ]] || { printf 'Missing render: %s\n' "$image" >&2; exit 1; }
   printf '%s\n' "$image"
 done
+printf 'Renders written to %s\n' "$OUT"

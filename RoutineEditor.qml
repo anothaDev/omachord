@@ -59,12 +59,7 @@ Item {
 
   readonly property var actionTypeOptions: Model.ACTION_TYPES
   readonly property var hookOptions: Model.HOOKS
-  readonly property var conditionTypeOptions: [
-    { value: "time", label: "Time period", description: "Between two times of day, optionally on chosen weekdays" },
-    { value: "wifi", label: "Wi-Fi network", description: "Connected to one of the listed networks" },
-    { value: "power", label: "Power source", description: "Plugged in, on battery, or below a battery level" },
-    { value: "omarchy-toggle", label: "Omarchy toggle", description: "An Omarchy toggle flag is on" }
-  ]
+  readonly property var conditionTypeOptions: Model.CONDITION_TYPES
   readonly property var weekdayOptions: [
     { value: "mon", label: "Mon" }, { value: "tue", label: "Tue" }, { value: "wed", label: "Wed" },
     { value: "thu", label: "Thu" }, { value: "fri", label: "Fri" }, { value: "sat", label: "Sat" },
@@ -215,6 +210,11 @@ Item {
 
   function addAction(list) {
     if (!draft) return
+    var limit = list === "end" ? Model.MAX_END_ACTIONS : Model.MAX_ACTIONS
+    if (actionList(list).length >= limit) {
+      localError = "A routine can have at most " + limit + (list === "end" ? " end actions" : " actions")
+      return
+    }
     var next = Model.clone(draft)
     if (list === "end") {
       var action = Model.defaultAction(addEndActionType)
@@ -318,6 +318,10 @@ Item {
 
   function addCondition() {
     if (!draft) return
+    if (draft.conditions.length >= Model.MAX_CONDITIONS) {
+      localError = "A routine can have at most " + Model.MAX_CONDITIONS + " conditions"
+      return
+    }
     assignDraft(Model.addCondition(draft, addConditionType))
   }
 
@@ -424,11 +428,10 @@ Item {
       setArgumentError(key, "Arguments must be a JSON array of strings")
       return
     }
-    for (var i = 0; i < parsed.length; i++) {
-      if (typeof parsed[i] !== "string") {
-        setArgumentError(key, "Every argument must be a string")
-        return
-      }
+    var argumentsError = Model.validateArguments(parsed)
+    if (argumentsError) {
+      setArgumentError(key, argumentsError)
+      return
     }
     setArgumentError(key, "")
     var actions = actionList(list)
@@ -460,6 +463,10 @@ Item {
     }
     if (Model.codePointLength(next.name) > 100) {
       localError = "Routine name cannot exceed 100 characters"
+      return null
+    }
+    if (Model.hasForbiddenControl(next.name)) {
+      localError = "Routine name cannot contain line breaks or NUL characters"
       return null
     }
     if (next.actions.length === 0) {

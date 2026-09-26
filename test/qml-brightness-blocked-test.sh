@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-if [[ -d /tmp/opencode ]]; then TEST_TMP=/tmp/opencode; else TEST_TMP=${TMPDIR:-/tmp}; fi
+TEST_TMP=${TMPDIR:-/tmp}
 TEST_DIR=$(mktemp -d "$TEST_TMP/omachord-brightness-blocked.XXXXXX")
 runtime_pid=""
 cleanup() {
@@ -12,7 +12,8 @@ trap cleanup EXIT
 cp -RL /usr/share/omarchy/shell/Commons /usr/share/omarchy/shell/Ui "$TEST_DIR/"
 cp "$ROOT"/*.qml "$ROOT"/*.js "$TEST_DIR/"
 cp "$ROOT/test/qml-runtime/brightness-blocked.qml" "$TEST_DIR/shell.qml"
-cp "$ROOT/test/qml-runtime/fake-brightness-runner" "$TEST_DIR/runner"
+cp "$ROOT/test/qml-runtime/brightness-runner.py" "$TEST_DIR/runner"
+cp "$ROOT/test/qml-runtime/fake-runner-grammar" "$TEST_DIR/fake-runner-grammar"
 chmod +x "$TEST_DIR/runner"
 mkdir -p "$TEST_DIR"/{home,config,state/omarchy/toggles,data,cache,runtime,tmp,theme,bin}
 chmod 700 "$TEST_DIR/runtime"

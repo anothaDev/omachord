@@ -102,7 +102,12 @@ ShellRoot {
   Timer {
     interval: 20; running: true; repeat: false
     onTriggered: {
-      try { root.testService(); root.testPanel(); console.log("OMACHORD_QML_TEST_PASS") }
+      try {
+        root.testService(); root.testPanel()
+        calls.reload()
+        root.check(String(calls.text()).indexOf("UNEXPECTED ") === -1, "a QML process sent an argv the runner rejects")
+        console.log("OMACHORD_QML_TEST_PASS")
+      }
       catch (error) { console.error("OMACHORD_QML_TEST_FAIL", String(error)) }
     }
   }

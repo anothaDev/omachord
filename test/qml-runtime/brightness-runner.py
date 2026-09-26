@@ -2,11 +2,18 @@
 """Private runner protocol fixture: no hardware or real configuration access."""
 import json
 import os
+import subprocess
 from pathlib import Path
 import sys
 
 directory = Path(os.environ["OMACHORD_QML_TEST_DIR"])
 args = sys.argv[1:]
+# Accept exactly the argv the real runner accepts (shared bash grammar).
+grammar = subprocess.run(["bash", "-c", 'source "$0"; fake_check_argv "$@"',
+                          str(directory / "fake-runner-grammar"), *args], capture_output=True, text=True)
+if grammar.returncode != 0:
+    sys.stdout.write(grammar.stdout)
+    sys.exit(grammar.returncode)
 with (directory / "calls.log").open("a") as calls:
     calls.write(" ".join(args) + "\n")
 plan = json.loads((directory / "plan.json").read_text())

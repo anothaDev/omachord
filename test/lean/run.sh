@@ -13,7 +13,6 @@ if ! command -v node >/dev/null 2>&1; then
 fi
 
 temp_root=${TMPDIR:-/tmp}
-if [[ -z ${TMPDIR:-} && -d /tmp/opencode ]]; then temp_root=/tmp/opencode; fi
 output=$(mktemp "$temp_root/omachord-lean.XXXXXX")
 trap 'rm -f -- "$output"' EXIT
 
