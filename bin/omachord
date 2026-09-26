@@ -52,6 +52,10 @@ MAX_TOGGLE_SCAN_BYTES=524288
 MAX_TOGGLE_ENTRIES=4096
 LOCK_TIMEOUT=${OMACHORD_LOCK_TIMEOUT:-10}
 CONTROL_TIMEOUT=${OMACHORD_CONTROL_TIMEOUT:-5s}
+ACTION_TIMEOUT=${OMACHORD_ACTION_TIMEOUT:-30s}
+# "<pid>:<starttime>" of a runner ending routines in bulk, read once and then
+# removed from the environment (see bulk_cleanup_suppresses_hooks).
+BULK_CLEANUP_OWNER=${OMACHORD_BULK_CLEANUP:-}
 CONFIG_SNAPSHOT_FINGERPRINT=""
 CONFIG_COMMIT_REVISION=""
 CONFIG_LOAD_ERROR_CODE=invalid-config
@@ -88,9 +92,7 @@ fail() {
 control_capture() {
   local output status
   output=$(mktemp) || return 1
-  if OMACHORD_ACTION_TIMEOUT="$CONTROL_TIMEOUT" \
-    OMACHORD_CAPTURE_MODE=head OMACHORD_CAPTURE_LIMIT="$MAX_CONTROL_BYTES" \
-    run_capture "$output" "$@"; then
+  if run_capture --timeout "$CONTROL_TIMEOUT" --head "$MAX_CONTROL_BYTES" "$output" "$@"; then
     if ! cat -- "$output"; then
       rm -f -- "$output"
       LAST_ERROR="Could not write the command output"
@@ -1881,13 +1883,13 @@ command_config_apply() {
     fail "$LAST_ERROR" active-plan-conflict
   fi
 
-  export OMACHORD_BULK_CLEANUP=1
+  begin_bulk_cleanup
   if ! deactivate_orphans config "$candidate"; then
-    unset OMACHORD_BULK_CLEANUP
+    end_bulk_cleanup
     rm -f -- "$candidate" "$candidate_lua"
     fail "$LAST_ERROR" action-failed
   fi
-  unset OMACHORD_BULK_CLEANUP
+  end_bulk_cleanup
 
   if ! snapshot_begin \
     || ! snapshot_file "$CONFIG_FILE" config \
@@ -2147,12 +2149,12 @@ command_disconnect() {
   acquire_config_lock || fail "$LAST_ERROR" unsafe-state
 
   if ! connected && ! owned_connection; then
-    export OMACHORD_BULK_CLEANUP=1
+    begin_bulk_cleanup
     if ! deactivate_all disconnect; then
-      unset OMACHORD_BULK_CLEANUP
+      end_bulk_cleanup
       fail "$LAST_ERROR" action-failed
     fi
-    unset OMACHORD_BULK_CLEANUP
+    end_bulk_cleanup
     write_connection_disabled || fail "$LAST_ERROR" unsafe-state
     jq -cn --argjson deactivated "$DEACTIVATED_IDS" \
       '{ok:true,connected:false,alreadyDisconnected:true,deactivated:$deactivated}'
@@ -2161,12 +2163,12 @@ command_disconnect() {
   if ! owned_connection; then
     fail "The Hyprland loader is not owned by this installation; it was left untouched" ownership-conflict
   fi
-  export OMACHORD_BULK_CLEANUP=1
+  begin_bulk_cleanup
   if ! deactivate_all disconnect; then
-    unset OMACHORD_BULK_CLEANUP
+    end_bulk_cleanup
     fail "$LAST_ERROR" action-failed
   fi
-  unset OMACHORD_BULK_CLEANUP
+  end_bulk_cleanup
   if ! snapshot_begin || ! snapshot_owned_files 0 1; then
     snapshot_end
     fail "$LAST_ERROR" snapshot-failed
@@ -2324,9 +2326,8 @@ command_toggles() {
   local capture error
   [[ $# -eq 0 ]] || fail "Usage: omachord toggles" usage
   capture=$(mktemp) || fail "Could not prepare the toggle scan" toggles-unavailable
-  if ! PATH=/usr/bin:/bin OMACHORD_ACTION_TIMEOUT="$CONTROL_TIMEOUT" \
-      OMACHORD_CAPTURE_MODE=head OMACHORD_CAPTURE_LIMIT="$MAX_TOGGLE_SCAN_BYTES" \
-      run_capture "$capture" "$FS_HELPER" list-toggles "$TOGGLES_DIR" \
+  if ! PATH=/usr/bin:/bin run_capture --timeout "$CONTROL_TIMEOUT" --head "$MAX_TOGGLE_SCAN_BYTES" \
+      "$capture" "$FS_HELPER" list-toggles "$TOGGLES_DIR" \
         "$MAX_TOGGLE_ENTRIES" "$MAX_TOGGLE_SCAN_BYTES"; then
     error=$(/usr/bin/jq -r '.error // empty' "$capture" 2>/dev/null || true)
     [[ -n $error ]] || error=$LAST_ERROR
@@ -2427,11 +2428,21 @@ abort_active_routine() {
   exit "$status"
 }
 
+# run_capture [--timeout DURATION] [--head LIMIT] OUTPUT COMMAND...
+# Capture settings are explicit arguments, never environment variables, so
+# they cannot leak into the action tree or be injected from the ambient env.
 run_capture() {
+  local capture_mode=tail capture_limit=4096 action_timeout=$ACTION_TIMEOUT outcome=""
+  while (($# > 0)); do
+    case $1 in
+      --timeout) action_timeout=$2; shift 2 ;;
+      --head) capture_mode=head; capture_limit=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
   local output_file=$1
   shift
   local status capture_dir supervisor_pid parent_pid parent_start output_size pipe_in pipe_out
-  local capture_mode=${OMACHORD_CAPTURE_MODE:-tail} capture_limit=${OMACHORD_CAPTURE_LIMIT:-4096}
   LAST_ERROR=""
   capture_dir=$(mktemp -d) || {
     LAST_ERROR="Could not create an action output buffer"
@@ -2453,9 +2464,11 @@ run_capture() {
   # One native owner captures bounded output and retains the timeout leader
   # unreaped through the final group signal. The pipe carries cancellation by
   # EOF, so cleanup needs neither writable markers nor a recyclable job PID.
+  # The supervisor's outcome line in the capture directory is advisory: it
+  # only refines the message (own timeout vs. killed vs. exit status).
   coproc OMACHORD_CAPTURE {
     exec "$ACTION_SUPERVISOR" "$parent_pid" "$parent_start" "$capture_dir" \
-      "${OMACHORD_ACTION_TIMEOUT:-30s}" --capture "$capture_mode" "$capture_limit" "$output_file" -- "$@" \
+      "$action_timeout" --capture "$capture_mode" "$capture_limit" "$output_file" -- "$@" \
       8>&- 9>&- > /dev/null 2>"$capture_dir/error"
   }
   supervisor_pid=$!
@@ -2476,11 +2489,22 @@ run_capture() {
   ACTIVE_CONTROL_FD=""
   ACTIVE_SUPERVISOR_PID=""
   output_size=$(stat -c %s -- "$output_file" 2>/dev/null || printf 0)
+  [[ ! -f $capture_dir/outcome ]] || IFS= read -r outcome <"$capture_dir/outcome" || true
   if [[ $capture_mode == head ]] && ((output_size > capture_limit)); then
     status=125
     LAST_ERROR="Command output exceeds the $capture_limit byte limit"
-  elif ((status != 0)) && [[ -s $capture_dir/error ]]; then
-    LAST_ERROR=$(tail -c 2000 "$capture_dir/error" | tr '\n' ' ')
+  elif ((status != 0)) && [[ $outcome == timeout ]]; then
+    # Only the supervisor knows whether its deadline fired; exit 124/137
+    # alone is also what an action killed by SIGKILL or exiting 124 returns.
+    LAST_ERROR="Action timed out after $action_timeout"
+  elif ((status != 0)) && [[ $outcome == "signal "* ]]; then
+    LAST_ERROR="Action was killed (signal ${outcome#signal })"
+  elif ((status != 0)) && [[ $outcome == cancelled ]]; then
+    LAST_ERROR="Action was cancelled"
+  elif ((status != 0)) && [[ $outcome == internal || -z $outcome ]] && [[ -s $capture_dir/error ]]; then
+    LAST_ERROR="The action supervisor failed: $(tail -c 2000 "$capture_dir/error" | tr '\n' ' ')"
+  elif ((status != 0)) && [[ $outcome == internal ]]; then
+    LAST_ERROR="The action supervisor failed while capturing output"
   fi
   set -e
   rm -rf -- "$capture_dir"
@@ -2488,9 +2512,7 @@ run_capture() {
   if ((status == 0)); then
     return 0
   fi
-  if ((status == 124 || status == 137)); then
-    LAST_ERROR="Action timed out after ${OMACHORD_ACTION_TIMEOUT:-30s}"
-  elif [[ -z $LAST_ERROR ]]; then
+  if [[ -z $LAST_ERROR ]]; then
     LAST_ERROR=$(tail -c 2000 "$output_file" | tr '\n' ' ')
     [[ -n $LAST_ERROR ]] || LAST_ERROR="Command failed: $1"
   fi
@@ -2621,7 +2643,7 @@ execute_action() {
       milliseconds=$(jq -r '.milliseconds' <<<"$action")
       seconds=$(jq -nr --argjson ms "$milliseconds" '$ms / 1000')
       delay_timeout=$(jq -nr --argjson ms "$milliseconds" '($ms / 1000 + 1 | tostring) + "s"')
-      if ! OMACHORD_ACTION_TIMEOUT="$delay_timeout" run_capture "$output" sleep "$seconds"; then
+      if ! run_capture --timeout "$delay_timeout" "$output" sleep "$seconds"; then
         rm -f -- "$output"
         return 1
       fi
@@ -3963,7 +3985,7 @@ command_trigger_hook() {
   local valid=0 candidate index=1 failures=0 matched=0 config_snapshot
   for candidate in "${HOOK_EVENTS[@]}"; do [[ $candidate == "$event" ]] && valid=1; done
   ((valid)) || fail "Unsupported hook event: $event" usage
-  if [[ ${OMACHORD_BULK_CLEANUP:-} == 1 ]]; then
+  if bulk_cleanup_suppresses_hooks; then
     jq -cn --arg event "$event" '{ok:true,event:$event,matched:0,suppressed:true}'
     return
   fi
@@ -4359,10 +4381,50 @@ require_prepared_state() {
   prepare_state_dir || fail "$LAST_ERROR" unsafe-state
 }
 
+# Internal knobs are never honored from the ambient environment, and the
+# documented timeout overrides must be durations the supervisor accepts.
+sanitize_environment() {
+  unset OMACHORD_CAPTURE_MODE OMACHORD_CAPTURE_LIMIT OMACHORD_BULK_CLEANUP
+  local name value
+  for name in OMACHORD_ACTION_TIMEOUT OMACHORD_CONTROL_TIMEOUT; do
+    value=${!name-}
+    [[ -z ${!name+set} ]] || [[ $value =~ ^[0-9]*\.?[0-9]+[smhd]?$ && $value =~ [1-9] ]] \
+      || fail "$name must be a positive duration such as 30s or 2m" invalid-environment
+  done
+  [[ -z ${OMACHORD_LOCK_TIMEOUT+set} || $OMACHORD_LOCK_TIMEOUT =~ ^[0-9]*\.?[0-9]+$ ]] \
+    || fail "OMACHORD_LOCK_TIMEOUT must be a number of seconds" invalid-environment
+}
+
+# Bulk cleanup (config apply, disconnect) suppresses hook routines that its
+# own end actions trigger. The marker names the live runner that set it, so a
+# descendant detached from a finished runner never suppresses hooks forever.
+begin_bulk_cleanup() {
+  local start
+  start=$(process_start_time "$BASHPID") || start=""
+  export OMACHORD_BULK_CLEANUP="$BASHPID:$start"
+}
+
+end_bulk_cleanup() {
+  unset OMACHORD_BULK_CLEANUP
+}
+
+bulk_cleanup_suppresses_hooks() {
+  local pid start stat rest
+  [[ $BULK_CLEANUP_OWNER =~ ^([0-9]+):([0-9]+)$ ]] || return 1
+  pid=${BASH_REMATCH[1]}
+  start=${BASH_REMATCH[2]}
+  { stat=$(<"/proc/$pid/stat"); } 2>/dev/null || return 1
+  rest=${stat##*) }
+  local -a fields=()
+  read -r -a fields <<<"$rest"
+  ((${#fields[@]} >= 20)) && [[ ${fields[0]} != Z && ${fields[19]} == "$start" ]]
+}
+
 main() {
   local command=${1:-}
   shift || true
   clear_trigger_context
+  sanitize_environment
   case $command in
     status) require_prepared_state; command_status "$@" ;;
     config)
