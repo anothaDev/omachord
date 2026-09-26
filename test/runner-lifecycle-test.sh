@@ -192,4 +192,90 @@ done
 OMACHORD_ACTION_TIMEOUT=1.5m OMACHORD_LOCK_TIMEOUT=2.5 "$RUNNER" run fds test | jq -e '.ok' >/dev/null
 pass "environment knob validation and isolation"
 
+# --- Connect/Disconnect leave bindings.lua byte-identical
+result=$("$RUNNER" connect) || fail "initial connect failed: $result"
+result=$("$RUNNER" disconnect) || fail "initial disconnect failed: $result"
+check_round_trip() {
+  local label=$1 original=$2 cycle
+  printf '%s' "$original" >"$BINDINGS"
+  for cycle in 1 2 3; do
+    "$RUNNER" connect | jq -e '.ok and .connected' >/dev/null || fail "$label: connect failed"
+    grep -Fqx -- "$LOADER" "$BINDINGS" || fail "$label: connect did not add the loader"
+    "$RUNNER" disconnect | jq -e '.ok and (.connected | not)' >/dev/null || fail "$label: disconnect failed"
+    cmp -s <(printf '%s' "$original") "$BINDINGS" \
+      || fail "$label: cycle $cycle changed bindings.lua: $(od -c "$BINDINGS" | head -5)"
+  done
+}
+check_round_trip "terminated file" $'-- user bindings\nbind("a")\n'
+check_round_trip "unterminated file" $'-- user bindings\nbind("a")'
+check_round_trip "empty file" ''
+check_round_trip "user blank lines" $'bind("a")\n\n\n'
+check_round_trip "leading blank line" $'\nbind("a")\n'
+# A user line after the loader keeps its place; only the loader goes.
+printf '%s' $'bind("a")\n' >"$BINDINGS"
+"$RUNNER" connect | jq -e '.ok' >/dev/null
+printf '%s\n' 'bind("b")' >>"$BINDINGS"
+"$RUNNER" disconnect | jq -e '.ok' >/dev/null
+cmp -s <(printf '%s' $'bind("a")\n\nbind("b")\n') "$BINDINGS" \
+  || fail "loader removal disturbed user lines after the loader: $(od -c "$BINDINGS" | head -5)"
+# Old releases left one extra blank line per cycle. Model such a connected
+# file: disconnect removes the loader and one separator, nothing more.
+printf '%s\n' 'bind("a")' >"$BINDINGS"
+"$RUNNER" connect | jq -e '.ok' >/dev/null
+printf '%s\n' 'bind("a")' '' '' '' "$LOADER" >"$BINDINGS"
+"$RUNNER" disconnect | jq -e '.ok' >/dev/null
+cmp -s <(printf '%s' $'bind("a")\n\n\n') "$BINDINGS" \
+  || fail "legacy accumulated blank lines were not handled: $(od -c "$BINDINGS" | head -5)"
+pass "loader connect/disconnect round trip"
+
+# --- A FIFO swapped in for bindings.lua while Connect holds the lock fails
+# the transaction promptly instead of blocking the reader forever.
+mkdir -p "$TEST_ROOT/swap-bin"
+cat >"$TEST_ROOT/swap-bin/stat" <<'STUB'
+#!/bin/bash
+if [[ -f $TEST_ROOT/swap-fifo && ${1:-} == -c && ${2:-} == %a && ${3:-} == "$SWAP_TARGET" ]]; then
+  rm -f "$TEST_ROOT/swap-fifo"
+  mode=$(/usr/bin/stat -c %a "$3")
+  rm -f "$3"
+  mkfifo -m "$mode" "$3"
+  printf '%s\n' "$mode"
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+STUB
+chmod +x "$TEST_ROOT/swap-bin/stat"
+printf '%s\n' 'bind("a")' >"$BINDINGS"
+touch "$TEST_ROOT/swap-fifo"
+start=$(date +%s%3N)
+status=0
+SWAP_TARGET=$BINDINGS PATH="$TEST_ROOT/swap-bin:$PATH" timeout 20s "$RUNNER" connect >"$TEST_ROOT/fifo.json" || status=$?
+elapsed=$(($(date +%s%3N) - start))
+[[ ! -e $TEST_ROOT/swap-fifo ]] || fail "the FIFO swap was not exercised"
+((status != 0 && status != 124)) || fail "Connect did not fail cleanly on a swapped FIFO (status $status)"
+((elapsed < 10000)) || fail "Connect blocked ${elapsed}ms on a swapped FIFO"
+jq -e '.ok == false' "$TEST_ROOT/fifo.json" >/dev/null || fail "FIFO swap did not report a failure"
+rm -f "$BINDINGS"
+printf '%s\n' 'bind("a")' >"$BINDINGS"
+pass "nonblocking reads of user-controlled integration files"
+
+# --- Only the newest bindings backups plus the original are kept
+backups="$STATE_DIR/backups"
+rm -f "$backups"/bindings.lua.*
+printf '%s\n' original >"$backups/bindings.lua.00000000000000aa"
+touch -d '2019-01-01' "$backups/bindings.lua.00000000000000aa"
+for index in $(seq 1 15); do
+  name=$(printf 'bindings.lua.%016x' "$((index + 256))")
+  printf '%s\n' "$index" >"$backups/$name"
+  touch -d "2020-01-$(printf '%02d' "$index")" "$backups/$name"
+done
+chmod 600 "$backups"/bindings.lua.*
+"$RUNNER" connect | jq -e '.ok' >/dev/null
+assert_eq "$(find "$backups" -maxdepth 1 -name 'bindings.lua.*' | wc -l)" 11 "backups were not pruned"
+[[ $(cat "$backups/bindings.lua.00000000000000aa") == original ]] || fail "the original backup was pruned"
+[[ ! -e $backups/$(printf 'bindings.lua.%016x' 257) ]] || fail "an old intermediate backup was kept"
+[[ -e $backups/$(printf 'bindings.lua.%016x' 271) ]] || fail "a recent backup was pruned"
+"$RUNNER" disconnect | jq -e '.ok' >/dev/null
+assert_eq "$(find "$backups" -maxdepth 1 -name 'bindings.lua.*' | wc -l)" 11 "backups grew past the limit"
+pass "bindings backup retention"
+
 printf 'Runner lifecycle tests passed.\n'
