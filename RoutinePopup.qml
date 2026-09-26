@@ -47,7 +47,7 @@ Column {
     if (row.expiresAt) {
       var left = Conditions.minutesLeft(row.expiresAt, displayNow)
       parts.push(left !== null && left >= 0 ? (left < 1 ? "ending now" : left + " min left") : "until " + Conditions.clockTime(row.expiresAt))
-    } else if (row.conditions > 0) parts.push("while conditions hold")
+    } else if (Conditions.endsWithConditions(row)) parts.push(Conditions.conditionHoldText(row))
     else {
       var started = Model.triggerLabel(row.trigger)
       if (started) parts.push(started)

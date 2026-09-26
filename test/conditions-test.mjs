@@ -322,6 +322,25 @@ assert.equal(conditions.relativeTime(new Date().toISOString()), "just now", "the
 assert.equal(conditions.clockTime(iso(31, 9, 5)), "09:05")
 assert.equal(conditions.clockTime(iso(31, 23, 59)), "23:59")
 assert.equal(conditions.clockTime(iso(31, 0, 0)), "00:00")
+for (const bad of [NaN, Infinity, -Infinity, 1e20, -8.64e15 - 1, "not a time"])
+  assert.equal(conditions.clockTime(bad), "", "an unusable or out-of-range retry time renders as nothing instead of throwing")
+assert.equal(conditions.clockTime(8.64e15) !== "", true, "the last representable Date still renders")
+
+// Only activations the service will end itself promise to follow conditions.
+const ownedRow = { trigger: "condition", keepUntil: "conditions", conditions: 1 }
+assert.equal(conditions.endsWithConditions(ownedRow), true)
+assert.equal(conditions.conditionHoldText(ownedRow), "while its conditions hold")
+assert.equal(conditions.endsWithConditions(Object.assign({}, ownedRow, { trigger: "service" })), true, "legacy service trigger")
+for (const row of [
+  Object.assign({}, ownedRow, { trigger: "manual" }),
+  Object.assign({}, ownedRow, { trigger: "shortcut" }),
+  Object.assign({}, ownedRow, { keepUntil: { minutes: 30 } }),
+  Object.assign({}, ownedRow, { conditions: 0 }),
+  null
+]) {
+  assert.equal(conditions.endsWithConditions(row), false, JSON.stringify(row))
+  assert.equal(conditions.conditionHoldText(row), "")
+}
 assert.equal(conditions.clockTime(at(31, 14, 7)), "14:07", "a Date is accepted")
 assert.equal(conditions.clockTime("garbage"), "")
 assert.equal(conditions.clockTime(""), "")

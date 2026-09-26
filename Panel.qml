@@ -346,7 +346,7 @@ Item {
       if (state.failure.op === "activate" && state.failure.blocked === true)
         return { label: "Unavailable", detail: "Could not start: " + (state.failure.error || "brightness unavailable")
           + " · Automatic retry blocked. Retry manually or edit the routine.", urgent: true }
-      var retry = state.failure.retryAt ? Conditions.clockTime(new Date(Number(state.failure.retryAt)).toISOString()) : ""
+      var retry = state.failure.retryAt ? Conditions.clockTime(Number(state.failure.retryAt)) : ""
       return { label: "Failed", detail: (state.failure.op === "activate" ? "Could not start: " : "Could not end: ")
         + (state.failure.error || "runner error") + (retry ? " · retrying " + retry : ""), urgent: true }
     }
@@ -371,6 +371,7 @@ Item {
         name: Model.nameFor(currentConfig, id),
         activatedAt: String(record.activatedAt || ""),
         trigger: String(record.trigger || ""),
+        keepUntil: record.keepUntil === undefined ? "conditions" : record.keepUntil,
         expiresAt: record.expiresAt ? String(record.expiresAt) : "",
         onEndMode: String(record.onEndMode || "restore"),
         setterCount: Number(record.setterCount || 0),
@@ -400,7 +401,7 @@ Item {
     if (row.expiresAt) {
       var left = Conditions.minutesLeft(row.expiresAt, displayNow)
       parts.push(left !== null && left >= 0 ? (left < 1 ? "ending now" : left + " min left") : "until " + Conditions.clockTime(row.expiresAt))
-    } else if (row.conditions > 0) parts.push("while its conditions hold")
+    } else if (Conditions.endsWithConditions(row)) parts.push(Conditions.conditionHoldText(row))
     return parts.join(" · ")
   }
 
